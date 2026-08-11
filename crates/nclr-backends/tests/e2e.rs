@@ -2120,7 +2120,16 @@ fn corrupt_state_file_fails_run() {
     let dir = tmpdir("corrupt-state");
     let img = dir.join("sim.img");
     let state = dir.join("broken.state");
-    std::fs::write(&state, b"{\"not\": \"a journal\"\n").unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&state)
+        .unwrap();
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    f.write_all(b"{\"not\": \"a journal\"\n").unwrap();
+    f.sync_all().unwrap();
     make_sim(&img, &["--id", "e2e-corrupt"]);
     let (rc, _, err) = run_nclr(
         &[

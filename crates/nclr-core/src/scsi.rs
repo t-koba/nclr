@@ -756,7 +756,7 @@ mod tests {
         // The Display string carries a prefix; classification must match
         // the message field, not the rendered text.
         let cc = Error::io(
-            format!("{CHECK_CONDITION_PREFIX}: sense [70 00 05 00 00 00 00 0a]"),
+            format!("{}: sense [70 00 05 00 00 00 00 0a]", sg::CHECK_CONDITION_PREFIX),
             None,
         );
         assert!(super::sg::is_check_condition(&cc));
