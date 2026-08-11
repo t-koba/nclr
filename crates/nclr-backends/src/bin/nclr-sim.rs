@@ -267,6 +267,25 @@ fn sample_read(dev: &mut SimDevice, events: &mut BackendEvents) -> Result<serde_
     Ok(json!({ "samples": samples, "sectors": sectors }))
 }
 
+/// Block-level evidence record (spec §1331): physical coordinates,
+/// pre-classification state, FBB and historical RBB flags, ECC detail and,
+/// when requested, the erase attempt with its verdict.
+fn block_evidence(dev: &SimDevice, block: u32, erase: Option<bool>) -> Result<serde_json::Value> {
+    let mut rec = dev.block_detail(block)?;
+    let obj = rec
+        .as_object_mut()
+        .ok_or_else(|| Error::Invalid("block detail must be a JSON object".into()))?;
+    if let Some(ok) = erase {
+        obj.insert("erase_attempted".into(), json!(true));
+        obj.insert(
+            "erase_result".into(),
+            json!(if ok { "erased" } else { "failed" }),
+        );
+        obj.insert("erased".into(), json!(ok));
+    }
+    Ok(rec)
+}
+
 fn dispatch(
     action: &str,
     seed: Option<&str>,
@@ -501,8 +520,8 @@ fn dispatch(
             let failed = results.iter().filter(|(_, ok)| !ok).count();
             let per_block: Vec<Value> = results
                 .iter()
-                .map(|(b, ok)| json!({ "block": b, "erased": ok }))
-                .collect();
+                .map(|(b, ok)| block_evidence(dev, *b, Some(*ok)))
+                .collect::<Result<Vec<_>>>()?;
             Ok(json!({
                 "status": if failed == 0 { "ok" } else { "partial" },
                 "failed": failed as u64,
@@ -528,12 +547,22 @@ fn dispatch(
             let (erased, failed) = dev.final_erase()?;
             let (_, fbb_after, _) = dev.old_bbt();
             let fbb_preserved = fbb_before == fbb_after;
+            // Per-block erase records (spec §1331: final erase result; the
+            // core records each failure individually, §1187).
+            let mut per_block: Vec<Value> = Vec::new();
+            for b in &erased {
+                per_block.push(block_evidence(dev, *b, Some(true))?);
+            }
+            for b in &failed {
+                per_block.push(block_evidence(dev, *b, Some(false))?);
+            }
             Ok(json!({
                 "status": if failed.is_empty() && fbb_preserved { "ok" } else { "partial" },
                 "erased": erased.len() as u64,
                 "failed": failed.len() as u64,
                 "errors": failed.len() as u64,
                 "fbb_preserved": fbb_preserved,
+                "per_block": per_block,
             }))
         }
         "rebuild-bbt-ftl" => {
@@ -616,9 +645,16 @@ fn dispatch(
                 .iter()
                 .map(|(b, c)| {
                     *by_cat.entry(c).or_default() += 1;
-                    json!({ "block": b, "category": c })
+                    // Block-level evidence records (spec §1331): physical
+                    // coordinates, pre-classification, FBB/historical RBB
+                    // state, ECC and verdict detail.
+                    let mut rec = block_evidence(dev, *b, None)?;
+                    rec.as_object_mut()
+                        .ok_or_else(|| Error::Invalid("block detail must be a JSON object".into()))?
+                        .insert("category".into(), json!(c));
+                    Ok(rec)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let data_blocks = entries
                 .iter()
                 .filter(|(_, c)| !matches!(*c, "fbb" | "unknown" | "protected"))
@@ -637,8 +673,8 @@ fn dispatch(
             let failed = results.iter().filter(|(_, ok)| !ok).count();
             let per_block: Vec<Value> = results
                 .iter()
-                .map(|(b, ok)| json!({ "block": b, "erased": ok }))
-                .collect();
+                .map(|(b, ok)| block_evidence(dev, *b, Some(*ok)))
+                .collect::<Result<Vec<_>>>()?;
             Ok(json!({
                 "status": if failed == 0 { "ok" } else { "partial" },
                 "erased": (results.len() - failed) as u64,
@@ -739,36 +775,56 @@ fn dispatch(
                 .take(256)
                 .collect::<Vec<_>>();
             Ok(json!({
-                "status": if complete { "ok" } else { "partial" },
-                "errors": if complete { 0 } else if salvage {
-                    summary.unreadable_pages.saturating_add(summary.uncorrectable_pages)
-                } else {
-                    summary.target_unreadable_pages
-                        .saturating_add(summary.target_uncorrectable_pages)
-                        .saturating_add(summary.target_non_erased_pages)
-                },
-                "total_blocks": summary.total_blocks,
-                "total_pages": summary.total_pages,
-                "readable_pages": summary.readable_pages,
-                "unreadable_pages": summary.unreadable_pages,
-                "uncorrectable_pages": summary.uncorrectable_pages,
-                "target_pages": summary.target_pages,
-                "target_readable_pages": summary.target_readable_pages,
-                "target_unreadable_pages": summary.target_unreadable_pages,
-                "target_uncorrectable_pages": summary.target_uncorrectable_pages,
-                "target_non_erased_pages": summary.target_non_erased_pages,
-                "target_non_erased_bytes": summary.target_non_erased_bytes,
-                "excluded_non_erased_pages": summary.excluded_non_erased_pages,
-                "all_addresses_readable": summary.all_addresses_readable,
-                "all_pages_correctable": summary.all_pages_correctable,
-                "erased_scope_verified": summary.erased_scope_verified,
-                "ordered_sweep_sha256": summary.ordered_sweep_sha256,
-                "image_sha256": summary.image_sha256,
-                "image_bytes": summary.image_bytes,
+               "status": if complete { "ok" } else { "partial" },
+               "errors": if complete { 0 } else if salvage {
+                   summary.unreadable_pages.saturating_add(summary.uncorrectable_pages)
+               } else {
+                   summary.target_unreadable_pages
+                       .saturating_add(summary.target_uncorrectable_pages)
+                       .saturating_add(summary.target_non_erased_pages)
+               },
+               "total_blocks": summary.total_blocks,
+               "total_pages": summary.total_pages,
+               "readable_pages": summary.readable_pages,
+               "unreadable_pages": summary.unreadable_pages,
+               "uncorrectable_pages": summary.uncorrectable_pages,
+               "target_pages": summary.target_pages,
+               "target_readable_pages": summary.target_readable_pages,
+               "target_unreadable_pages": summary.target_unreadable_pages,
+               "target_uncorrectable_pages": summary.target_uncorrectable_pages,
+               "target_non_erased_pages": summary.target_non_erased_pages,
+               "target_non_erased_bytes": summary.target_non_erased_bytes,
+               "excluded_non_erased_pages": summary.excluded_non_erased_pages,
+               "all_addresses_readable": summary.all_addresses_readable,
+               "all_pages_correctable": summary.all_pages_correctable,
+               "erased_scope_verified": summary.erased_scope_verified,
+               "ordered_sweep_sha256": summary.ordered_sweep_sha256,
+               "image_sha256": summary.image_sha256,
+               "image_bytes": summary.image_bytes,
                 "block_summary_sha256": hex::encode(sha2::Sha256::digest(&block_summary)),
                 "exception_blocks": exception_blocks,
                 "exception_block_count": exception_count,
                 "exception_blocks_truncated": exception_count > 256,
+                "per_block": summary
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        // Per-block page/OOB sweep summary (spec §1331).
+                        json!({
+                            "block": block.flat_block,
+                            "disposition": block.disposition,
+                            "pages": block.pages,
+                            "readable_pages": block.readable_pages,
+                            "unreadable_pages": block.unreadable_pages,
+                            "uncorrectable_pages": block.uncorrectable_pages,
+                            "non_erased_pages": block.non_erased_pages,
+                            "non_erased_bytes": block.non_erased_bytes,
+                            "maximum_corrected_bits": block.maximum_corrected_bits,
+                            "maximum_read_retries": block.maximum_read_retries,
+                            "maximum_read_latency_ms": block.maximum_read_latency_ms,
+                        })
+                    })
+                    .collect::<Vec<Value>>(),
             }))
         }
         "postcheck-c4" => {

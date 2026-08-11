@@ -2051,11 +2051,15 @@ fn write_evidence(
     }
     let mut append = Vec::new();
     for rec in per_block {
+        // The block identity is the record's physical coordinate: a flat
+        // array form, an explicit `flat` field, or the `block` key used by
+        // the block-level evidence records.
         let flat = rec
             .as_array()
             .and_then(|values| values.first())
             .and_then(|value| value.as_u64())
-            .or_else(|| rec.get("flat").and_then(|value| value.as_u64()));
+            .or_else(|| rec.get("flat").and_then(|value| value.as_u64()))
+            .or_else(|| rec.get("block").and_then(|value| value.as_u64()));
         let line = serde_json::json!({
             "plan_hash": plan_hash,
             "action": action_id,

@@ -11,7 +11,7 @@ use crate::errors::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const PROFILE_SCHEMA: u32 = 2;
+pub const PROFILE_SCHEMA: u32 = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

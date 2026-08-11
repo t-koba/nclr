@@ -27,7 +27,7 @@ mod tests {
             // nclr::profile is in the core crate; parse via the core's TOML
             // schema indirectly by emitting and re-loading through the core.
             let parsed: toml::Value = toml::from_str(content).unwrap();
-            assert_eq!(parsed["schema"].as_integer(), Some(2), "{name} schema");
+            assert_eq!(parsed["schema"].as_integer(), Some(1), "{name} schema");
         }
     }
 

@@ -15,7 +15,7 @@ keep state, or open any device path themselves.
 .TP
 .B nclr-<id> run   --request-fd 4 --device-fd 3 [--events-fd 5]
 .TP
-.B nclr-<id> status --request-fd 4 --device-fd 3
+.B nclr-<id> status --request-fd 4 --device-fd 3 [--events-fd 5]
 .TP
 .B nclr-<id> recover --request-fd 4 --device-fd 3 [--events-fd 5]
 .PP
@@ -31,7 +31,7 @@ go to the events fd.
 All fields optional unless noted:
 .TP
 .B api
-Protocol version (2).
+Protocol version (1).
 .TP
 .B op
 probe | plan | run | status | recover.

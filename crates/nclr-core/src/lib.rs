@@ -33,7 +33,7 @@ pub mod usb_bot;
 pub const SCHEMA_DEVICE: &str = "nclr.device.v1";
 pub const SCHEMA_PLAN: &str = "nclr.plan.v1";
 pub const SCHEMA_REPORT: &str = "nclr.report.v1";
-pub const BACKEND_API: u32 = 2;
+pub const BACKEND_API: u32 = 1;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Hash a normalized string with SHA-256 and format as `sha256:<hex>`.

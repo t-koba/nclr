@@ -1070,7 +1070,7 @@ const TEMPLATE: &str = r#"# nclr controller profile template.
 # Fill in the identification ranges and trust state. Never add D1-D4 from a
 # vendor data sheet or successful command alone: destructive execution needs
 # exact hardware identity, compiled driver support and independent HIL evidence.
-schema = 2
+schema = 1
 id = "{family}-{controller}"
 controller_id = "{controller}"
 firmware = { min = "1.0", max = "9.9" }

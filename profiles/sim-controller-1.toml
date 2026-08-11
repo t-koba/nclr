@@ -1,7 +1,7 @@
 # nclr controller profile: sim reference family.
 # The sim family is the certified reference implementation for the C3
 # controller-reinit path in this build (trust = production).
-schema = 2
+schema = 1
 id = "sim-controller-1"
 controller_id = "sim-ctlr-01"
 firmware = { min = "1.0", max = "9.9" }
@@ -19,4 +19,4 @@ sd_vendor = { read_only_health = true, cmd56_arg = 1, block_len = 512 }
 # C4 (physical scope) certification: the sim family passed the independent
 # physical validation fixture (tests/e2e.rs: certification_independent_physical_validation).
 certification = "C4"
-sha256 = "30ec37745cfc6b4b6f0369fae0503a30b7217ef76006e0ca6b3b060f7f671893"
+sha256 = "f7875643a4c7caa5291c184a57960af0059b19f993cc544160181a1e3b0aeb85"

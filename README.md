@@ -132,8 +132,9 @@ accepted only from package-managed `/usr/share` or `<prefix>/share`
 locations; a user-controlled `NCLR_PROFILE_DIR` cannot self-assert
 production trust. The sim backend additionally accepts only the exact
 digest of its compiled-in certified profile. Custom backends require a
-schema-2 production manifest with an exact executable digest; only bundled
-backend IDs in trusted install locations may omit the manifest.
+production manifest (api 1, trust "production") and a verified executable
+digest when the manifest declares one; only bundled backend IDs in trusted
+install locations may omit the manifest.
 
 ## Backend selection
 

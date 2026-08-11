@@ -2,6 +2,7 @@
 //! These run on any Unix (no root required): the target "devices" are files.
 
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -954,6 +955,57 @@ fn sim_physical_level_ok_c4() {
     assert!(r["evidence_sha256"].as_str().unwrap().len() == 64);
     let text = std::fs::read_to_string(ev_file).unwrap();
     assert!(text.lines().count() >= 124, "per-block records expected");
+    // Per-block evidence records carry the block-level detail (spec §1331):
+    // physical coordinates, classification, FBB/RBB state, erase attempt
+    // and result, and the page/OOB sweep summary.
+    let recs: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let erase_recs: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["action"] == "erase-data-blocks")
+        .collect();
+    assert_eq!(erase_recs.len(), 62, "one record per data block");
+    let erase_blocks: BTreeSet<u64> = erase_recs
+        .iter()
+        .map(|line| line["record"]["block"].as_u64().unwrap())
+        .collect();
+    assert_eq!(erase_blocks.len(), 62, "block coordinates must be unique");
+    for block in &erase_blocks {
+        assert!((0..64).contains(block), "block {block} out of range");
+        assert_ne!(*block, 2, "FBB blocks must not be erased");
+        assert_ne!(*block, 5, "FBB blocks must not be erased");
+    }
+    for line in &erase_recs {
+        let rec = &line["record"];
+        assert_eq!(rec["erase_attempted"], true);
+        assert_eq!(rec["erase_result"], "erased");
+        assert_eq!(rec["erased"], true);
+        assert!(rec["is_fbb"].is_boolean());
+        assert!(rec["historical_rbb"].is_boolean());
+    }
+    let sweep_recs: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["action"] == "verify-physical-erasure")
+        .collect();
+    assert_eq!(sweep_recs.len(), 64, "one record per physical block");
+    for line in &sweep_recs {
+        let rec = &line["record"];
+        assert!(rec["disposition"].is_string());
+        assert!(rec["unreadable_pages"].is_u64());
+        assert!(rec["uncorrectable_pages"].is_u64());
+        assert!(rec["non_erased_pages"].is_u64());
+        assert!(rec["maximum_corrected_bits"].is_u64());
+        // Every physical page is readable and correctable after the sweep.
+        // Factory-bad blocks are excluded from the erased-byte requirement
+        // and legitimately still hold stale data.
+        assert_eq!(rec["unreadable_pages"], 0);
+        assert_eq!(rec["uncorrectable_pages"], 0);
+        if rec["disposition"] != "factory-bad" {
+            assert_eq!(rec["non_erased_pages"], 0);
+        }
+    }
     // D3 per-block erased; no unknown reservation.
     let d3 = r["coverage"]
         .as_array()
@@ -1061,7 +1113,16 @@ fn sim_physical_salvage_reads_every_raw_page() {
     assert_eq!(result["physical_read"]["readable_pages"], 512);
     assert_eq!(result["physical_read"]["unreadable_pages"], 0);
     assert_eq!(result["physical_read"]["uncorrectable_pages"], 0);
-    assert!(result["physical_read"].get("per_block").is_none());
+    // The sweep carries a per-block page/OOB summary (spec §1331).
+    let per_block = result["physical_read"]["per_block"].as_array().unwrap();
+    assert_eq!(per_block.len(), 64, "one record per physical block");
+    for rec in per_block {
+        assert!(rec["disposition"].is_string());
+        assert!(rec["unreadable_pages"].is_u64());
+        assert!(rec["uncorrectable_pages"].is_u64());
+        assert!(rec["non_erased_pages"].is_u64());
+        assert!(rec["maximum_corrected_bits"].is_u64());
+    }
 
     let raw = std::fs::read(&output).unwrap();
     let expected_bytes =
@@ -1747,10 +1808,13 @@ fn backend_timeout_kills_and_interrupts() {
     let state = dir.join("sim.state");
     // A slow backend: the probe answers immediately, every action sleeps
     // far beyond the 1s timeout (30s leaves the timeout reliably first
-    // even under parallel-suite load).
+    // even under parallel-suite load). `exec` replaces the shell so the
+    // timeout kill lands on the sleeper itself; a forked child would keep
+    // the stdout pipe open past the timeout and block the reader until it
+    // exits.
     let back = dir.join("back");
     std::fs::create_dir_all(&back).unwrap();
-    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":2,\"ok\":true}'\n    ;;\n  *)\n    sleep 30\n    echo '{\"api\":2,\"ok\":true}'\n    ;;\nesac\n";
+    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true}'\n    ;;\n  *)\n    exec sleep 30\n    ;;\nesac\n";
     std::fs::write(back.join("nclr-lba"), script).unwrap();
     let mut perms = std::fs::metadata(back.join("nclr-lba"))
         .unwrap()
@@ -1760,7 +1824,7 @@ fn backend_timeout_kills_and_interrupts() {
     std::fs::set_permissions(back.join("nclr-lba"), perms).unwrap();
     std::fs::write(
         back.join("lba.toml"),
-        "schema = 2\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 2\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
+        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
     )
     .unwrap();
 
@@ -1798,7 +1862,7 @@ fn backend_interrupted_status_exits_75() {
     std::fs::write(&img, vec![0u8; 65536]).unwrap();
     let back = dir.join("back");
     std::fs::create_dir_all(&back).unwrap();
-    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":2,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"match\":\"exact\",\"capabilities\":[\"LBA_PRBS_WRITE\",\"ERASE_USER_AREA\"],\"grade_ceiling\":\"C2\",\"erase_coverage\":[\"D0\"],\"erase_method\":\"fake-erase\"}'\n    ;;\n  *)\n    echo '{\"api\":2,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"action\":\"device-user-area-erase\",\"action_results\":[{\"status\":\"interrupted\",\"message\":\"busy timeout; card may still be erasing\"}]}'\n    ;;\nesac\n";
+    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"match\":\"exact\",\"capabilities\":[\"LBA_PRBS_WRITE\",\"ERASE_USER_AREA\"],\"grade_ceiling\":\"C2\",\"erase_coverage\":[\"D0\"],\"erase_method\":\"fake-erase\"}'\n    ;;\n  *)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"action\":\"device-user-area-erase\",\"action_results\":[{\"status\":\"interrupted\",\"message\":\"busy timeout; card may still be erasing\"}]}'\n    ;;\nesac\n";
     std::fs::write(back.join("nclr-lba"), script).unwrap();
     let mut perms = std::fs::metadata(back.join("nclr-lba"))
         .unwrap()
@@ -1808,7 +1872,7 @@ fn backend_interrupted_status_exits_75() {
     std::fs::set_permissions(back.join("nclr-lba"), perms).unwrap();
     std::fs::write(
         back.join("lba.toml"),
-        "schema = 2\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 2\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
+        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
     )
     .unwrap();
 
@@ -2142,13 +2206,13 @@ fn check_reports_vendor_health_failure_as_warning() {
 req=$(cat <&4)
 case "$req" in
   *'"op":"probe"'*)
-    echo '{"api":2,"ok":true,"backend":"lba","version":"0.0.0","capabilities":["SD_VENDOR_HEALTH","SAMPLE_READ"],"grade_ceiling":"L1","trust":"production"}'
+    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0","capabilities":["SD_VENDOR_HEALTH","SAMPLE_READ"],"grade_ceiling":"L1","trust":"production"}'
     ;;
   *'"action":"vendor-health"'*)
-    echo '{"api":2,"ok":false,"backend":"lba","version":"0.0.0","action_results":[{"status":"error","message":"vendor health probe denied"}]}'
+    echo '{"api":1,"ok":false,"backend":"lba","version":"0.0.0","action_results":[{"status":"error","message":"vendor health probe denied"}]}'
     ;;
   *)
-    echo '{"api":2,"ok":true,"backend":"lba","version":"0.0.0","action_results":[{"status":"ok","action":"sample-read","value":{}}]}'
+    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0","action_results":[{"status":"ok","action":"sample-read","value":{}}]}'
     ;;
 esac
 "#,
@@ -2160,7 +2224,7 @@ esac
     std::fs::set_permissions(&be, perms).unwrap();
     std::fs::write(
         dir.join("lba.toml"),
-        "schema = 2\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 2\ntrust = \"production\"\noperations = [\"probe\", \"run\"]\n",
+        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"run\"]\n",
     )
     .unwrap();
     let (rc, out, _) = run_nclr(

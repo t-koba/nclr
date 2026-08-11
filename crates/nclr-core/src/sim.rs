@@ -1338,6 +1338,45 @@ impl SimDevice {
             .collect()
     }
 
+    /// Per-block detail for the C4 block-level evidence records (spec §1331):
+    /// physical coordinates, pre-classification state, FBB and historical
+    /// RBB flags, PROGRAM/READ/ECC results (injection, corrected bits,
+    /// weak/quarantine verdicts). The per-block vectors are all allocated
+    /// to the block count at open (invariant).
+    pub fn block_detail(&self, block: u32) -> Result<serde_json::Value> {
+        let i = block as usize;
+        if i >= self.states.len() {
+            return Err(Error::Invalid(format!(
+                "block {block} is out of range ({} blocks)",
+                self.states.len()
+            )));
+        }
+        let state = self.states[i];
+        let inj = self.inject[i];
+        let corrected = self.corrected_bits[i];
+        let qual = self.qual_flags[i];
+        let category = self
+            .enumerate_blocks()
+            .iter()
+            .find(|(b, _)| *b == block)
+            .map(|(_, c)| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(serde_json::json!({
+            "block": block,
+            "category": category,
+            "state": state,
+            "is_fbb": state == STATE_FBB,
+            "historical_rbb": state == STATE_OLD_RBB,
+            "inject_erase": inj & INJ_ERASE != 0,
+            "inject_program": inj & INJ_PROGRAM != 0,
+            "inject_read": inj & INJ_READ != 0,
+            "corrected_bits": corrected,
+            "weak": qual & QUAL_WEAK != 0,
+            "quarantined": qual & QUAL_QUARANTINED != 0,
+            "protected": self.is_protected(block),
+        }))
+    }
+
     /// Attempt physical ERASE of a block. FBB is protected.
     pub fn erase_physical(&mut self, block: u32) -> Result<()> {
         if self.read_only {
@@ -1808,6 +1847,55 @@ mod tests {
         dev2.enter_service_mode().unwrap();
         assert!(dev2.exit_service_mode().is_err());
         assert!(dev2.service_mode());
+    }
+
+    #[test]
+    fn block_detail_reports_state_injection_and_qualifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("detail.img");
+        let spec = SimSpec {
+            fbb: vec![0],
+            old_rbb: vec![1],
+            fail_erase: vec![2],
+            fail_program: vec![3],
+            fail_read: vec![4],
+            weak_blocks: vec![5],
+            protected_area_blocks: 2,
+            ..SimSpec::default()
+        };
+        create(&p, &spec).unwrap();
+        let dev = SimDevice::open(&p).unwrap();
+
+        let fbb = dev.block_detail(0).unwrap();
+        assert_eq!(fbb["is_fbb"], true);
+        assert_eq!(fbb["historical_rbb"], false);
+        assert_eq!(fbb["protected"], false);
+
+        let old = dev.block_detail(1).unwrap();
+        assert_eq!(old["historical_rbb"], true);
+        assert_eq!(old["is_fbb"], false);
+
+        let inj_erase = dev.block_detail(2).unwrap();
+        assert_eq!(inj_erase["inject_erase"], true);
+        assert_eq!(inj_erase["inject_program"], false);
+        assert_eq!(inj_erase["inject_read"], false);
+
+        let inj_program = dev.block_detail(3).unwrap();
+        assert_eq!(inj_program["inject_program"], true);
+
+        let inj_read = dev.block_detail(4).unwrap();
+        assert_eq!(inj_read["inject_read"], true);
+
+        let weak = dev.block_detail(5).unwrap();
+        assert_eq!(weak["weak"], true);
+        assert_eq!(weak["quarantined"], false);
+
+        let protected = dev.block_detail(spec.blocks - 1).unwrap();
+        assert_eq!(protected["protected"], true);
+        assert_eq!(protected["is_fbb"], false);
+
+        let err = dev.block_detail(spec.blocks);
+        assert!(err.is_err(), "out-of-range block must be an error");
     }
 }
 

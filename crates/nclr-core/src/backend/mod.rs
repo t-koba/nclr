@@ -156,11 +156,6 @@ pub fn find(id: &str, dirs: &[PathBuf]) -> Result<BackendHandle> {
                 .map_err(|e| Error::Invalid(format!("manifest read: {e}")))?;
             let toml: toml::Value =
                 toml::from_str(&m).map_err(|e| Error::Invalid(format!("manifest parse: {e}")))?;
-            if toml.get("schema").and_then(|v| v.as_integer()) != Some(2) {
-                return Err(Error::Invalid(format!(
-                    "backend {id} manifest schema must be 2"
-                )));
-            }
             if manifest_string(&toml, "id")? != id {
                 return Err(Error::Invalid(format!(
                     "backend {id} manifest id does not match"
