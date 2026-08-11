@@ -1,0 +1,216 @@
+.TH NCLR 1 "August 2026" "nclr 0.1.0" "User Commands"
+.SH NAME
+nclr \- NAND media erase / reinitialize CLI
+.SH SYNOPSIS
+.B nclr ls [\-j]
+.br
+.B nclr info [\-j] DEVICE
+.br
+.B nclr plan [\-l LEVEL] [OPTIONS] DEVICE
+.br
+.B nclr run [\-l LEVEL] [OPTIONS] DEVICE
+.br
+.B nclr run \-\-plan FILE|\- [OPTIONS]
+.br
+.B nclr check [\-j] [OPTIONS] DEVICE
+.br
+.B nclr salvage DEVICE \-\-output FILE \-\-map FILE [OPTIONS]
+.br
+.B nclr resume [OPTIONS] STATE
+.br
+.B nclr help [COMMAND]
+.SH DESCRIPTION
+.B nclr
+erases and reinitializes one managed NAND medium (SD/microSD, USB flash) to
+a reusable raw-uninitialized block device state. It is a one-shot, one-medium
+CLI: no daemon, no API, no internal database.
+.PP
+When the backend has a documented device-level erase (SCSI SANITIZE BLOCK
+ERASE, native SD full-range ERASE), the strongest plan is C2: the device
+erase runs last, followed by a blank sweep, signature check, power cycle and
+re-enumeration check. When a production controller profile matches the device
+exactly, the C3 plan runs the controller reinitialization (BBT capture,
+service mode, per-block old RBB erase, PROGRAM/READ/ECC qualification, new
+BBT/spare/FTL rebuild with old FTL invalidation, capacity accounting). Real
+Phison, Alcor and SMI execution additionally requires an authenticated exact
+tuple protocol recipe and independent qualification report.
+Otherwise the L1 recipe overwrites the full logical space with a
+plan-seeded PRBS pattern, flushes, power cycles, verifies, overwrites with
+zeros, verifies again, and checks that no partition/filesystem signatures
+remain. Evidence (C grade, residual risk, H grade) is reported
+independently; the final state is always
+.B raw-uninitialized
+and no filesystem is created.
+.SH DANGER
+Destructive. Verify the device path, fingerprint and capacity before running.
+The run confirmation token is of the form
+.BR DEVICE-FINGERPRINT8-CAPACITY ,
+for example
+.BR sdb-1d4a8c2e-31GB .
+.SH COMMANDS
+.TP
+.B ls [\-j]
+List removable whole-disk candidates, one device path per line (\-j: JSON).
+.TP
+.B info [\-j] DEVICE
+Read-only identity, transport, capacity, fingerprint and backend capability.
+.TP
+.B plan [\-l LEVEL] [OPTIONS] DEVICE
+Produce a normalized JSON plan on stdout (read-only).
+.TP
+.B run [\-l LEVEL] [OPTIONS] DEVICE
+Generate a plan internally, confirm, and execute (destructive).
+.TP
+.B run \-\-plan FILE|\- [OPTIONS]
+Execute a fixed plan file (or stdin). The plan hash, fingerprint, physical
+path and capacity are validated before any destructive action.
+.TP
+.B check [\-j] [\-\-scratch\-range START:SECTORS] [\-\-yes] DEVICE
+Non-destructive assessment: identity, sample reads, warnings. Never writes,
+except for an explicit bounded write test: \-\-scratch\-range START:SECTORS
+(with \-\-yes confirmation) writes a limited range and restores it, e.g.
+\-\-scratch\-range 0:1024. Results are reported in the check JSON
+(samples, vendor_health, scratch_test, errors).
+.TP
+.B salvage DEVICE \-\-output FILE \-\-map FILE [OPTIONS]
+Enter the exactly matched controller service mode and read every declared
+physical NAND page, including OOB bytes, without erase or program commands.
+FILE is a new raw image in flat-block-major, page-minor, data-then-OOB order.
+The mandatory NDJSON map records geometry, disposition, offsets, ECC/retry
+metrics and unreadable zero-filled holes. Neither output may already exist.
+.TP
+.B resume [OPTIONS] STATE
+Continue from an append-only journal state file after an interruption. The
+device is re-identified and the backend queried before continuing.
+.TP
+.B help [COMMAND]
+Show help for a subcommand.
+.SH OPTIONS
+.TP
+.B \-l, \-\-level LEVEL
+Processing level: best (default), lba, device, controller, physical.
+C1 (lba), C2 (device), C3 (controller) and C4 (physical) are implemented.
+C2 requires a documented device-level erase capability; C3 requires a
+production controller profile matching the device exactly; C4 requires a
+certified physical-scope backend (independent validation, TEST-001).
+Controller and physical plans never switch to a weaker erase method after
+their first state-changing action; recovery/resume is required on failure.
+.TP
+.B \-\-min-level LEVEL
+Minimum C grade the run result must meet (else degraded, exit 1).
+.TP
+.B \-\-no-fallback
+Do not fall back to a weaker path (e.g. zero-only after PRBS write failure).
+.TP
+.B \-\-backend ID
+Force a specific backend; rejected if it does not match the device.
+.TP
+.B \-\-backend-dir DIR
+Additional backend search directory (repeatable; also NCLR_BACKEND_DIR).
+.TP
+.B \-\-artifact-dir DIR
+Content-addressed controller artifact store for run/resume (repeatable; also
+NCLR_ARTIFACT_DIR). Every plan-pinned object is opened without following
+symlinks and revalidated by size, SHA-256 and format before confirmation.
+.TP
+.B \-\-state FILE
+Journal/state file location (default:
+/var/lib/nclr/run/<plan-id>.state for root, $XDG_STATE_HOME/nclr otherwise).
+Controller runs also create a two-slot, SHA-256 protected FILE.controller
+state used for power-loss recovery.
+.TP
+.B \-\-events-fd N
+Write NDJSON progress events to fd N (never mixed with stdout).
+.TP
+.B \-\-backend-timeout SECS
+Kill a backend call that exceeds SECS (0 disables; default 0). The run
+becomes interrupted (exit 75) and the journal records the boundary; nothing
+is resent without a device status query (SAFE-003).
+.TP
+.B \-\-config FILE
+Site policy file (default /etc/nclr/nclr.toml): allowed_backends,
+minimum_level, spare_ratio bounds, power-cycle command allowlist.
+.TP
+.B \-\-unmount
+Unmount target mounts (normal unmount only) before proceeding.
+.TP
+.B \-\-yes
+Skip the interactive confirmation prompt; safety checks are never skipped.
+.TP
+.B \-\-power-cycle CMD
+Approved external power control command, executed between verify phases.
+.TP
+.B \-\-allow-nonremovable
+Allow non-removable targets (system disk protection remains absolute).
+.TP
+.B \-\-aggressive-lba
+Research option: finite extra PRBS churn passes (grade ceiling stays C1).
+.TP
+.B \-\-summary
+Emit the redacted summary report (nclr.summary.v1: grades, residual, final
+state; identity fields are omitted) instead of the full report.
+.TP
+.B \-j, \-\-json
+Machine-readable JSON output (stdout carries only the JSON document).
+.TP
+.B \-q, \-\-quiet
+Suppress progress output; warnings and errors remain.
+.TP
+.B \-v, \-\-verbose
+Increase diagnostic detail (repeatable).
+.SH STREAMS
+Data (final reports, plans, listings) goes to stdout. Diagnostics, progress
+and confirmation prompts go to stderr. Machine progress events go to
+\-\-events-fd as one JSON object per line.
+.SH EXIT STATUS
+.TP
+.B 0
+Requested reach achieved and post-verification passed.
+.TP
+.B 1
+Completed but degraded (residual risk, health H1, or min level unmet).
+.TP
+.B 2
+No safe processing path; requested level cannot be planned.
+.TP
+.B 64
+Usage error.
+.TP
+.B 69
+Required backend or external capability unavailable.
+.TP
+.B 74
+Device I/O or protocol error.
+.TP
+.B 75
+Interrupted; a resumable journal state was left.
+.TP
+.B 77
+Permission or safety interlock rejection.
+.TP
+.B 78
+Invalid profile, plan, signature or schema.
+.SH EXAMPLES
+.TP
+Plan and execute with a fixed plan:
+.nf
+nclr plan -l best /dev/sdb > card.plan.json
+sudo nclr run --plan card.plan.json -j > card.report.json
+.fi
+.TP
+One-shot interactive run:
+.nf
+sudo nclr run -l best /dev/sdb
+.fi
+.TP
+Monitor progress with events:
+.nf
+sudo nclr run --plan card.plan.json --events-fd 9 9> events.ndjson
+.fi
+.TP
+Read the complete physical NAND address space for salvage:
+.nf
+sudo nclr salvage /dev/sdb --output card.raw --map card.pages.ndjson
+.fi
+.SH SEE ALSO
+nclr-lab(1), nclr-backend(7).

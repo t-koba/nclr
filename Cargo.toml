@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nclr-core",
+    "crates/nclr-backends",
+    "crates/nclr-profiles",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

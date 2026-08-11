@@ -1,0 +1,22 @@
+# Build artifacts
+/target
+/build
+
+# Not managed by git (project convention)
+/AGENTS.md
+/CLAUDE.md
+.claude/
+.codex/
+codex.md
+opencode.json
+opencode.jsonc
+.opencode/
+.github/copilot-instructions.md
+
+# OS and editor litter
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.log

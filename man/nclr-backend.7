@@ -1,0 +1,100 @@
+.TH NCLR-BACKEND 7 "August 2026" "nclr 0.1.0" "File Formats and Protocols"
+.SH NAME
+nclr-backend \- nclr backend execution protocol and contract
+.SH DESCRIPTION
+Backends are short-lived executables located under
+.B /usr/libexec/nclr/
+(nclr-lba, nclr-sim, nclr-scsi, nclr-sd-native, nclr-controller). The core
+executes exactly one request per invocation; backends must not daemonize,
+keep state, or open any device path themselves.
+.SH INVOCATION
+.TP
+.B nclr-<id> probe --request-fd 4 --device-fd 3 [--events-fd 5]
+.TP
+.B nclr-<id> plan  --request-fd 4 --device-fd 3 [--events-fd 5]
+.TP
+.B nclr-<id> run   --request-fd 4 --device-fd 3 [--events-fd 5]
+.TP
+.B nclr-<id> status --request-fd 4 --device-fd 3
+.TP
+.B nclr-<id> recover --request-fd 4 --device-fd 3 [--events-fd 5]
+.PP
+The device fd is opened and validated by the core (fstat, sysfs
+correspondence); the request is read from the request fd until EOF. Optional
+additional device fds (sg, usbfs) are inherited at fd 6 and above and are
+described in the request's extra_fds array. Physical salvage outputs are a
+paired physical-image and physical-map fd; paths are never sent to a backend.
+Backends write one final JSON
+response to stdout and exit; diagnostics go to stderr; NDJSON progress events
+go to the events fd.
+.SH REQUEST
+All fields optional unless noted:
+.TP
+.B api
+Protocol version (2).
+.TP
+.B op
+probe | plan | run | status | recover.
+.TP
+.B action
+For run: the action id (inventory, lba-prbs-write, device-user-area-erase,
+enumerate-blocks, erase-data-blocks, qualify-blocks,
+verify-physical-erasure, salvage-physical, rebuild-bbt-ftl,
+scratch-test, ...).
+.TP
+.B seed
+PRBS seed (plan hash) for pattern actions.
+.TP
+.B params
+Action parameters (e.g. scratch-test {start, count}).
+.TP
+.B extra_fds
+[{fd, role}] inherited extra device fds.
+.SH RESPONSE
+.TP
+.B ok
+boolean.
+.TP
+.B backend / version / match / grade_ceiling / capabilities
+probe identity data. Capabilities use the protocol vocabulary
+(READ_IDENTITY, ERASE_USER_AREA, CONTROLLER_REINITIALIZE, PHYSICAL_SCOPE,
+PHYSICAL_SALVAGE,
+SD_VENDOR_HEALTH, LBA_PRBS_WRITE, ...).
+.TP
+.B action_results
+Array of {status: ok|partial|error|interrupted, errors, ...} for run
+actions. Action failures are reported in the response with a clean exit; a
+nonzero exit indicates a protocol/transport failure. A status of
+.B interrupted
+(reported with a clean exit) means the device operation was stopped in a
+resumable state (for example a busy timeout mid-erase); the core exits 75
+and the run can be continued with
+.B nclr resume
+instead of treating the operation as failed.
+.SH CONTRACT RULES
+.IP 1.
+The backend operates only on the inherited fds; it must never open a device
+path (SEC-001).
+.IP 2.
+One request per process; no RPC server, no sockets, no database.
+.IP 3.
+Destructive operations require an exact production-profile match and the
+declared trust state.
+.IP 4.
+IMMED long-running operations (e.g. SANITIZE) return {started: true}; the
+core polls the status op and the backend reports progress until completion.
+.IP 5.
+Per-block records (erase results) are returned in action_results; the core
+streams them to the evidence directory.
+.IP 6.
+Capabilities are declared only when the profile exactly matches and the
+preconditions hold; existence of a function is not a capability.
+.SH MANIFESTS
+A backend manifest <dir>/<id>.toml declares id, trust, profile, version and
+an optional sha256 digest of the binary. The core reads those fields,
+verifies the digest when present and records backend version/digest in
+reports; manifests with trust = "research" are refused for destructive
+operations. (The id and api are implied by the filename and protocol; a
+schema field, when present, is informational.)
+.SH SEE ALSO
+nclr(1), nclr-lab(1).

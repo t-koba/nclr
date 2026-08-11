@@ -1,0 +1,27 @@
+[package]
+name = "nclr-core"
+version.workspace = true
+edition.workspace = true
+description = "nclr core: NAND media erase / reinitialize library and CLI"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "nclr"
+
+[[bin]]
+name = "nclr"
+path = "src/bin/nclr.rs"
+
+[[bin]]
+name = "nclr-lab"
+path = "src/bin/nclr-lab.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+toml = "0.8"
+libc = "0.2"
+tempfile = "3"

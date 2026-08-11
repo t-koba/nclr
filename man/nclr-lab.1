@@ -1,0 +1,92 @@
+.TH NCLR-LAB 1 "August 2026" "nclr-lab 0.1.0" "User Commands"
+.SH NAME
+nclr-lab \- research tooling for nclr vendor protocols and profiles
+.SH SYNOPSIS
+.B nclr-lab artifact fetch MANIFEST \-\-store DIR [\-\-accept-source-terms]
+.br
+.B nclr-lab artifact import MANIFEST SOURCE \-\-store DIR
+.br
+.B nclr-lab artifact verify MANIFEST (\-\-file FILE|\-\-store DIR)
+.br
+.B nclr-lab decode CDB [\-\-response HEX]
+.br
+.B nclr-lab diff TRACE_A TRACE_B [\-\-summary]
+.br
+.B nclr-lab infer HEX [\-\-command]
+.br
+.B nclr-lab profile \-\-new [\-\-family NAME] [\-\-controller ID] [\-o FILE]
+.br
+.B nclr-lab profile \-\-check FILE
+.br
+.B nclr-lab recipe \-\-profile PROFILE \-\-file RECIPE
+.br
+.B nclr-lab replay TRACE [\-\-execute] [\-\-confirm-sacrificial]
+.br
+.B nclr-lab cap \-\-bus N [\-o FILE]
+.br
+.B nclr-lab trace CAPTURE.pcapng [\-o TRACE.ndjson]
+.SH DESCRIPTION
+.B nclr-lab
+is a separate research tool package. Protocol inference and replay do not
+share destructive handlers with
+.BR nclr run .
+The size, SHA-256 and format verifier is intentionally shared so both tools
+authenticate identical artifact bytes. Unknown write commands are never
+brute-forced; replay defaults to a dry run and requires an explicit
+sacrificial-device confirmation to send read-only commands.
+.SH COMMANDS
+.TP
+.B artifact fetch|import|verify
+Acquire or import exact vendor bytes without redistributing them. The
+manifest pins controller, firmware, NAND id, size, SHA-256, format, HTTPS
+source and terms. Non-redistributable downloads require
+\-\-accept-source-terms. Objects are stored as DIR/id/sha256 and are never
+executed by this command.
+.TP
+.B decode [\-\-lenient] CDB [RESPONSE_HEX]
+Decode a hex SCSI CDB (e.g. "48 03 00 00 00 02") into a structured
+description; optionally attach a hex response. \-\-lenient tolerates
+unknown opcodes and short payloads.
+.TP
+.B diff TRACE_A TRACE_B
+Compare two NDJSON traces (opcode/status/response differences).
+.TP
+.B infer HEX
+Heuristics over a byte sequence: role, length, endianness candidates,
+checksum candidates (sum/xor/crc16), tail sequence.
+.TP
+.B profile \-\-new
+Generate a controller profile template (research trust by default).
+.TP
+.B profile \-\-check FILE
+Validate a profile against the schema.
+.TP
+.B recipe \-\-profile PROFILE \-\-file RECIPE
+Authenticate the recipe using the profile-pinned size, SHA-256 and format,
+then validate its exact controller/firmware/NAND binding, bounded CDB and
+response fields, NAND geometry, BBT/FTL/capacity layouts, qualification and
+USB re-enumeration policy. This does not execute a command.
+.TP
+.B replay [\-\-device\-fd N] [\-\-execute] TRACE
+Replay read-only commands from a trace. Dry-run by default; write commands
+are always skipped; execution requires \-\-execute and
+\-\-confirm-sacrificial (Linux SG_IO). \-\-device\-fd N sends the trace
+commands to an open device fd instead of opening one itself.
+.TP
+.B cap \-\-bus N
+Capture USB traffic from Linux usbmon (root required; not available on
+macOS).
+.TP
+.B trace CAPTURE.pcapng
+Use TShark to decode raw bulk endpoint payloads and validate USB Mass Storage
+Bulk-Only Transport CBW/data/CSW sequences. Output is normalized NDJSON.
+Payload bytes are represented by SHA-256 only unless both
+\-\-include-payload and \-\-confirm-sensitive-payload are supplied. The
+offline conversion is supported on macOS.
+.SH SAFETY
+Write-command brute forcing is prohibited. Read-only and state-changing
+commands are classified separately in the output. Research profiles are
+never usable by the core's destructive run.
+.SH EXIT STATUS
+0 success; 64 usage; 69 unsupported platform/feature; 74 I/O; 77 safety
+interlock.

@@ -1,0 +1,10 @@
+[package]
+name = "nclr-profiles"
+version.workspace = true
+edition.workspace = true
+description = "nclr production controller profile data (embedded; materialized by the installer)"
+license = "MIT OR Apache-2.0"
+
+[dev-dependencies]
+toml = "0.8"
+tempfile = "3"
