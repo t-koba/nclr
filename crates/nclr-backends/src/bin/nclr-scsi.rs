@@ -83,36 +83,46 @@ mod linux {
         )?;
         let inquiry = scsi::parse_inquiry(&inq)?;
 
-        // READ CAPACITY(16) first; fall back to READ CAPACITY(10).
-        let cap16 = scsi_command(
+        // READ CAPACITY(10) first (SBC-4): the 0xFFFFFFFF/0xFFFFFFFF
+        // response means the device exceeds the 10-byte addressing range,
+        // and only then READ CAPACITY(16) is used. Leading with the 16-byte
+        // CDB resets some older USB bridges (they answer with DID_RESET
+        // instead of a clean sense), leaving the device NOT READY for the
+        // subsequent fallback.
+        let cap10 = scsi_command(
             file,
-            &scsi::cdb_read_capacity_16(32),
+            &scsi::cdb_read_capacity_10(),
             scsi::SG_DXFER_FROM_DEV,
-            32,
+            8,
         );
-        let (capacity_bytes, block_size) = match cap16 {
-            Ok(d) if d.len() >= 12 => {
-                let blocks = u64::from_be_bytes(d[0..8].try_into().unwrap());
-                let bsz = u32::from_be_bytes(d[8..12].try_into().unwrap());
-                ((blocks + 1).saturating_mul(bsz as u64), bsz)
-            }
-            _ => {
-                let d = scsi_command(
-                    file,
-                    &scsi::cdb_read_capacity_10(),
-                    scsi::SG_DXFER_FROM_DEV,
-                    8,
-                )?;
+        let (capacity_bytes, block_size) = match cap10 {
+            Ok(d) if d.len() >= 8 => {
                 let blocks = u32::from_be_bytes(d[0..4].try_into().unwrap());
                 let bsz = u32::from_be_bytes(d[4..8].try_into().unwrap());
-                // SBC-4: FFFFFFFF in both fields means the device exceeds
-                // the READ CAPACITY(10) addressing range.
                 if blocks == 0xFFFF_FFFF && bsz == 0xFFFF_FFFF {
-                    return Err(Error::Invalid(
-                        "device capacity exceeds READ CAPACITY(10) range (2 TiB+); READ CAPACITY(16) required".into(),
-                    ));
+                    let d = scsi_command(
+                        file,
+                        &scsi::cdb_read_capacity_16(32),
+                        scsi::SG_DXFER_FROM_DEV,
+                        32,
+                    )?;
+                    if d.len() < 12 {
+                        return Err(Error::Invalid(
+                            "READ CAPACITY(16) returned a truncated response".into(),
+                        ));
+                    }
+                    let blocks = u64::from_be_bytes(d[0..8].try_into().unwrap());
+                    let bsz = u32::from_be_bytes(d[8..12].try_into().unwrap());
+                    ((blocks + 1).saturating_mul(bsz as u64), bsz)
+                } else {
+                    ((blocks as u64 + 1).saturating_mul(bsz as u64), bsz)
                 }
-                ((blocks as u64 + 1).saturating_mul(bsz as u64), bsz)
+            }
+            _ => {
+                return Err(Error::io(
+                    "READ CAPACITY(10) returned a truncated response".to_string(),
+                    None,
+                ))
             }
         };
 
