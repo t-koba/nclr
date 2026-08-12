@@ -2146,22 +2146,53 @@ mod linux {
     fn usb_family_hint(request: &Value) -> Option<Family> {
         let vid = request.get("device")?.get("usb")?.get("vid")?.as_str()?;
         let vid = u16::from_str_radix(vid.trim_start_matches("0x"), 16).ok()?;
-        vendor::family_hint_from_usb_vid(vid)
+        let profiles = profile::load_identify_profiles(&[]);
+        profile::family_hint_from_vid(vid, &profiles)
     }
 
     /// Probe only the family selected by a vendor-owned USB VID. Every
     /// successful path validates a controller response signature before it
-    /// returns an identity.
+    /// returns an identity. The identification profile supplies the probe
+    /// parameters (vendor id hints, INQUIRY marker).
     fn vendor_identity(
         file: &std::fs::File,
         hint: Option<Family>,
     ) -> Result<Option<ControllerIdentity>> {
-        let Some(family) = hint else {
-            return Ok(None);
+        let profiles = profile::load_identify_profiles(&[]);
+        let marker = match hint {
+            Some(family) => profiles
+                .iter()
+                .find(|p| p.family == family.as_str())
+                .and_then(|p| p.inquiry_marker.clone()),
+            None => profiles
+                .iter()
+                .find(|p| p.inquiry_marker.is_some())
+                .and_then(|p| p.inquiry_marker.clone()),
         };
-        vendor::identify_with(family, |cdb, len| {
-            scsi_command(file, cdb, scsi::SG_DXFER_FROM_DEV, len)
-        })
+        match hint {
+            Some(family) => vendor::identify_with(family, marker.as_ref(), |cdb, len| {
+                scsi_command(file, cdb, scsi::SG_DXFER_FROM_DEV, len)
+            }),
+            // No vendor-owned VID hint: fall back to controller signatures
+            // carried in the standard INQUIRY response. Only INQUIRY is
+            // issued (never an unknown vendor CDB), so a device that does
+            // not match simply answers harmlessly.
+            None => {
+                let Some(marker) = marker else {
+                    return Ok(None);
+                };
+                let inquiry = scsi_command(
+                    file,
+                    &vendor::inquiry_cdb(marker.alloc_len),
+                    scsi::SG_DXFER_FROM_DEV,
+                    marker.alloc_len as usize,
+                )?;
+                match vendor::parse_inquiry_marker(&inquiry, &marker) {
+                    Ok(identity) => Ok(Some(identity)),
+                    Err(_) => Ok(None),
+                }
+            }
+        }
     }
 
     /// Find the first production-trust profile that matches the device.
@@ -2394,6 +2425,9 @@ mod linux {
             Family::AlcorAu698x => "alcor-au698x",
             Family::SiliconMotionUfd => "smi-sm32x",
             Family::SandiskCruzer => "sandisk-cruzer",
+            // No recipe is documented for the USBest UT163 family; the
+            // string exists only to keep the mapping total and explicit.
+            Family::UsbestUt163 => "usbest-ut163",
         }
     }
 
@@ -2403,6 +2437,7 @@ mod linux {
             "alcor-au698x" => Some(Family::AlcorAu698x),
             "smi-sm32x" => Some(Family::SiliconMotionUfd),
             "sandisk-cruzer" => Some(Family::SandiskCruzer),
+            "usbest-ut163" => Some(Family::UsbestUt163),
             _ => None,
         }
     }

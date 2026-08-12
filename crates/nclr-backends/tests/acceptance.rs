@@ -112,6 +112,61 @@ fn core_01_no_daemon_no_api_no_db() {
     assert_eq!(before, after, "read-only commands must not create state");
 }
 
+/// `info -j` reports the device identity, the matched backend probe and the
+/// best-effort controller identification (null for non-USB targets like the
+/// sim file; a structured object for USB mass storage devices).
+#[test]
+fn core_06_info_reports_controller_identify_field() {
+    let dir = tmpdir("c06");
+    let img = dir.join("sim.img");
+    make_sim(&img, &["--id", "acc-c06"]);
+    let (rc, out, err) = run_nclr(&["info", "-j", img.to_str().unwrap()], &[]);
+    assert_eq!(rc, 0, "info failed: {err}");
+    let v = json_of(&out);
+    assert_eq!(v["identity"]["schema"], "nclr.device.v1");
+    assert!(v["identity"].is_object(), "identity object missing");
+    assert!(v["backend_probe"].is_object(), "backend_probe missing");
+    // A regular file is not a USB device: no controller family can be
+    // selected, so the field is present and null.
+    assert!(
+        v.get("controller_identify").is_some(),
+        "controller_identify field must be present"
+    );
+    assert!(
+        v["controller_identify"].is_null(),
+        "controller_identify must be null for non-USB targets"
+    );
+}
+
+/// The marker parser for the USBest UT163 INQUIRY signature is validated
+/// against the byte layout measured on the Imation Flash Drive Mini
+/// ("UtffU163A1BM" in the vendor-specific area past the standard 36 bytes).
+#[test]
+fn core_08_ut163_inquiry_marker_parser() {
+    use nclr::controller_protocol::parse_inquiry_marker;
+    use nclr::profile::InquiryMarkerIdentify;
+    let marker = InquiryMarkerIdentify {
+        marker: "U163".into(),
+        alloc_len: 96,
+        standard_len: 36,
+    };
+    let mut inquiry = vec![0u8; 96];
+    inquiry[8..16].copy_from_slice(b"Imation ");
+    inquiry[16..32].copy_from_slice(b"Flash Drive     ");
+    inquiry[32..36].copy_from_slice(b"1.00");
+    inquiry[36..48].copy_from_slice(b"UtffU163A1BM");
+    let identity = parse_inquiry_marker(&inquiry, &marker).expect("UT163 marker must parse");
+    assert_eq!(identity.controller_id, "usbest-ut163");
+    assert_eq!(identity.firmware, "1.00");
+
+    // A generic device without the vendor marker must not match.
+    let mut generic = vec![0u8; 96];
+    generic[8..16].copy_from_slice(b"Generic ");
+    generic[16..32].copy_from_slice(b"USB Flash Disk  ");
+    generic[32..36].copy_from_slice(b"8.07");
+    assert!(parse_inquiry_marker(&generic, &marker).is_err());
+}
+
 fn walk(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {

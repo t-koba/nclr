@@ -12,12 +12,15 @@
 | Alcor AU698x | config + flash ID 実装済み | runtime recipe | 同上 | なし | exact recipe + HIL が揃うまで C3 を拒否 |
 | Silicon Motion SM32X | `F0 04 ... 02` identity page 実装済み | runtime recipe | 同上 | なし | exact erase/NAND/metadata recipe + HIL が揃うまで C3 を拒否 |
 | SanDisk Cruzer proprietary (`82-00263-1` を含む) | exact USB/SCSI bootstrap + runtime `read-controller-id` / `read-nand-id` | runtime recipe | 同上 | なし | controller-owned 2 段 identity と exact recipe + HIL が揃うまで C3 を拒否 |
+| USBest UT163 | 標準 INQUIRY の vendor-specific 領域の `U163` マーカー (追加 CDB なし) | 公開資料なし | なし | なし | 読み取り専用の識別のみ。service CDB が公開されていないため C3 を拒否 |
 
 「MPTool で初期化できる」「コマンドが GOOD status を返す」「ファームウェアを書き換えられる」は、D1–D4 の処理証拠ではない。C3 を有効にするには、少なくとも全非 FBB ブロックの列挙、D1/D2 の物理消去、旧 RBB の個別消去結果、旧・新 BBT 差分、旧 FTL 世代の無効化、新 FTL の commit、電源再投入後の独立確認が必要である。
 
 ## 実装した安全境界
 
 - USB VID は送信してよい読み取り専用プローブを 1 ファミリーへ限定するヒントとしてだけ使う。OEM VID を推測して総当たりしない。OEM VID は trusted production profile の exact USB / SCSI bootstrap が明示した family と runtime identity recipe でのみ扱う。
+- VID からベンダー名・モデル名を表示するときは、ツール固有の表を持たず OS の usb.ids (linux-usb.org、udev hwdb の生成元) を読み、無い場合はデバイスの iManufacturer 文字列にフォールバックする。ベンダー名はブランド情報であり、コントローラ family の断定には使わない (例: Imation ブランドの UT163)。
+- 読み取り専用の controller family 識別パラメータ (VID ヒント、INQUIRY マーカー、報告名) は `profiles/identify-*.toml` に置き、コードへ埋め込まない。ファミリ名は既知の enum と照合して検証する。
 - Phison は vendor version page の `VR` シグネチャ、big-endian chip type、firmware bytes、run mode を検証する。続いて 6-byte NAND ID を取得し、全 `00` / 全 `FF` を拒否する。
 - Alcor は 512-byte config の `99 07` シグネチャ、little-endian VID/PID/bcdDevice、USB string descriptor の型・偶数長・境界を検証する。シグネチャ確認後だけ flash ID を取得する。
 - SCSI INQUIRY の vendor/product/revision 文字列を単独の controller 推定には使わない。署名済み production profile が USB VID/PID/bcdDevice と SCSI 3 文字列を全て固定した exact bootstrap tuple に限り、runtime recipe の候補選択へ使用する。
@@ -209,6 +212,16 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 5. `SDTNNNAHSM` / `SDTNNNAHEM` / `SDTNNNBHSM` / `SDTNNNBHEM`、8-bit / 16-bit / 16-8 表現、XOR / randomizer、page/OOB、ECC layout を別 tuple とし、`82-00263-1` だけを根拠に geometry を共用しない。
 
 このため engine は `82-00263-1` を含む SanDisk proprietary controller recipe を実行できるが、repository には未確認 PID、firmware、CDB、geometry を埋めた production profile を同梱しない。対象個体の正規 tool capture から exact `read-controller-id`、`read-nand-id`、physical erase / raw page / status / BBT / FTL commit command を抽出し、同一 tuple の recipe として固定する必要がある。
+
+## USBest UT163
+
+一次資料:
+
+- [USBest UT163 datasheet](https://opendevices.ru/wp-content/uploads/2011/11/USBest_UT163.pdf) は USB 2.0 flash disk controller の機能を説明するが、SCSI ベンダー固有コマンドや service mode の protocol は公開しない。
+- [UT163/UT165 USB Flash Disk Utility の user manual](https://archive.org/details/manualzilla-id-5806917) はパーティション、boot disk、secret area の使い方を説明する Windows ツールの説明であり、ホスト protocol 定義ではない。
+- usb.ids は `4146` を "USBest Technology" に、`1307` を "Transcend Information, Inc." に登録するが、USB-IF の registry 議論は `1307` を USBest Technology Inc. の割り当てとする。いずれも識別のヒントに過ぎない。
+
+実測 (Imation Flash Drive Mini、VID `0718`、UT163 搭載): 標準 INQUIRY を 96 バイト要求すると、36 バイトの標準データを超える vendor-specific 領域に `UtffU163A1BM` のマーカーが返る。`profiles/identify-usbest-ut163.toml` が VID ヒント (`4146`、`1307`) と INQUIRY マーカー (`U163`) を宣言し、nclr はこの領域のパターンを検証して `usbest-ut163` と識別する。この識別は標準 INQUIRY だけを使い、未知の vendor CDB を送信しない。識別は読み取り専用の情報提供であり、destructive capability は公開 service CDB が存在しないため一切公開しない。
 
 ## C3 / C4 へ昇格する認定条件
 

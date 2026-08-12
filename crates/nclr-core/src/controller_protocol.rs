@@ -19,6 +19,7 @@ pub enum Family {
     AlcorAu698x,
     SiliconMotionUfd,
     SandiskCruzer,
+    UsbestUt163,
 }
 
 impl Family {
@@ -28,8 +29,26 @@ impl Family {
             Family::AlcorAu698x => "alcor-au698x",
             Family::SiliconMotionUfd => "silicon-motion-ufd",
             Family::SandiskCruzer => "sandisk-cruzer",
+            Family::UsbestUt163 => "usbest-ut163",
         }
     }
+}
+
+/// Parse a family from its canonical string.
+pub fn family_from_str(value: &str) -> Option<Family> {
+    match value {
+        "phison-ps2251" => Some(Family::PhisonPs2251),
+        "alcor-au698x" => Some(Family::AlcorAu698x),
+        "silicon-motion-ufd" => Some(Family::SiliconMotionUfd),
+        "sandisk-cruzer" => Some(Family::SandiskCruzer),
+        "usbest-ut163" => Some(Family::UsbestUt163),
+        _ => None,
+    }
+}
+
+/// Whether the string names a known controller family (profile validation).
+pub fn is_known_family(value: &str) -> bool {
+    family_from_str(value).is_some()
 }
 
 /// Evidence-bounded support advertised for a family.
@@ -116,19 +135,21 @@ pub fn support(family: Family) -> FamilySupport {
             production_tuple_bundled: false,
             reason: "SanDisk Cruzer proprietary controllers use exact USB/SCSI bootstrap selection followed by recipe-owned controller and NAND identity commands; destructive commands require an exact trace-derived recipe and HIL qualification",
         },
-    }
-}
-
-/// Convert a USB vendor id into the only family that may be probed. These
-/// USB-IF vendor ids deliberately cover vendor-owned identities only; OEM or
-/// rebranded ids are not guessed.
-pub fn family_hint_from_usb_vid(vid: u16) -> Option<Family> {
-    match vid {
-        0x13FE => Some(Family::PhisonPs2251),
-        0x058F => Some(Family::AlcorAu698x),
-        0x090C => Some(Family::SiliconMotionUfd),
-        0x0781 => Some(Family::SandiskCruzer),
-        _ => None,
+        Family::UsbestUt163 => FamilySupport {
+            family,
+            identify: true,
+            recipe_identify: false,
+            nand_identify: false,
+            recipe_nand_identify: false,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: false,
+            physical_erase: false,
+            bbt_rebuild: false,
+            ftl_rebuild: false,
+            production_tuple_bundled: false,
+            reason: "USBest UT163 identification uses the controller-owned vendor-specific INQUIRY marker (\"U163\"); no public service CDB, NAND identity or service-mode entry is documented, so destructive commands are unavailable",
+        },
     }
 }
 
@@ -142,11 +163,14 @@ pub struct ControllerIdentity {
 }
 
 /// Execute the bounded read-only identification sequence for one hinted
-/// family. The caller supplies the transport. Every returned identity has a
-/// validated controller-owned signature; a family without a public fixed
-/// probe returns `None` without issuing a command.
+/// family. The caller supplies the transport and the identification profile
+/// that selected the family (vendor id hints + optional INQUIRY marker).
+/// Every returned identity has a validated controller-owned signature; a
+/// family without a public fixed probe returns `None` without issuing a
+/// command.
 pub fn identify_with(
     family: Family,
+    marker: Option<&crate::profile::InquiryMarkerIdentify>,
     mut read: impl FnMut(&[u8], usize) -> Result<Vec<u8>>,
 ) -> Result<Option<ControllerIdentity>> {
     match family {
@@ -172,6 +196,17 @@ pub fn identify_with(
         // Cruzer family. Identification is supplied by an authenticated
         // exact-tuple recipe after a read-only USB/SCSI bootstrap match.
         Family::SandiskCruzer => Ok(None),
+        // USBest UT163: the controller embeds its identity in the standard
+        // INQUIRY response's vendor-specific area (beyond the standard
+        // data). No vendor CDB is sent, so a non-UT163 device answers
+        // INQUIRY harmlessly and the marker simply does not match.
+        Family::UsbestUt163 => {
+            let marker = marker.ok_or_else(|| {
+                Error::Invalid("USBest UT163 identification requires an inquiry marker".into())
+            })?;
+            let inquiry = read(&inquiry_cdb(marker.alloc_len), marker.alloc_len as usize)?;
+            Ok(Some(parse_inquiry_marker(&inquiry, marker)?))
+        }
     }
 }
 
@@ -254,10 +289,69 @@ pub fn parse_smi_identity_page(data: &[u8]) -> Result<ControllerIdentity> {
     })
 }
 
+// INQUIRY marker identification (e.g. USBest UT163) ------------------------
+
+/// Standard INQUIRY CDB (no EVPD) with an explicit allocation length.
+/// Requesting more than the 36-byte standard data exposes the
+/// vendor-specific area where the UT163 controller embeds its marker.
+pub fn inquiry_cdb(alloc_len: u16) -> [u8; 6] {
+    [0x12, 0, 0, (alloc_len >> 8) as u8, alloc_len as u8, 0]
+}
+
+/// Whether a standard INQUIRY response carries the declared marker. The
+/// marker is searched only in the vendor-specific area (past the standard
+/// data) so a device whose product string merely contains the marker text
+/// does not match.
+fn has_inquiry_marker(data: &[u8], marker: &str, standard_len: u16) -> bool {
+    if data.len() < standard_len as usize {
+        return false;
+    }
+    let vendor_area = &data[standard_len as usize..];
+    vendor_area
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
+}
+
+/// Parse a controller identification from a standard INQUIRY response using
+/// the declared vendor-specific marker. The controller-owned marker is
+/// required; the standard vendor/product strings are reported as-is but
+/// never drive the family decision on their own.
+pub fn parse_inquiry_marker(
+    data: &[u8],
+    marker: &crate::profile::InquiryMarkerIdentify,
+) -> Result<ControllerIdentity> {
+    let standard_len = marker.standard_len as usize;
+    if data.len() < standard_len {
+        return Err(Error::Invalid(format!(
+            "INQUIRY response is too short for the vendor area: {} bytes",
+            data.len()
+        )));
+    }
+    if !has_inquiry_marker(data, &marker.marker, marker.standard_len) {
+        return Err(Error::Invalid(format!(
+            "INQUIRY marker {} is absent",
+            marker.marker
+        )));
+    }
+    let ascii = |range: std::ops::Range<usize>| {
+        String::from_utf8_lossy(&data[range])
+            .trim()
+            .to_string()
+    };
+    Ok(ControllerIdentity {
+        family: Family::UsbestUt163,
+        controller_id: "usbest-ut163".into(),
+        // The product revision (bytes 32-35) is the firmware-provided
+        // revision of the mass-storage firmware.
+        firmware: ascii(32..36),
+        nand_id: None,
+        mode: "firmware".into(),
+    })
+}
+
 // Phison PS2251 ------------------------------------------------------------
 
-pub const PHISON_VERSION_PAGE_LEN: usize = 528;
-pub const PHISON_NAND_ID_LEN: usize = 512;
+pub const PHISON_VERSION_PAGE_LEN: usize = 528;pub const PHISON_NAND_ID_LEN: usize = 512;
 
 pub fn phison_version_cdb() -> [u8; 16] {
     let mut cdb = [0u8; 16];
@@ -642,20 +736,75 @@ fn validate_alcor_descriptors(data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::InquiryMarkerIdentify;
+
+    fn ut163_marker_profile() -> InquiryMarkerIdentify {
+        InquiryMarkerIdentify {
+            marker: "U163".into(),
+            alloc_len: 96,
+            standard_len: 36,
+        }
+    }
 
     #[test]
-    fn family_hints_are_vendor_owned_only() {
-        assert_eq!(family_hint_from_usb_vid(0x13FE), Some(Family::PhisonPs2251));
-        assert_eq!(family_hint_from_usb_vid(0x058F), Some(Family::AlcorAu698x));
-        assert_eq!(
-            family_hint_from_usb_vid(0x090C),
-            Some(Family::SiliconMotionUfd)
-        );
-        assert_eq!(family_hint_from_usb_vid(0x0951), None);
-        assert_eq!(
-            family_hint_from_usb_vid(0x0781),
-            Some(Family::SandiskCruzer)
-        );
+    fn family_names_round_trip() {
+        for family in [
+            Family::PhisonPs2251,
+            Family::AlcorAu698x,
+            Family::SiliconMotionUfd,
+            Family::SandiskCruzer,
+            Family::UsbestUt163,
+        ] {
+            assert_eq!(family_from_str(family.as_str()), Some(family));
+        }
+        assert_eq!(family_from_str("bogus"), None);
+        assert!(!is_known_family("bogus"));
+    }
+
+    /// The Imation Flash Drive Mini (USBest UT163) INQUIRY vendor area as
+    /// measured on hardware: "1.00" revision followed by the
+    /// "UtffU163A1BM" vendor-specific marker.
+    fn imation_ut163_inquiry() -> Vec<u8> {
+        let mut data = vec![0u8; 96];
+        data[8..16].copy_from_slice(b"Imation ");
+        data[16..32].copy_from_slice(b"Flash Drive     ");
+        data[32..36].copy_from_slice(b"1.00");
+        data[36..48].copy_from_slice(b"UtffU163A1BM");
+        data
+    }
+
+    #[test]
+    fn ut163_parses_from_vendor_specific_inquiry_marker() {
+        let inquiry = imation_ut163_inquiry();
+        let identity = parse_inquiry_marker(&inquiry, &ut163_marker_profile()).unwrap();
+        assert_eq!(identity.family, Family::UsbestUt163);
+        assert_eq!(identity.controller_id, "usbest-ut163");
+        assert_eq!(identity.firmware, "1.00");
+        assert_eq!(identity.nand_id, None);
+    }
+
+    #[test]
+    fn ut163_rejects_missing_or_misplaced_marker() {
+        // No marker at all.
+        let mut plain = vec![0u8; 96];
+        plain[8..16].copy_from_slice(b"Generic ");
+        plain[16..32].copy_from_slice(b"USB Flash Disk  ");
+        plain[32..36].copy_from_slice(b"8.07");
+        assert!(parse_inquiry_marker(&plain, &ut163_marker_profile()).is_err());
+
+        // "U163" only in the standard (36-byte) product area must not match:
+        // the marker lives in the vendor-specific area beyond it.
+        let mut std_area = [0u8; 96];
+        std_area[16..32].copy_from_slice(b"U163 Flash Drive");
+        assert!(parse_inquiry_marker(&std_area, &ut163_marker_profile()).is_err());
+        // Truncated response is rejected, not misparsed.
+        assert!(parse_inquiry_marker(&[0u8; 20], &ut163_marker_profile()).is_err());
+    }
+
+    #[test]
+    fn inquiry_cdb_requests_the_full_vendor_area() {
+        assert_eq!(inquiry_cdb(96), [0x12, 0, 0, 0, 0x60, 0]);
+        assert_eq!(inquiry_cdb(252), [0x12, 0, 0, 0x00, 0xFC, 0]);
     }
 
     #[test]
@@ -826,7 +975,7 @@ mod tests {
     #[test]
     fn sandisk_probe_never_guesses_a_vendor_command() {
         let mut called = false;
-        let identity = identify_with(Family::SandiskCruzer, |_, _| {
+        let identity = identify_with(Family::SandiskCruzer, None, |_, _| {
             called = true;
             Err(Error::Invalid("unexpected transport call".into()))
         })
@@ -838,7 +987,7 @@ mod tests {
     #[test]
     fn phison_probe_sequence_is_bounded_and_signed() {
         let mut calls = Vec::<(Vec<u8>, usize)>::new();
-        let identity = identify_with(Family::PhisonPs2251, |cdb, len| {
+        let identity = identify_with(Family::PhisonPs2251, None, |cdb, len| {
             calls.push((cdb.to_vec(), len));
             if cdb == phison_version_cdb() {
                 let mut page = vec![0u8; PHISON_VERSION_PAGE_LEN];
@@ -864,7 +1013,7 @@ mod tests {
     #[test]
     fn smi_probe_uses_the_documented_identity_page() {
         let mut calls = Vec::new();
-        let identity = identify_with(Family::SiliconMotionUfd, |cdb, len| {
+        let identity = identify_with(Family::SiliconMotionUfd, None, |cdb, len| {
             calls.push((cdb.to_vec(), len));
             let mut page = vec![0u8; SMI_IDENTITY_LEN];
             let signature = b"  2013-02-26  SM3257ENLTBA   SMI32X";

@@ -265,6 +265,240 @@ fn is_default_sdvendor(v: &SdVendorPolicy) -> bool {
     !v.read_only_health && v.cmd56_arg == 0 && v.block_len == 0
 }
 
+// ---------------------------------------------------------------------------
+// Read-only identification profiles (profiles/identify-*.toml)
+// ---------------------------------------------------------------------------
+
+/// Identification parameters for a controller carried in the standard
+/// INQUIRY response's vendor-specific area (past the 36-byte standard
+/// data). No vendor CDB is involved: a non-matching device answers INQUIRY
+/// harmlessly and the marker simply does not match.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct InquiryMarkerIdentify {
+    /// Byte pattern searched in the vendor-specific INQUIRY area (e.g.
+    /// "U163" for the USBest UT163 "UtffU163A1BM" marker).
+    pub marker: String,
+    /// INQUIRY allocation length that exposes the vendor area.
+    #[serde(default = "default_inquiry_alloc_len")]
+    pub alloc_len: u16,
+    /// Standard INQUIRY data length; the marker is searched beyond it.
+    #[serde(default = "default_inquiry_standard_len")]
+    pub standard_len: u16,
+}
+
+fn default_inquiry_alloc_len() -> u16 {
+    96
+}
+
+fn default_inquiry_standard_len() -> u16 {
+    36
+}
+
+/// Read-only controller-family identification profile. This is not a
+/// destructive-execution profile: it only declares which USB vendor ids may
+/// be probed and how the controller answers, so `nclr info` can name the
+/// family. Destructive capability is never derived from it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct IdentifyProfile {
+    pub schema: u32,
+    pub id: String,
+    /// Family name; must match a known `controller_protocol::Family` string.
+    pub family: String,
+    /// Controller id reported by the probe (the dynamic chip-type suffix of
+    /// e.g. phison-psXXXX is appended by the backend from the response).
+    pub controller_id: String,
+    /// USB vendor ids that may select this family for a read-only probe.
+    #[serde(default)]
+    pub usb_vid_hints: Vec<u16>,
+    /// Optional INQUIRY vendor-area marker used to identify the family
+    /// without a vendor CDB (USBest UT163).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inquiry_marker: Option<InquiryMarkerIdentify>,
+}
+
+/// Load all read-only identification profiles from the profile search
+/// directories (`identify-*.toml`). Invalid or unreadable profiles are
+/// skipped with a warning so a single bad file cannot break `nclr info`.
+pub fn load_identify_profiles(explicit: &[PathBuf]) -> Vec<IdentifyProfile> {
+    let mut out = Vec::new();
+    for dir in search_dirs(explicit) {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("identify-") {
+                continue;
+            }
+            match load_identify_profile(&path) {
+                Ok(p) => out.push(p),
+                Err(e) => eprintln!("nclr: warning: skipping {}: {e}", path.display()),
+            }
+        }
+    }
+    out
+}
+
+/// Load and validate a single identification profile file.
+pub fn load_identify_profile(path: &Path) -> Result<IdentifyProfile> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::io(format!("identify profile read {}", path.display()), Some(e)))?;
+    let profile: IdentifyProfile = toml::from_str(&raw)
+        .map_err(|e| Error::Invalid(format!("identify profile {}: {e}", path.display())))?;
+    validate_identify_profile(&profile, path)?;
+    Ok(profile)
+}
+
+/// Validate an identification profile. The family name must match a known
+/// controller family and every field must be non-empty and in range.
+pub fn validate_identify_profile(profile: &IdentifyProfile, path: &Path) -> Result<()> {
+    if profile.schema != PROFILE_SCHEMA {
+        return Err(Error::Invalid(format!(
+            "identify profile {}: schema {} != {PROFILE_SCHEMA}",
+            path.display(),
+            profile.schema
+        )));
+    }
+    if profile.id.is_empty() || profile.family.is_empty() || profile.controller_id.is_empty() {
+        return Err(Error::Invalid(format!(
+            "identify profile {}: id, family and controller_id are required",
+            path.display()
+        )));
+    }
+    if !crate::controller_protocol::is_known_family(&profile.family) {
+        return Err(Error::Invalid(format!(
+            "identify profile {}: unknown family {}",
+            path.display(),
+            profile.family
+        )));
+    }
+    for vid in &profile.usb_vid_hints {
+        if *vid == 0 {
+            return Err(Error::Invalid(format!(
+                "identify profile {}: usb_vid_hints must not contain 0",
+                path.display()
+            )));
+        }
+    }
+    if let Some(marker) = &profile.inquiry_marker {
+        if marker.marker.is_empty() {
+            return Err(Error::Invalid(format!(
+                "identify profile {}: inquiry_marker.marker must not be empty",
+                path.display()
+            )));
+        }
+        if marker.alloc_len < marker.standard_len || marker.standard_len == 0 {
+            return Err(Error::Invalid(format!(
+                "identify profile {}: inquiry_marker alloc_len must exceed standard_len",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Controller family selected by a USB vendor id, from the identification
+/// profiles. Only vendor-owned ids are accepted as hints (OEM ids are never
+/// guessed); a vid that hints several families is ambiguous and rejected.
+pub fn family_hint_from_vid(vid: u16, profiles: &[IdentifyProfile]) -> Option<Family> {
+    let matches: Vec<&IdentifyProfile> = profiles
+        .iter()
+        .filter(|p| p.usb_vid_hints.contains(&vid))
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+    crate::controller_protocol::family_from_str(&matches[0].family)
+}
+
+use crate::controller_protocol::Family;
+
+// ---------------------------------------------------------------------------
+// usb.ids (linux-usb.org) vendor/model database
+// ---------------------------------------------------------------------------
+
+/// Candidate locations of the USB id database. The udev hwdb
+/// `20-usb-vendor-model.hwdb` is generated from this same file
+/// ("Data imported from: http://www.linux-usb.org/usb.ids"), so reading it
+/// resolves both vendor and model names exactly like lsusb/udev.
+fn usb_ids_paths() -> &'static [&'static str] {
+    &[
+        "/usr/share/hwdata/usb.ids",
+        "/usr/share/misc/usb.ids",
+        "/usr/local/share/hwdata/usb.ids",
+    ]
+}
+
+fn read_usb_ids() -> Option<String> {
+    for path in usb_ids_paths() {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            return Some(content);
+        }
+    }
+    None
+}
+
+/// Vendor name for a USB vendor id from usb.ids (`^XXXX  Name` lines).
+pub fn usb_ids_vendor(vid: u16) -> Option<String> {
+    let content = read_usb_ids()?;
+    let needle = format!("{vid:04x}");
+    for line in content.lines() {
+        // Vendor lines: exactly 4 hex digits, two spaces, then the name.
+        if line.len() >= 6
+            && !line.starts_with('\t')
+            && line.as_bytes()[4] == b' '
+            && line.as_bytes()[5] == b' '
+            && line[..4] == needle
+        {
+            return Some(line[6..].trim().to_string());
+        }
+    }
+    None
+}
+
+/// Model name for a USB vendor/product id pair from usb.ids
+/// (`\tXXXX  Name` lines under the vendor). A model name may carry the
+/// controller name when the vendor used it as the product name (e.g.
+/// 13fe:1f23 "PS2232 flash drive controller").
+pub fn usb_ids_model(vid: u16, pid: u16) -> Option<String> {
+    let content = read_usb_ids()?;
+    let mut inside_vendor = false;
+    for line in content.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with('\t') {
+            inside_vendor = line.len() >= 6 && line.as_bytes()[4] == b' ' && line.as_bytes()[5] == b' ' && line[..4] == format!("{vid:04x}");
+            continue;
+        }
+        if !inside_vendor {
+            continue;
+        }
+        let trimmed = line.trim_start_matches('\t');
+        // Model lines: 4 hex digits, two spaces, name. Sub-interface lines
+        // start with two tabs and are not models.
+        if trimmed.starts_with('\t') {
+            continue;
+        }
+        if trimmed.len() >= 6
+            && trimmed.as_bytes()[4] == b' '
+            && trimmed.as_bytes()[5] == b' '
+            && trimmed[..4] == format!("{pid:04x}")
+        {
+            return Some(trimmed[6..].trim().to_string());
+        }
+    }
+    None
+}
+
 impl Profile {
     pub fn trust(&self) -> Option<Trust> {
         Trust::parse(&self.trust)
@@ -1453,5 +1687,96 @@ mod tests {
             Some(Path::new("/opt/nclr"))
         );
         assert_eq!(install_prefix(Path::new("/tmp/target/debug/nclr")), None);
+    }
+
+    #[test]
+    fn usb_ids_parses_vendor_and_model_lines() {
+        // Real entries from the shipped usb.ids database.
+        assert_eq!(
+            usb_ids_vendor(0x13FE).as_deref(),
+            Some("Phison Electronics Corp.")
+        );
+        assert_eq!(
+            usb_ids_model(0x13FE, 0x1F23).as_deref(),
+            Some("PS2232 flash drive controller")
+        );
+        assert_eq!(usb_ids_vendor(0x0718).as_deref(), Some("Imation Corp."));
+        assert_eq!(
+            usb_ids_model(0x3538, 0x0901).as_deref(),
+            Some("Traveling Disk U273 (4GB)")
+        );
+        // Unknown ids are not matched.
+        assert_eq!(usb_ids_vendor(0xF0F0), None);
+        assert_eq!(usb_ids_model(0x13FE, 0xFFFF), None);
+    }
+
+    #[test]
+    fn identify_profiles_validate_and_resolve_family_hints() {
+        // All shipped identify-*.toml files load and validate.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("identify-"))
+            {
+                load_identify_profile(&path).unwrap();
+                loaded += 1;
+            }
+        }
+        assert!(loaded >= 5, "expected at least 5 identify profiles, got {loaded}");
+
+        // VID hints resolve to a single family.
+        let profiles = load_identify_profiles(&[dir]);
+        assert_eq!(
+            family_hint_from_vid(0x13FE, &profiles),
+            Some(crate::controller_protocol::Family::PhisonPs2251)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x4146, &profiles),
+            Some(crate::controller_protocol::Family::UsbestUt163)
+        );
+        // An unknown / unlisted VID hints nothing.
+        assert_eq!(family_hint_from_vid(0x1234, &profiles), None);
+        // The marker parameters for UT163 come from the profile.
+        let ut163 = profiles
+            .iter()
+            .find(|p| p.family == "usbest-ut163")
+            .unwrap();
+        let marker = ut163.inquiry_marker.as_ref().unwrap();
+        assert_eq!(marker.marker, "U163");
+        assert_eq!(marker.alloc_len, 96);
+        assert_eq!(marker.standard_len, 36);
+    }
+
+    #[test]
+    fn identify_profile_validation_rejects_bad_fields() {
+        let good = IdentifyProfile {
+            schema: PROFILE_SCHEMA,
+            id: "x".into(),
+            family: "usbest-ut163".into(),
+            controller_id: "usbest-ut163".into(),
+            usb_vid_hints: vec![0x4146],
+            inquiry_marker: Some(InquiryMarkerIdentify {
+                marker: "U163".into(),
+                alloc_len: 96,
+                standard_len: 36,
+            }),
+        };
+        validate_identify_profile(&good, Path::new("good.toml")).unwrap();
+
+        let mut unknown_family = good.clone();
+        unknown_family.family = "bogus".into();
+        assert!(validate_identify_profile(&unknown_family, Path::new("bad.toml")).is_err());
+
+        let mut bad_marker = good.clone();
+        bad_marker.inquiry_marker.as_mut().unwrap().standard_len = 200;
+        assert!(validate_identify_profile(&bad_marker, Path::new("bad.toml")).is_err());
+
+        let mut zero_vid = good.clone();
+        zero_vid.usb_vid_hints = vec![0];
+        assert!(validate_identify_profile(&zero_vid, Path::new("bad.toml")).is_err());
     }
 }

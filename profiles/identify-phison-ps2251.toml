@@ -1,0 +1,9 @@
+# Read-only controller identification profile: Phison PS2251 family.
+# Declares which USB vendor id may select a read-only probe and the family
+# name reported by `nclr info`. Destructive capability is never derived
+# from this file (see docs/controller-vendor-support.md).
+schema = 1
+id = "phison-ps2251"
+family = "phison-ps2251"
+controller_id = "phison-ps2251"
+usb_vid_hints = [0x13FE]

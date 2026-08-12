@@ -171,8 +171,9 @@ service re-enumeration and recovery engine for Phison, SMI, Alcor and SanDisk
 Cruzer proprietary controllers. Vendor CDBs and response layouts are supplied
 as an authenticated runtime protocol recipe tied to one exact
 controller/firmware/NAND tuple; unknown commands are never inferred. Built-in
-read-only identification is implemented for Phison PS2251, Alcor AU698x and
-the publicly documented SMI SM32X identity page. SanDisk Cruzer, later
+read-only identification is implemented for Phison PS2251, Alcor AU698x,
+the publicly documented SMI SM32X identity page and the USBest UT163 INQUIRY
+marker. SanDisk Cruzer, later
 controller generations without a public fixed probe, and explicitly profiled
 OEM VID products first select the required recipe by an exact USB/SCSI tuple,
 then verify recipe-owned controller and NAND identity responses before
@@ -193,7 +194,11 @@ artifact digests; missing or invalid bytes stop `run` before confirmation.
 # List removable candidates (read-only)
 nclr ls
 
-# Identify a device (read-only)
+# Identify a device (read-only); USB devices also get the vendor/model
+# names from the OS usb.ids database and a read-only controller-family
+# probe (controller ID, firmware, NAND ID when an identification profile
+# selects a supported family or a standard INQUIRY carries a controller
+# marker, e.g. USBest UT163)
 nclr info /dev/sdb
 nclr info -j /dev/sdb
 

@@ -82,7 +82,7 @@ enum ArtifactCmd {
 
 #[derive(clap::Args)]
 struct ControllerArgs {
-    /// Limit output to phison, alcor, smi or sandisk
+    /// Limit output to phison, alcor, smi, sandisk or usbest
     #[arg(long)]
     family: Option<String>,
 }
@@ -298,6 +298,7 @@ fn cmd_controller(args: &ControllerArgs) -> i32 {
             Family::AlcorAu698x,
             Family::SiliconMotionUfd,
             Family::SandiskCruzer,
+            Family::UsbestUt163,
         ],
         Some("phison") | Some("phison-ps2251") => vec![Family::PhisonPs2251],
         Some("alcor") | Some("alcor-au698x") => vec![Family::AlcorAu698x],
@@ -305,6 +306,7 @@ fn cmd_controller(args: &ControllerArgs) -> i32 {
             vec![Family::SiliconMotionUfd]
         }
         Some("sandisk") | Some("sandisk-cruzer") => vec![Family::SandiskCruzer],
+        Some("usbest") | Some("usbest-ut163") => vec![Family::UsbestUt163],
         Some(other) => {
             eprintln!("nclr-lab: unknown controller family: {other}");
             return 64;

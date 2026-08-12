@@ -655,13 +655,14 @@ fn cmd_ls(json: bool) -> i32 {
 
 fn cmd_info(device_path: &str, json: bool, backend_dir: &[PathBuf]) -> i32 {
     match info_impl(device_path, backend_dir) {
-        Ok((identity, probe)) => {
+        Ok((identity, probe, controller)) => {
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "identity": identity,
                         "backend_probe": probe,
+                        "controller_identify": controller,
                     }))
                     .unwrap()
                 );
@@ -680,6 +681,30 @@ fn cmd_info(device_path: &str, json: bool, backend_dir: &[PathBuf]) -> i32 {
                     println!("Grade ceiling: {}", p.grade_ceiling);
                 } else {
                     println!("Backend: (none)");
+                }
+                if let Some(c) = controller {
+                    if let Some(v) = &c.vendor {
+                        println!("Vendor: {v} (VID {})", identity.usb.as_ref().map(|u| &u.vid).unwrap_or(&String::new()));
+                    }
+                    if let Some(m) = &c.model {
+                        println!("Model: {m}");
+                    }
+                    if c.controller_id == "unidentified" {
+                        if let Some(e) = &c.probe_error {
+                            println!("Controller: (unidentified: {e})");
+                        } else {
+                            println!("Controller: (unidentified)");
+                        }
+                    } else {
+                        print!("Controller: {}", c.controller_id);
+                        if c.firmware != "unidentified" {
+                            print!(" (FW {})", c.firmware);
+                        }
+                        if let Some(n) = &c.nand_id {
+                            print!(", NAND {n}");
+                        }
+                        println!();
+                    }
                 }
             }
             0
@@ -700,18 +725,108 @@ struct ProbeSummary {
     grade_ceiling: String,
 }
 
+/// Read-only controller identification result from the controller backend
+/// probe (best effort: only vendor-owned USB VIDs are probed, and a missing
+/// or failing probe is reported, never fatal).
+#[derive(Serialize, Deserialize)]
+struct ControllerIdentify {
+    /// Vendor name resolved from the OS usb.ids database (lsusb/udev source,
+    /// e.g. "Phison Electronics Corp."), falling back to the device's own
+    /// iManufacturer claim. Informational branding only, never a
+    /// controller-family claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vendor: Option<String>,
+    /// Model name resolved from the OS usb.ids database (e.g. "PS2232
+    /// flash drive controller"), when the vid:pid pair is listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    family_hint: Option<String>,
+    controller_id: String,
+    firmware: String,
+    nand_id: Option<String>,
+    service_mode: String,
+    probe_error: Option<String>,
+}
+
+/// Resolve the vendor name for a USB device: first from the OS usb.ids
+/// database (the same source lsusb and udev use), then from the device's
+/// own iManufacturer string.
+fn vendor_name(usb: &nclr::device::UsbInfo) -> Option<String> {
+    let vid = u16::from_str_radix(usb.vid.trim_start_matches("0x"), 16).ok()?;
+    nclr::profile::usb_ids_vendor(vid).or_else(|| {
+        let claimed = usb.manufacturer.trim();
+        if claimed.is_empty() {
+            None
+        } else {
+            Some(claimed.to_string())
+        }
+    })
+}
+
+/// Resolve the model name from the OS usb.ids database, when listed.
+fn model_name(usb: &nclr::device::UsbInfo) -> Option<String> {
+    let vid = u16::from_str_radix(usb.vid.trim_start_matches("0x"), 16).ok()?;
+    let pid = u16::from_str_radix(usb.pid.trim_start_matches("0x"), 16).ok()?;
+    nclr::profile::usb_ids_model(vid, pid)
+}
+
+/// Brand the controller identification with the vendor/model names resolved
+/// from the OS usb.ids database.
+fn with_vendor(mut c: ControllerIdentify, identity: &DeviceIdentity) -> ControllerIdentify {
+    if let Some(usb) = identity.usb.as_ref() {
+        c.vendor = vendor_name(usb);
+        c.model = model_name(usb);
+    }
+    c
+}
+
+/// A ControllerIdentify for an unsuccessful or skipped probe.
+fn unidentified_controller(identity: &DeviceIdentity, probe_error: Option<String>) -> ControllerIdentify {
+    with_vendor(
+        ControllerIdentify {
+            vendor: None,
+            model: None,
+            family_hint: None,
+            controller_id: "unidentified".into(),
+            firmware: "unidentified".into(),
+            nand_id: None,
+            service_mode: "normal".into(),
+            probe_error,
+        },
+        identity,
+    )
+}
+
+/// Open the device read-only, retrying briefly. A USB bridge that reset its
+/// transport (NOT READY / ENOMEDIUM) usually recovers within a second.
+fn open_raw_with_retry(device_path: &str, attempts: u32) -> Result<std::fs::File> {
+    let mut last = None;
+    for attempt in 0..attempts {
+        match device::open_raw(device_path, false) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                last = Some(e);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::io(format!("open {device_path}"), None)))
+}
+
 /// Identify the device and probe the matching backend.
 fn info_impl(
     device_path: &str,
     backend_dir: &[PathBuf],
-) -> Result<(DeviceIdentity, Option<ProbeSummary>)> {
+) -> Result<(DeviceIdentity, Option<ProbeSummary>, Option<ControllerIdentify>)> {
     let identity = device::identify(device_path)?;
     let site = nclr::config::load(None)?;
     let handle = match pick_backend(&identity, None, backend_dir, &site) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("nclr: warning: backend probe skipped: {e}");
-            return Ok((identity, None));
+            return Ok((identity, None, None));
         }
     };
     let fd = device::open_raw(device_path, false)?;
@@ -742,6 +857,7 @@ fn info_impl(
         &extra_sources,
         None,
     )?;
+    let controller = controller_identify(&identity, device_path, backend_dir, &site);
     Ok((
         identity,
         Some(ProbeSummary {
@@ -749,6 +865,112 @@ fn info_impl(
             trust: handle.trust.clone(),
             grade_ceiling: resp.grade_ceiling(),
         }),
+        controller,
+    ))
+}
+
+/// Best-effort read-only controller identification for USB mass storage
+/// devices. Only vendor-owned USB VIDs are probed (the controller backend
+/// validates a controller response signature before returning an identity);
+/// any failure is reported in the result instead of failing `info`.
+fn controller_identify(
+    identity: &DeviceIdentity,
+    device_path: &str,
+    backend_dir: &[PathBuf],
+    site: &nclr::config::SiteConfig,
+) -> Option<ControllerIdentify> {
+    // Only USB-attached devices carry a vendor VID that could select a
+    // controller family; regular files and native SD have none.
+    identity.usb.as_ref()?;
+    // Respect the site policy: a controller probe that the policy forbids
+    // (or would forbid for destructive use) is not attempted.
+    if site.restricts_backends() && !site.allowed_backends().iter().any(|b| b == "controller") {
+        return None;
+    }
+    let handle = match backend::find("controller", &backend::search_dirs(backend_dir)) {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    // The scsi probe just ran on this device. Some USB bridges (e.g. the
+    // USBest UT163 in the Imation Flash Drive Mini) reset their transport
+    // after a probe and briefly answer open() with ENOMEDIUM; retry a few
+    // times before declaring the identification unavailable.
+    let fd = match open_raw_with_retry(device_path, 4) {
+        Ok(f) => f,
+        Err(e) => return Some(unidentified_controller(identity, Some(e.to_string()))),
+    };
+    let device_fd = OwnedFd::from(fd);
+    let extras = match open_backend_extras(identity, false) {
+        Ok(e) => e,
+        Err(e) => return Some(unidentified_controller(identity, Some(e.to_string()))),
+    };
+    let extra_request = extra_fd_request(&extras);
+    let extra_sources = extra_fd_sources(&extras);
+    let resp = match backend::call(
+        &handle,
+        "probe",
+        &device_fd,
+        None,
+        &Request {
+            api: nclr::BACKEND_API,
+            op: "probe".into(),
+            action: None,
+            seed: None,
+            device_is_file: Some(device::is_regular_file(device_path)),
+            limits: req_limits(),
+            params: None,
+            device: Some(identity.clone()),
+            extra_fds: extra_request,
+        },
+        &extra_sources,
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => return Some(unidentified_controller(identity, Some(e.to_string()))),
+    };
+    let family_hint = resp
+        .value
+        .get("family_hint")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let device = resp.value.get("device");
+    let controller_id = device
+        .and_then(|d| d.get("controller_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unidentified")
+        .to_string();
+    let firmware = device
+        .and_then(|d| d.get("firmware"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unidentified")
+        .to_string();
+    let nand_id = device
+        .and_then(|d| d.get("nand_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| *s != "unidentified")
+        .map(String::from);
+    let service_mode = device
+        .and_then(|d| d.get("service_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("normal")
+        .to_string();
+    let probe_error = resp
+        .value
+        .get("probe_error")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(with_vendor(
+        ControllerIdentify {
+            vendor: None,
+            model: None,
+            family_hint,
+            controller_id,
+            firmware,
+            nand_id,
+            service_mode,
+            probe_error,
+        },
+        identity,
     ))
 }
 
@@ -5171,7 +5393,8 @@ fn cmd_resume(config: Option<&Path>, state_file: &Path, opts: &RunOptions) -> i3
 
 #[cfg(test)]
 mod tests {
-    use super::should_heartbeat;
+    use super::{should_heartbeat, model_name, vendor_name};
+    use nclr::device::UsbInfo;
 
     #[test]
     fn heartbeat_threshold() {
@@ -5180,6 +5403,45 @@ mod tests {
         assert!(should_heartbeat(30, 30));
         assert!(should_heartbeat(120, 30));
         assert!(!should_heartbeat(30, 0), "disabled threshold");
+    }
+
+    fn usb(vid: &str, pid: &str, manufacturer: &str) -> UsbInfo {
+        UsbInfo {
+            vid: vid.into(),
+            pid: pid.into(),
+            bcd_device: String::new(),
+            serial: String::new(),
+            manufacturer: manufacturer.into(),
+            product: String::new(),
+            port_chain: String::new(),
+        }
+    }
+
+    #[test]
+    fn vendor_name_uses_os_database_with_manufacturer_fallback() {
+        // usb.ids names (the lsusb/udev source), when the OS database is
+        // present; the device's own iManufacturer claim otherwise.
+        let phison = usb("13fe", "1f23", "silicon");
+        let vendor = vendor_name(&phison);
+        assert!(
+            vendor.as_deref().unwrap_or("").to_lowercase().contains("phison"),
+            "usb.ids should name Phison, got {vendor:?}"
+        );
+        let unknown = usb("ffff", "0000", "Some Brand");
+        assert_eq!(vendor_name(&unknown).as_deref(), Some("Some Brand"));
+    }
+
+    #[test]
+    fn model_name_comes_from_os_database() {
+        // 13fe:1f23 is listed as "PS2232 flash drive controller" in
+        // usb.ids, so the model name carries the controller name.
+        let ps2232 = usb("13fe", "1f23", "silicon");
+        assert_eq!(
+            model_name(&ps2232).as_deref(),
+            Some("PS2232 flash drive controller")
+        );
+        let unlisted = usb("ffff", "0000", "x");
+        assert_eq!(model_name(&unlisted), None);
     }
 }
 

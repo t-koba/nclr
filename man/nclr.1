@@ -54,6 +54,15 @@ List removable whole-disk candidates, one device path per line (\-j: JSON).
 .TP
 .B info [\-j] DEVICE
 Read-only identity, transport, capacity, fingerprint and backend capability.
+For USB-attached devices the vendor and model names are resolved from the
+OS usb.ids database (the lsusb/udev source; the device's own iManufacturer
+claim is the fallback), and the matching controller family is also probed
+read-only (best effort): the controller ID, firmware, NAND ID and service
+mode are reported when an identification profile
+.RB ( profiles/identify\-*.toml )
+selects a supported family or a standard INQUIRY carries a controller
+marker (e.g. the USBest UT163 "U163" signature), and the reason is reported
+instead when the probe cannot run or fails.
 .TP
 .B plan [\-l LEVEL] [OPTIONS] DEVICE
 Produce a normalized JSON plan on stdout (read-only).

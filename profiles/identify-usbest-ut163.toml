@@ -1,0 +1,15 @@
+# Read-only controller identification profile: USBest UT163.
+# The UT163 firmware embeds the "U163" marker in the vendor-specific area
+# of the standard INQUIRY response (past the 36-byte standard data). Only
+# INQUIRY is issued, never an unknown vendor CDB; a non-matching device
+# answers harmlessly and the marker simply does not match.
+schema = 1
+id = "usbest-ut163"
+family = "usbest-ut163"
+controller_id = "usbest-ut163"
+usb_vid_hints = [0x4146, 0x1307]
+
+[inquiry_marker]
+marker = "U163"
+alloc_len = 96
+standard_len = 36

@@ -1,0 +1,6 @@
+# Read-only controller identification profile: Alcor AU698x family.
+schema = 1
+id = "alcor-au698x"
+family = "alcor-au698x"
+controller_id = "alcor-au698x"
+usb_vid_hints = [0x058F]

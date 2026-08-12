@@ -1,0 +1,8 @@
+# Read-only controller identification profile: SanDisk Cruzer proprietary.
+# No public fixed probe is documented, so this is a VID hint only: the
+# family is never probed with an unknown vendor CDB.
+schema = 1
+id = "sandisk-cruzer"
+family = "sandisk-cruzer"
+controller_id = "sandisk-cruzer"
+usb_vid_hints = [0x0781]
