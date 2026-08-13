@@ -1,0 +1,7 @@
+# Candidate-only identification profile: Skymedi SK62xx/SK66xx.
+# The vendor-owned VID selects no command: exact controller and NAND
+# identities must come from an authenticated bootstrap recipe.
+schema = 1
+id = "skymedi-ufd"
+family = "skymedi-ufd"
+usb_vid_hints = [0x1516]

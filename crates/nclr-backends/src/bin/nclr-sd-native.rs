@@ -158,71 +158,85 @@ mod linux {
         Ok(())
     }
 
-    /// Full-card standard ERASE: CMD32(0) + CMD33(last LBA) + CMD38.
-    fn device_user_area_erase(dev: &LbaDevice, file: &std::fs::File) -> Result<Value> {
-        // CMD32/CMD33 carry a 32-bit block address, which caps the range at
-        // 2 TiB (2^32 x 512). SDXC tops out at 2 TiB by specification, but a
-        // larger (or non-conformant) device must fail loudly instead of
-        // silently truncating the erase range.
-        if dev.sectors() > u64::from(u32::MAX) + 1 {
-            return Err(Error::Unsupported(format!(
-                "device has {} sectors; CMD32/CMD33 address a maximum of 2^32 (2 TiB)",
-                dev.sectors()
-            )));
-        }
-        // SDSC (CSD_STRUCTURE 0, <2 GB) addresses CMD32/33 in bytes, not
-        // blocks: sending block numbers would silently erase only a tiny
-        // prefix. The sysfs `csd` attribute carries the structure bits in
-        // the top two bits of its first byte. Refuse SDSC until the
-        // byte-address conversion is validated on hardware.
-        if is_sdsc_card(file)? {
+    struct CardEraseLayout {
+        csd: nclr::sd::CsdEraseInfo,
+        erase_size_bytes: u64,
+    }
+
+    /// Re-read the raw CSD and erase group from the card currently bound to
+    /// the inherited fd. This prevents a stale planning identity from
+    /// selecting the wrong address unit after card replacement.
+    fn card_erase_layout(file: &std::fs::File) -> Result<CardEraseLayout> {
+        let dev_link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|error| Error::io("readlink of the device fd", Some(error)))?;
+        let name = dev_link
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .ok_or_else(|| Error::io("cannot resolve the device name", None))?;
+        let card_dir = std::path::Path::new("/sys/block")
+            .join(&name)
+            .join("device");
+        let csd_path = card_dir.join("csd");
+        let csd = std::fs::read_to_string(&csd_path).map_err(|error| {
+            Error::io(
+                format!("cannot read the card CSD from {}", csd_path.display()),
+                Some(error),
+            )
+        })?;
+        let csd = nclr::sd::parse_csd_erase_info(&csd)?;
+        let erase_size_path = card_dir.join("erase_size");
+        let erase_size = std::fs::read_to_string(&erase_size_path).map_err(|error| {
+            Error::io(
+                format!(
+                    "cannot read the card erase size from {}",
+                    erase_size_path.display()
+                ),
+                Some(error),
+            )
+        })?;
+        let erase_size_bytes = erase_size.trim().parse::<u64>().map_err(|error| {
+            Error::Invalid(format!(
+                "malformed SD erase size {:?}: {error}",
+                erase_size.trim()
+            ))
+        })?;
+        Ok(CardEraseLayout {
+            csd,
+            erase_size_bytes,
+        })
+    }
+
+    fn full_range_arguments(dev: &LbaDevice, layout: &CardEraseLayout) -> Result<(u32, u32)> {
+        if !layout.csd.erase_command_class {
             return Err(Error::Unsupported(
-                "SDSC card (byte-addressed CMD32/33) is not supported for full-range erase; convert the range or use the lba backend".into(),
+                "SD CSD does not declare standard erase command class 5".into(),
             ));
         }
-        let last_lba = (dev.sectors() - 1) as u32;
-        send_cmd(file, CMD32_ERASE_WR_BLK_START, 0, false)?;
-        send_cmd(file, CMD33_ERASE_WR_BLK_END, last_lba, false)?;
+        nclr::sd::full_range_erase_arguments(
+            dev.sectors(),
+            layout.csd.addressing,
+            layout.erase_size_bytes,
+        )
+    }
+
+    /// Full-card standard ERASE: CMD32(start) + CMD33(end) + CMD38.
+    fn device_user_area_erase(dev: &LbaDevice, file: &std::fs::File) -> Result<Value> {
+        let layout = card_erase_layout(file)?;
+        let (start, end) = full_range_arguments(dev, &layout)?;
+        send_cmd(file, CMD32_ERASE_WR_BLK_START, start, false)?;
+        send_cmd(file, CMD33_ERASE_WR_BLK_END, end, false)?;
         send_cmd(file, CMD38_ERASE, MMC_ERASE_ARG, true)?;
         Ok(json!({
             "status": "ok",
             "started": false,
             "completed": true,
             "method": "sd-full-range-erase",
-            "range": {"start_lba": 0, "end_lba": last_lba},
+            "range": {"start_lba": 0, "end_lba": dev.sectors() - 1},
+            "command_addressing": layout.csd.addressing,
+            "cmd32_argument": start,
+            "cmd33_argument": end,
+            "erase_size_bytes": layout.erase_size_bytes,
         }))
-    }
-
-    /// Whether the card is SDSC (CSD_STRUCTURE 0). The CSD is read from
-    /// /sys/block/<name>/device/csd (hex string); its top two bits select
-    /// the structure: 0 = SDSC (byte addressing), 1 = SDHC/SDXC (block
-    /// addressing). An unreadable or malformed CSD is an error, never a
-    /// silent "not SDSC": erasing with the wrong address unit would only
-    /// wipe a tiny prefix of the card.
-    fn is_sdsc_card(file: &std::fs::File) -> Result<bool> {
-        let dev_link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-            .map_err(|e| Error::io("readlink of the device fd", Some(e)))?;
-        let name = dev_link
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .ok_or_else(|| Error::io("cannot resolve the device name", None))?;
-        let csd_path = std::path::Path::new("/sys/block")
-            .join(&name)
-            .join("device")
-            .join("csd");
-        let csd = std::fs::read_to_string(&csd_path).map_err(|e| {
-            Error::io(
-                format!("cannot read the card CSD from {}", csd_path.display()),
-                Some(e),
-            )
-        })?;
-        let csd = csd.trim();
-        let first_hex = csd
-            .get(..2)
-            .ok_or_else(|| Error::Invalid(format!("malformed CSD attribute \"{csd}\"")))?;
-        let first = u8::from_str_radix(first_hex, 16)
-            .map_err(|e| Error::Invalid(format!("malformed CSD attribute \"{csd}\": {e}")))?;
-        Ok(first >> 6 == 0)
     }
 
     fn dispatch(
@@ -236,20 +250,7 @@ mod linux {
         match action {
             "device-user-area-erase" => device_user_area_erase(dev, file),
             "blank-verify" => backend_common::blank_verify(dev, events, "nclr-sd-native"),
-            "postcheck-p2" => {
-                // Re-query the device geometry: capacity stability must be
-                // measured after the erase/power cycle, not taken from the
-                // values cached at process start.
-                dev.refresh_capacity()?;
-                let sample = backend_common::sample_read(dev, events)?;
-                Ok(json!({
-                    "status": "ok",
-                    "capacity_bytes": dev.capacity_bytes(),
-                    "logical_block_size": dev.block_size(),
-                    "capacity_stable": true,
-                    "sample": sample,
-                }))
-            }
+            "postcheck-p2" => backend_common::postcheck_p2(dev, events, "nclr-sd-native", None),
             _ => backend_common::dispatch_lba_action(action, seed, params, dev, events),
         }
     }
@@ -302,31 +303,48 @@ mod linux {
         let op = invocation.op.as_str();
         let result: Result<Value> = (|| match op {
             "probe" | "plan" => {
-                // SDSC cards (byte addressing) cannot be erased with block
-                // addresses at all; gate the capability at probe time.
-                let sdsc = is_sdsc_card(&file)?;
+                let assessment = card_erase_layout(&file).and_then(|layout| {
+                    let arguments = full_range_arguments(&dev, &layout)?;
+                    Ok((layout, arguments))
+                });
+                let available = assessment.is_ok();
                 let mut caps = backend_common::lba_caps();
-                if !sdsc {
+                if available {
                     caps.push("ERASE_USER_AREA".into());
                 }
                 let mut v = backend_common::probe_result_body(
                     "sd-native",
                     &dev,
                     caps,
-                    if sdsc { "C1" } else { "C2" },
+                    if available { "C2" } else { "C1" },
                 );
                 // The SD standard ERASE (CMD32/33/38) covers the
                 // user-address area (D0) only; SD does not document
                 // spare/OP (D1) or obsolete page (D2) erasure, so only D0
                 // is claimed (spec §830/§865: never claim more than the
                 // documented scope).
-                if sdsc {
-                    v["erase_coverage"] = json!([]);
-                    v["erase_method"] = json!(Value::Null);
-                    v["sdsc_unsupported"] = json!(true);
-                } else {
-                    v["erase_coverage"] = json!(["D0"]);
-                    v["erase_method"] = json!("sd-full-range-erase");
+                match assessment {
+                    Ok((layout, (start, end))) => {
+                        v["erase_coverage"] = json!(["D0"]);
+                        v["erase_method"] = json!("sd-full-range-erase");
+                        v["sd_standard_erase"] = json!({
+                            "available": true,
+                            "csd_structure": layout.csd.structure,
+                            "addressing": layout.csd.addressing,
+                            "erase_command_class": layout.csd.erase_command_class,
+                            "erase_size_bytes": layout.erase_size_bytes,
+                            "cmd32_argument": start,
+                            "cmd33_argument": end,
+                        });
+                    }
+                    Err(error) => {
+                        v["erase_coverage"] = json!([]);
+                        v["erase_method"] = json!(Value::Null);
+                        v["sd_standard_erase"] = json!({
+                            "available": false,
+                            "reason": error.to_string(),
+                        });
+                    }
                 }
                 Ok(v)
             }
@@ -375,6 +393,7 @@ mod linux {
                 "api": PROTOCOL_API,
                 "ok": true,
                 "backend": "sd-native",
+                "version": VERSION,
                 "state": "ready",
                 "recovery": {
                     "automated": false,

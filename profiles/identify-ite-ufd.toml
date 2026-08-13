@@ -1,0 +1,7 @@
+# Candidate-only profile: ITE IT11xx UFD controllers.
+# VID 048D is used by several ITE product lines. On a mass-storage target it
+# narrows research only; no vendor command is selected by this file.
+schema = 1
+id = "ite-ufd"
+family = "ite-ufd"
+usb_vid_hints = [0x048D]

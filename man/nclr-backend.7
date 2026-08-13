@@ -52,8 +52,10 @@ Action parameters (e.g. scratch-test {start, count}).
 [{fd, role}] inherited extra device fds.
 .SH RESPONSE
 .TP
-.B ok
-boolean.
+.B api / ok / backend / version
+Mandatory on every response. API must be 1, ok is boolean, backend must match
+the selected backend ID, and version must exactly match the pinned manifest or
+bundled backend version.
 .TP
 .B backend / version / match / grade_ceiling / capabilities
 probe identity data. Capabilities use the protocol vocabulary
@@ -62,8 +64,10 @@ PHYSICAL_SALVAGE,
 SD_VENDOR_HEALTH, LBA_PRBS_WRITE, ...).
 .TP
 .B action_results
-Array of {status: ok|partial|error|interrupted, errors, ...} for run
-actions. Action failures are reported in the response with a clean exit; a
+Exactly one {status: ok|partial|error|interrupted|found, errors, ...} entry for
+each run invocation. A successful run response also carries a top-level action
+equal to the requested action; a mismatched action is a protocol error. Action
+failures are reported in the response with a clean exit; a
 nonzero exit indicates a protocol/transport failure. A status of
 .B interrupted
 (reported with a clean exit) means the device operation was stopped in a
@@ -71,6 +75,11 @@ resumable state (for example a busy timeout mid-erase); the core exits 75
 and the run can be continued with
 .B nclr resume
 instead of treating the operation as failed.
+.TP
+.B state / sanitize
+A status response has state ready, in-progress or failed. An optional sanitize
+object has boolean completed/failed, progress from 0 through 1000, and an
+optional boolean started; completed and failed cannot both be true.
 .SH CONTRACT RULES
 .IP 1.
 The backend operates only on the inherited fds; it must never open a device
@@ -89,12 +98,20 @@ streams them to the evidence directory.
 .IP 6.
 Capabilities are declared only when the profile exactly matches and the
 preconditions hold; existence of a function is not a capability.
+.IP 7.
+Controller profiles pin logical_blank_value to 0 or 255. After the power
+cycle, postcheck-c3/postcheck-c4 must read the complete current LBA range,
+verify that blank mapping and signature absence, and complete a flush. Missing
+all_reads_ok, blank_verified, signature_free or flush_ok evidence is a failed
+P2/P1 postcheck and cannot yield H2.
 .SH MANIFESTS
-A backend manifest <dir>/<id>.toml declares id, trust, profile, version and
-an optional sha256 digest of the binary. The core reads those fields,
-verifies the digest when present and records backend version/digest in
-reports; manifests with trust = "research" are refused for destructive
-operations. (The id and api are implied by the filename and protocol; a
-schema field, when present, is informational.)
+A backend manifest <dir>/<id>.toml uses schema 1 and declares id, exec, api,
+version, trust, operations and the mandatory SHA-256 digest of the binary.
+Optional profile and profile_dir fields bind profile discovery. The core
+rejects unknown fields, symbolic links, oversized files, schema/API/ID/exec
+mismatches, undeclared operations and executable digest mismatches. Only
+trust = "production" is accepted. Bundled backend IDs in trusted installation
+locations may omit the manifest; arbitrary manifest-less binaries are never
+promoted to production.
 .SH SEE ALSO
 nclr(1), nclr-lab(1).

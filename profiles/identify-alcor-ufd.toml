@@ -1,0 +1,7 @@
+# Read-only controller identification profile: Alcor UFD families.
+# The compiled response parser covers AU698x. Later AU699x devices require
+# an exact bootstrap and recipe-owned identity.
+schema = 1
+id = "alcor-ufd"
+family = "alcor-ufd"
+usb_vid_hints = [0x058F]

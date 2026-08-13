@@ -1,0 +1,6 @@
+# Candidate-only profile: Yeestor USB flash controllers.
+# USB VID 23A9 identifies the vendor but not the exact controller/NAND tuple.
+schema = 1
+id = "yeestor-ufd"
+family = "yeestor-ufd"
+usb_vid_hints = [0x23A9]

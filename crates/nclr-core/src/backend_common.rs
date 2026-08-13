@@ -41,7 +41,12 @@ pub fn sample_read(dev: &mut LbaDevice, events: &mut BackendEvents) -> Result<Va
         }
         events.note("sample-read", &format!("lba {start} of {sectors}"))?;
     }
-    Ok(json!({ "samples": samples, "sectors": sectors }))
+    let status = if samples.iter().any(|sample| sample.get("error").is_some()) {
+        "error"
+    } else {
+        "ok"
+    };
+    Ok(json!({ "status": status, "samples": samples, "sectors": sectors }))
 }
 
 /// Execute one LBA recipe action against a block device / file.
@@ -238,6 +243,7 @@ pub fn blank_verify(
 ) -> Result<Value> {
     let capacity = dev.capacity_bytes();
     let mut errors = 0u64;
+    let mut read_errors = 0u64;
     let mut uniform = true;
     let mut value: Option<u8> = None;
     let total = capacity.div_ceil(crate::lba::CHUNK);
@@ -248,6 +254,7 @@ pub fn blank_verify(
         let len = crate::lba::CHUNK.min(capacity - off);
         if let Err(e) = dev.read_at(off, &mut buf[..len as usize]) {
             errors += 1;
+            read_errors += 1;
             eprintln!(
                 "{log_prefix}: blank read at LBA {}: {e}",
                 off / crate::lba::SECTOR
@@ -282,8 +289,61 @@ pub fn blank_verify(
     Ok(json!({
         "status": if errors == 0 && uniform { "ok" } else { "error" },
         "errors": errors,
+        "read_errors": read_errors,
         "uniform": uniform,
         "value": value.map(|v| format!("0x{v:02x}")),
+    }))
+}
+
+/// P2 logical postcheck performed after the power cycle. The whole current
+/// LBA range is read again, the controller's profile-pinned blank value is
+/// checked, known signatures are rejected and a real flush is issued.
+/// `expected_blank = None` is used by standard C2 paths and accepts either
+/// one uniform 0x00 or one uniform 0xff value.
+pub fn postcheck_p2(
+    dev: &mut LbaDevice,
+    events: &mut BackendEvents,
+    log_prefix: &str,
+    expected_blank: Option<u8>,
+) -> Result<Value> {
+    dev.refresh_capacity()?;
+    let sweep = blank_verify(dev, events, log_prefix)?;
+    let errors = sweep.get("errors").and_then(Value::as_u64).unwrap_or(1);
+    let read_errors = sweep
+        .get("read_errors")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let uniform = sweep
+        .get("uniform")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let value = sweep.get("value").and_then(Value::as_str);
+    let blank_value_ok = match expected_blank {
+        Some(expected) => value == Some(format!("0x{expected:02x}").as_str()),
+        None => matches!(value, Some("0x00" | "0xff")),
+    };
+    let found = check_signatures(dev)?;
+    let signature_free = found.is_empty();
+    let flush_started = std::time::Instant::now();
+    dev.flush()?;
+    let flush_latency_ms = flush_started.elapsed().as_millis() as u64;
+    let blank_verified = errors == 0 && uniform && blank_value_ok;
+    let ok = read_errors == 0 && blank_verified && signature_free;
+    Ok(json!({
+        "status": if ok { "ok" } else { "error" },
+        "errors": errors + u64::from(!signature_free),
+        "read_errors": read_errors,
+        "all_reads_ok": read_errors == 0,
+        "blank_verified": blank_verified,
+        "blank_value": value,
+        "expected_blank_value": expected_blank.map(|value| format!("0x{value:02x}")),
+        "signature_free": signature_free,
+        "found": found,
+        "flush_ok": true,
+        "flush_latency_ms": flush_latency_ms,
+        "capacity_bytes": dev.capacity_bytes(),
+        "logical_block_size": dev.block_size(),
+        "capacity_stable": true,
     }))
 }
 
@@ -302,6 +362,15 @@ pub fn probe_result_body(
         "version": VERSION,
         "capabilities": caps,
         "grade_ceiling": ceiling,
+        "erase_coverage": [],
+        "erase_method": Value::Null,
+        "rebuilds": [],
+        "controller_profile": Value::Null,
+        "profile_sha256": Value::Null,
+        "capacity_policy": Value::Null,
+        "protected_area_bytes": 0,
+        "certification": Value::Null,
+        "artifacts": [],
         "device": {
             "capacity_bytes": dev.capacity_bytes(),
             "logical_block_size": dev.block_size(),
@@ -348,4 +417,47 @@ pub fn respond_action_err(backend: &str, e: &Error) -> ! {
     });
     write_response_or_die(backend, &resp);
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blank_device(value: u8) -> (tempfile::TempDir, LbaDevice) {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device.img");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.write_all(&vec![value; 4096]).unwrap();
+        file.sync_all().unwrap();
+        let device = LbaDevice::from_fd(file.into(), true).unwrap();
+        (directory, device)
+    }
+
+    #[test]
+    fn p2_postcheck_measures_full_read_blank_signature_and_flush() {
+        let (_directory, mut device) = blank_device(0xff);
+        let mut events = BackendEvents::open(None);
+        let result = postcheck_p2(&mut device, &mut events, "test", Some(0xff)).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["all_reads_ok"], true);
+        assert_eq!(result["blank_verified"], true);
+        assert_eq!(result["signature_free"], true);
+        assert_eq!(result["flush_ok"], true);
+    }
+
+    #[test]
+    fn p2_postcheck_rejects_a_profile_blank_value_mismatch() {
+        let (_directory, mut device) = blank_device(0xff);
+        let mut events = BackendEvents::open(None);
+        let result = postcheck_p2(&mut device, &mut events, "test", Some(0x00)).unwrap();
+        assert_eq!(result["status"], "error");
+        assert_eq!(result["all_reads_ok"], true);
+        assert_eq!(result["blank_verified"], false);
+    }
 }

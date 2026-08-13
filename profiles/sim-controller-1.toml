@@ -12,11 +12,13 @@ operations = ["probe", "plan", "run", "status", "recover"]
 coverage = ["D0", "D1", "D2", "D3", "D4"]
 rebuilds = ["BBT", "FTL", "spare"]
 preserves = ["FBB-marker"]
+protected_area_bytes = 0
 capacity = { bin_bytes = 0, minimum_spare_blocks = 4, spare_ratio = 0.05 }
 ecc = { strength = 40, min_margin = 8, max_read_retry = 4, max_read_latency_ms = 200 }
 recovery = { method = "service-mode-exit+reset", timeout_ms = 30000 }
+logical_blank_value = 255
 sd_vendor = { read_only_health = true, cmd56_arg = 1, block_len = 512 }
 # C4 (physical scope) certification: the sim family passed the independent
 # physical validation fixture (tests/e2e.rs: certification_independent_physical_validation).
 certification = "C4"
-sha256 = "f7875643a4c7caa5291c184a57960af0059b19f993cc544160181a1e3b0aeb85"
+sha256 = "f97f48e8ae129d4d0648e4f5cf161038a322fa8cf6b90d052d3553396ec2b25b"

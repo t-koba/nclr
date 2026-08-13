@@ -1,0 +1,13 @@
+# Read-only controller identification profile: USBest UFD family.
+# UT163 firmware embeds the "U163" marker in the vendor-specific area of
+# the standard INQUIRY response. Other USBest lines require an exact
+# USB/SCSI bootstrap and recipe-owned identity; no unknown CDB is sent.
+schema = 1
+id = "usbest-ufd"
+family = "usbest-ufd"
+usb_vid_hints = [0x4146, 0x1307]
+
+[inquiry_marker]
+marker = "U163"
+alloc_len = 96
+standard_len = 36

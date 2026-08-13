@@ -153,6 +153,11 @@ pub struct ControllerBootstrapPolicy {
     pub usb_vid: u16,
     pub usb_pid: u16,
     pub usb_bcd_device: u16,
+    /// Exact USB descriptor strings. Empty values mean the observed
+    /// descriptor was absent; they are never wildcards.
+    pub usb_manufacturer: String,
+    pub usb_product: String,
+    pub usb_serial: String,
     pub scsi_vendor: String,
     pub scsi_product: String,
     pub scsi_revision: String,
@@ -232,12 +237,21 @@ pub struct Profile {
     pub rebuilds: Vec<String>,
     #[serde(default)]
     pub preserves: Vec<String>,
+    /// Controller domains that remain outside the reported user LBA space.
+    /// Real production profiles must state this explicitly, including zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_area_bytes: Option<u64>,
     #[serde(default)]
     pub capacity: CapacityPolicy,
     #[serde(default)]
     pub ecc: EccPolicy,
     #[serde(default)]
     pub recovery: RecoveryPolicy,
+    /// Uniform logical blank value that must be observed after a controller
+    /// rebuild. Controller profiles may currently certify only the two values
+    /// the postcheck engine can independently verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_blank_value: Option<u8>,
     #[serde(default, skip_serializing_if = "is_default_sdvendor")]
     pub sd_vendor: SdVendorPolicy,
     /// Certified erase grade (e.g. "C4" for a certified physical-scope
@@ -273,7 +287,7 @@ fn is_default_sdvendor(v: &SdVendorPolicy) -> bool {
 /// INQUIRY response's vendor-specific area (past the 36-byte standard
 /// data). No vendor CDB is involved: a non-matching device answers INQUIRY
 /// harmlessly and the marker simply does not match.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InquiryMarkerIdentify {
     /// Byte pattern searched in the vendor-specific INQUIRY area (e.g.
@@ -306,9 +320,6 @@ pub struct IdentifyProfile {
     pub id: String,
     /// Family name; must match a known `controller_protocol::Family` string.
     pub family: String,
-    /// Controller id reported by the probe (the dynamic chip-type suffix of
-    /// e.g. phison-psXXXX is appended by the backend from the response).
-    pub controller_id: String,
     /// USB vendor ids that may select this family for a read-only probe.
     #[serde(default)]
     pub usb_vid_hints: Vec<u16>,
@@ -367,9 +378,9 @@ pub fn validate_identify_profile(profile: &IdentifyProfile, path: &Path) -> Resu
             profile.schema
         )));
     }
-    if profile.id.is_empty() || profile.family.is_empty() || profile.controller_id.is_empty() {
+    if profile.id.is_empty() || profile.family.is_empty() {
         return Err(Error::Invalid(format!(
-            "identify profile {}: id, family and controller_id are required",
+            "identify profile {}: id and family are required",
             path.display()
         )));
     }
@@ -389,15 +400,18 @@ pub fn validate_identify_profile(profile: &IdentifyProfile, path: &Path) -> Resu
         }
     }
     if let Some(marker) = &profile.inquiry_marker {
-        if marker.marker.is_empty() {
+        if marker.marker.is_empty() || !marker.marker.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(Error::Invalid(format!(
-                "identify profile {}: inquiry_marker.marker must not be empty",
+                "identify profile {}: inquiry_marker.marker must be non-empty printable ASCII",
                 path.display()
             )));
         }
-        if marker.alloc_len < marker.standard_len || marker.standard_len == 0 {
+        if marker.standard_len == 0
+            || marker.alloc_len <= marker.standard_len
+            || usize::from(marker.alloc_len - marker.standard_len) < marker.marker.len()
+        {
             return Err(Error::Invalid(format!(
-                "identify profile {}: inquiry_marker alloc_len must exceed standard_len",
+                "identify profile {}: inquiry_marker alloc_len must leave enough vendor-specific bytes after standard_len",
                 path.display()
             )));
         }
@@ -409,14 +423,19 @@ pub fn validate_identify_profile(profile: &IdentifyProfile, path: &Path) -> Resu
 /// profiles. Only vendor-owned ids are accepted as hints (OEM ids are never
 /// guessed); a vid that hints several families is ambiguous and rejected.
 pub fn family_hint_from_vid(vid: u16, profiles: &[IdentifyProfile]) -> Option<Family> {
-    let matches: Vec<&IdentifyProfile> = profiles
+    let mut found = None;
+    for profile in profiles
         .iter()
-        .filter(|p| p.usb_vid_hints.contains(&vid))
-        .collect();
-    if matches.len() != 1 {
-        return None;
+        .filter(|profile| profile.usb_vid_hints.contains(&vid))
+    {
+        let family = crate::controller_protocol::family_from_str(&profile.family)?;
+        match found {
+            None => found = Some(family),
+            Some(existing) if existing == family => {}
+            Some(_) => return None,
+        }
     }
-    crate::controller_protocol::family_from_str(&matches[0].family)
+    found
 }
 
 use crate::controller_protocol::Family;
@@ -446,22 +465,50 @@ fn read_usb_ids() -> Option<String> {
     None
 }
 
-/// Vendor name for a USB vendor id from usb.ids (`^XXXX  Name` lines).
-pub fn usb_ids_vendor(vid: u16) -> Option<String> {
-    let content = read_usb_ids()?;
+fn usb_ids_vendor_from(content: &str, vid: u16) -> Option<String> {
     let needle = format!("{vid:04x}");
+    content.lines().find_map(|line| {
+        let bytes = line.as_bytes();
+        (bytes.len() >= 6 && bytes.get(..4) == Some(needle.as_bytes()) && bytes[4..6] == *b"  ")
+            .then(|| line.get(6..).map(str::trim).filter(|name| !name.is_empty()))
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
+fn usb_ids_model_from(content: &str, vid: u16, pid: u16) -> Option<String> {
+    let vendor = format!("{vid:04x}");
+    let product = format!("{pid:04x}");
+    let mut inside_vendor = false;
     for line in content.lines() {
-        // Vendor lines: exactly 4 hex digits, two spaces, then the name.
-        if line.len() >= 6
-            && !line.starts_with('\t')
-            && line.as_bytes()[4] == b' '
-            && line.as_bytes()[5] == b' '
-            && line[..4] == needle
-        {
-            return Some(line[6..].trim().to_string());
+        let bytes = line.as_bytes();
+        if bytes.is_empty() || bytes[0] == b'#' {
+            continue;
+        }
+        if bytes[0] != b'\t' {
+            inside_vendor = bytes.len() >= 6
+                && bytes.get(..4) == Some(vendor.as_bytes())
+                && bytes[4..6] == *b"  ";
+            continue;
+        }
+        if !inside_vendor || bytes.get(1) == Some(&b'\t') {
+            continue;
+        }
+        let model = &bytes[1..];
+        if model.len() >= 6 && model.get(..4) == Some(product.as_bytes()) && model[4..6] == *b"  " {
+            return std::str::from_utf8(&model[6..])
+                .ok()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
         }
     }
     None
+}
+
+/// Vendor name for a USB vendor id from usb.ids (`^XXXX  Name` lines).
+pub fn usb_ids_vendor(vid: u16) -> Option<String> {
+    usb_ids_vendor_from(&read_usb_ids()?, vid)
 }
 
 /// Model name for a USB vendor/product id pair from usb.ids
@@ -469,34 +516,7 @@ pub fn usb_ids_vendor(vid: u16) -> Option<String> {
 /// controller name when the vendor used it as the product name (e.g.
 /// 13fe:1f23 "PS2232 flash drive controller").
 pub fn usb_ids_model(vid: u16, pid: u16) -> Option<String> {
-    let content = read_usb_ids()?;
-    let mut inside_vendor = false;
-    for line in content.lines() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if !line.starts_with('\t') {
-            inside_vendor = line.len() >= 6 && line.as_bytes()[4] == b' ' && line.as_bytes()[5] == b' ' && line[..4] == format!("{vid:04x}");
-            continue;
-        }
-        if !inside_vendor {
-            continue;
-        }
-        let trimmed = line.trim_start_matches('\t');
-        // Model lines: 4 hex digits, two spaces, name. Sub-interface lines
-        // start with two tabs and are not models.
-        if trimmed.starts_with('\t') {
-            continue;
-        }
-        if trimmed.len() >= 6
-            && trimmed.as_bytes()[4] == b' '
-            && trimmed.as_bytes()[5] == b' '
-            && trimmed[..4] == format!("{pid:04x}")
-        {
-            return Some(trimmed[6..].trim().to_string());
-        }
-    }
-    None
+    usb_ids_model_from(&read_usb_ids()?, vid, pid)
 }
 
 impl Profile {
@@ -726,13 +746,13 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    if profile.destructive_allowed() && !matches!(profile.logical_blank_value, Some(0x00 | 0xff)) {
+        return Err(Error::Invalid(format!(
+            "profile {}: a destructive controller profile requires logical_blank_value 0 or 255",
+            path.display()
+        )));
+    }
     if let Some(bootstrap) = &profile.controller_bootstrap {
-        const BOOTSTRAP_FAMILIES: [&str; 4] = [
-            "phison-ps2251",
-            "alcor-au698x",
-            "smi-sm32x",
-            "sandisk-cruzer",
-        ];
         let canonical_scsi = |value: &str, maximum: usize| {
             !value.is_empty()
                 && value.len() <= maximum
@@ -741,19 +761,23 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
                     .bytes()
                     .all(|byte| byte.is_ascii_graphic() || byte == b' ')
         };
-        let controller_family_matches = match bootstrap.family.as_str() {
-            "phison-ps2251" => profile.controller_id.starts_with("phison-ps"),
-            "alcor-au698x" => profile.controller_id.starts_with("alcor-au"),
-            "smi-sm32x" => profile.controller_id.starts_with("smi-sm"),
-            "sandisk-cruzer" => profile.controller_id.starts_with("sandisk-"),
-            _ => false,
+        let canonical_usb = |value: &str| {
+            value.len() <= 255
+                && value
+                    .chars()
+                    .all(|character| !character.is_control() && character != '\0')
         };
+        let family = crate::controller_protocol::family_from_recipe_str(&bootstrap.family);
+        let controller_family_matches =
+            family.is_some_and(|family| family.accepts_controller_id(&profile.controller_id));
         if profile.simulated
-            || !BOOTSTRAP_FAMILIES.contains(&bootstrap.family.as_str())
+            || family.is_none()
+            || family.is_some_and(|family| bootstrap.family != family.recipe_str())
             || !controller_family_matches
             || bootstrap.usb_vid == 0
-            || bootstrap.usb_pid == 0
-            || bootstrap.usb_bcd_device == 0
+            || !canonical_usb(&bootstrap.usb_manufacturer)
+            || !canonical_usb(&bootstrap.usb_product)
+            || !canonical_usb(&bootstrap.usb_serial)
             || !canonical_scsi(&bootstrap.scsi_vendor, 8)
             || !canonical_scsi(&bootstrap.scsi_product, 16)
             || !canonical_scsi(&bootstrap.scsi_revision, 4)
@@ -783,6 +807,14 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
         }
     }
     validate_artifacts(profile, path)?;
+    if profile.destructive_allowed() {
+        validate_capacity_policy(&profile.capacity).map_err(|error| {
+            Error::Invalid(format!(
+                "profile {}: invalid capacity policy: {error}",
+                path.display()
+            ))
+        })?;
+    }
     if profile.destructive_allowed() && !profile.simulated {
         validate_real_production(profile, path)?;
     }
@@ -807,6 +839,26 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
                 path.display(),
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate a controller capacity policy before it can influence a plan.
+pub fn validate_capacity_policy(policy: &CapacityPolicy) -> Result<()> {
+    if policy.minimum_spare_blocks == 0 {
+        return Err(Error::Invalid(
+            "minimum_spare_blocks must be greater than zero".into(),
+        ));
+    }
+    if !policy.spare_ratio.is_finite() || policy.spare_ratio <= 0.0 || policy.spare_ratio >= 1.0 {
+        return Err(Error::Invalid(
+            "spare_ratio must be finite and strictly between zero and one".into(),
+        ));
+    }
+    if policy.bin_bytes != 0 && (policy.bin_bytes < 512 || !policy.bin_bytes.is_multiple_of(512)) {
+        return Err(Error::Invalid(
+            "bin_bytes must be zero or a multiple of 512".into(),
+        ));
     }
     Ok(())
 }
@@ -868,6 +920,12 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
     if firmware.is_none() || nand_id.is_none() {
         return Err(Error::Invalid(format!(
             "profile {}: a real production profile requires exact firmware and NAND ids",
+            path.display()
+        )));
+    }
+    if profile.protected_area_bytes.is_none() {
+        return Err(Error::Invalid(format!(
+            "profile {}: a real production profile must explicitly declare protected_area_bytes",
             path.display()
         )));
     }
@@ -1276,6 +1334,7 @@ mod tests {
             ],
             rebuilds: vec!["BBT".into(), "FTL".into(), "spare".into()],
             preserves: vec!["FBB-marker".into()],
+            protected_area_bytes: Some(0),
             capacity: CapacityPolicy {
                 bin_bytes: 512 * 512,
                 minimum_spare_blocks: 4,
@@ -1291,6 +1350,7 @@ mod tests {
                 method: "service-mode-exit+reset".into(),
                 timeout_ms: 30_000,
             },
+            logical_blank_value: Some(0xff),
             sd_vendor: SdVendorPolicy::default(),
             certification: None,
             qualification: None,
@@ -1395,12 +1455,23 @@ mod tests {
             usb_vid: 0x0781,
             usb_pid: 0x5567,
             usb_bcd_device: 0x0100,
+            usb_manufacturer: "SanDisk".into(),
+            usb_product: "Cruzer Slice".into(),
+            usb_serial: "4C530001".into(),
             scsi_vendor: "SanDisk".into(),
             scsi_product: "Cruzer Slice".into(),
             scsi_revision: "1.00".into(),
         });
         let path = Path::new("sandisk-cruzer-research.toml");
         assert!(validate(&p, path).is_ok());
+
+        // USB permits product id and bcdDevice value zero. They remain exact
+        // tuple values and are followed by recipe-owned identity checks.
+        p.controller_bootstrap.as_mut().unwrap().usb_pid = 0;
+        p.controller_bootstrap.as_mut().unwrap().usb_bcd_device = 0;
+        assert!(validate(&p, path).is_ok());
+        p.controller_bootstrap.as_mut().unwrap().usb_pid = 0x5567;
+        p.controller_bootstrap.as_mut().unwrap().usb_bcd_device = 0x0100;
 
         p.controller_bootstrap.as_mut().unwrap().usb_vid = 0;
         assert!(validate(&p, path).is_err());
@@ -1411,7 +1482,7 @@ mod tests {
         p.controller_bootstrap.as_mut().unwrap().family = "unknown".into();
         assert!(validate(&p, path).is_err());
 
-        p.controller_bootstrap.as_mut().unwrap().family = "smi-sm32x".into();
+        p.controller_bootstrap.as_mut().unwrap().family = "silicon-motion-ufd".into();
         p.controller_bootstrap.as_mut().unwrap().usb_vid = 0x125f;
         assert!(validate(&p, path).is_err());
         p.controller_id = "smi-sm3281bb".into();
@@ -1600,6 +1671,25 @@ mod tests {
     }
 
     #[test]
+    fn destructive_capacity_policy_is_bounded() {
+        let mut p = profile();
+        p.logical_blank_value = None;
+        assert!(validate(&p, Path::new("blank.toml")).is_err());
+
+        let mut p = profile();
+        p.capacity.minimum_spare_blocks = 0;
+        assert!(validate(&p, Path::new("capacity.toml")).is_err());
+
+        p = profile();
+        p.capacity.spare_ratio = 1.0;
+        assert!(validate(&p, Path::new("capacity.toml")).is_err());
+
+        p = profile();
+        p.capacity.bin_bytes = 513;
+        assert!(validate(&p, Path::new("capacity.toml")).is_err());
+    }
+
+    #[test]
     fn capacity_plan() {
         // 100 good, 4 reserved, policy min spare 4 / ratio 5% / weak 3:
         // spare = max(4, ceil(5), 3+1) = 5. No binning -> user = 91.
@@ -1691,23 +1781,36 @@ mod tests {
 
     #[test]
     fn usb_ids_parses_vendor_and_model_lines() {
-        // Real entries from the shipped usb.ids database.
+        let fixture = concat!(
+            "# usb.ids fixture\n",
+            "0718  Imation Corp.\n",
+            "13fe  Phison Electronics Corp.\n",
+            "\t1f23  PS2232 flash drive controller\n",
+            "\t\t0001  Interface entry\n",
+            "3538  Power Quotient International Co., Ltd.\n",
+            "\t0901  Traveling Disk U273 (4GB)\n",
+        );
         assert_eq!(
-            usb_ids_vendor(0x13FE).as_deref(),
+            usb_ids_vendor_from(fixture, 0x13FE).as_deref(),
             Some("Phison Electronics Corp.")
         );
         assert_eq!(
-            usb_ids_model(0x13FE, 0x1F23).as_deref(),
+            usb_ids_model_from(fixture, 0x13FE, 0x1F23).as_deref(),
             Some("PS2232 flash drive controller")
         );
-        assert_eq!(usb_ids_vendor(0x0718).as_deref(), Some("Imation Corp."));
         assert_eq!(
-            usb_ids_model(0x3538, 0x0901).as_deref(),
+            usb_ids_vendor_from(fixture, 0x0718).as_deref(),
+            Some("Imation Corp.")
+        );
+        assert_eq!(
+            usb_ids_model_from(fixture, 0x3538, 0x0901).as_deref(),
             Some("Traveling Disk U273 (4GB)")
         );
         // Unknown ids are not matched.
-        assert_eq!(usb_ids_vendor(0xF0F0), None);
-        assert_eq!(usb_ids_model(0x13FE, 0xFFFF), None);
+        assert_eq!(usb_ids_vendor_from(fixture, 0xF0F0), None);
+        assert_eq!(usb_ids_model_from(fixture, 0x13FE, 0xFFFF), None);
+        // Invalid UTF-8 boundaries in a non-ID prefix cannot panic.
+        assert_eq!(usb_ids_vendor_from("éé  invalid\n", 0x13FE), None);
     }
 
     #[test]
@@ -1726,25 +1829,41 @@ mod tests {
                 loaded += 1;
             }
         }
-        assert!(loaded >= 5, "expected at least 5 identify profiles, got {loaded}");
+        assert!(
+            loaded >= 18,
+            "expected at least 18 identify profiles, got {loaded}"
+        );
 
         // VID hints resolve to a single family.
         let profiles = load_identify_profiles(&[dir]);
         assert_eq!(
             family_hint_from_vid(0x13FE, &profiles),
-            Some(crate::controller_protocol::Family::PhisonPs2251)
+            Some(crate::controller_protocol::Family::PhisonUfd)
         );
         assert_eq!(
             family_hint_from_vid(0x4146, &profiles),
-            Some(crate::controller_protocol::Family::UsbestUt163)
+            Some(crate::controller_protocol::Family::UsbestUfd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x1E3D, &profiles),
+            Some(crate::controller_protocol::Family::ChipsbankUfd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x0EA0, &profiles),
+            Some(crate::controller_protocol::Family::OtiUfd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x1951, &profiles),
+            Some(crate::controller_protocol::Family::HyperstoneUfd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x23A9, &profiles),
+            Some(crate::controller_protocol::Family::YeestorUfd)
         );
         // An unknown / unlisted VID hints nothing.
         assert_eq!(family_hint_from_vid(0x1234, &profiles), None);
         // The marker parameters for UT163 come from the profile.
-        let ut163 = profiles
-            .iter()
-            .find(|p| p.family == "usbest-ut163")
-            .unwrap();
+        let ut163 = profiles.iter().find(|p| p.family == "usbest-ufd").unwrap();
         let marker = ut163.inquiry_marker.as_ref().unwrap();
         assert_eq!(marker.marker, "U163");
         assert_eq!(marker.alloc_len, 96);
@@ -1756,8 +1875,7 @@ mod tests {
         let good = IdentifyProfile {
             schema: PROFILE_SCHEMA,
             id: "x".into(),
-            family: "usbest-ut163".into(),
-            controller_id: "usbest-ut163".into(),
+            family: "usbest-ufd".into(),
             usb_vid_hints: vec![0x4146],
             inquiry_marker: Some(InquiryMarkerIdentify {
                 marker: "U163".into(),
@@ -1778,5 +1896,12 @@ mod tests {
         let mut zero_vid = good.clone();
         zero_vid.usb_vid_hints = vec![0];
         assert!(validate_identify_profile(&zero_vid, Path::new("bad.toml")).is_err());
+
+        let duplicate = vec![good.clone(), good];
+        assert_eq!(
+            family_hint_from_vid(0x4146, &duplicate),
+            Some(crate::controller_protocol::Family::UsbestUfd),
+            "the same packaged profile found through two search paths must not become ambiguous"
+        );
     }
 }

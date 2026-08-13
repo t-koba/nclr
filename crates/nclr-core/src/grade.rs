@@ -207,6 +207,12 @@ pub struct DeviceEraseEvidence {
     pub power_cycled: bool,
     /// Capacity and re-enumeration stable after the erase.
     pub capacity_stable: bool,
+    /// Full logical range was readable again after the power cycle.
+    pub postcheck_reads_ok: bool,
+    /// Post-power-cycle signature check remained clean.
+    pub postcheck_signature_free: bool,
+    /// Post-power-cycle flush completed successfully.
+    pub postcheck_flush_ok: bool,
     /// An UNMAP/discard was used instead of a real erase: this is never C2
     /// evidence (discard alone must not grant C2 or above).
     pub discard_only: bool,
@@ -237,7 +243,13 @@ pub fn compute_device_c2(e: &DeviceEraseEvidence) -> GradeResult {
             residual: Residual::UnknownScope,
         };
     }
-    let qualified = e.blank_verify && e.signature_free && e.power_cycled && e.capacity_stable;
+    let qualified = e.blank_verify
+        && e.signature_free
+        && e.power_cycled
+        && e.capacity_stable
+        && e.postcheck_reads_ok
+        && e.postcheck_signature_free
+        && e.postcheck_flush_ok;
     let residual = if qualified {
         // D3/D4 remain outside the reach of standard device operations.
         Residual::Unreachable
@@ -258,6 +270,10 @@ pub fn compute_device_c2(e: &DeviceEraseEvidence) -> GradeResult {
 pub struct ControllerReinitEvidence {
     /// Old BBT (all copies/generations) captured before any erase.
     pub old_bbt_captured: bool,
+    /// Digest of the complete captured old BBT payload.
+    pub old_bbt_sha256: Option<String>,
+    /// Number of old BBT copies included in that payload.
+    pub old_bbt_copies: Option<u64>,
     /// Old RBBs were individually attempted; per-block results recorded.
     pub old_rbb_erase_attempted: bool,
     /// Number of old RBBs whose erase failed (stays quarantined).
@@ -286,8 +302,18 @@ pub struct ControllerReinitEvidence {
     pub new_bbt_committed: bool,
     /// New FTL committed with a fresh generation; old FTL invalidated.
     pub ftl_rebuilt: bool,
+    /// The previous mapping generation was explicitly invalidated.
+    pub old_mapping_invalidated: bool,
     /// Capacity stable across the power cycle (equal to the committed value).
     pub capacity_stable: bool,
+    /// Full logical range is readable and matches the profile-pinned blank
+    /// mapping after the power cycle.
+    pub logical_reads_ok: bool,
+    pub logical_blank_verified: bool,
+    /// No known partition/filesystem signature remains after the rebuild.
+    pub signature_free: bool,
+    /// Post-rebuild flush completed successfully.
+    pub flush_ok: bool,
     /// Spare pool meets the profile minimum after the rebuild.
     pub spare_ok: bool,
     /// Weak/failed blocks were isolated from the user pool.
@@ -303,23 +329,56 @@ pub struct ControllerReinitEvidence {
 }
 
 pub fn compute_controller_c3(e: &ControllerReinitEvidence) -> GradeResult {
+    let generations_accounted = matches!(
+        (
+            e.old_bbt_generation,
+            e.new_bbt_generation,
+            e.new_ftl_generation,
+        ),
+        (Some(old), Some(new_bbt), Some(_)) if new_bbt != old
+    );
+    let old_bbt_accounted = e.fbb_count.is_some()
+        && e.rbb_count.is_some()
+        && e.old_bbt_copies.is_some_and(|copies| copies > 0)
+        && e.old_bbt_sha256.as_deref().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    let old_rbb_accounted = e.rbb_count.is_some_and(|total| {
+        e.old_rbb_erased
+            .checked_add(e.old_rbb_erase_failed)
+            .is_some_and(|accounted| accounted == total)
+    });
     // Core chain: without these, no C3.
-    if !e.old_bbt_captured || !e.new_bbt_committed || !e.ftl_rebuilt || e.io_errors > 0 {
+    if !e.old_bbt_captured
+        || !old_bbt_accounted
+        || !generations_accounted
+        || !e.new_bbt_committed
+        || !e.ftl_rebuilt
+        || !e.old_mapping_invalidated
+        || e.expected_capacity_bytes.is_none()
+        || e.io_errors > 0
+    {
         return GradeResult {
             grade: CGrade::C0,
             qualified: false,
             residual: Residual::EraseFailed,
         };
     }
-    if !e.old_rbb_erase_attempted || !e.fbb_preserved || !e.weak_isolated {
+    if !e.old_rbb_erase_attempted || !old_rbb_accounted || !e.fbb_preserved || !e.weak_isolated {
         return GradeResult {
             grade: CGrade::C0,
             qualified: false,
             residual: Residual::UnknownScope,
         };
     }
-    let qualified = e.capacity_stable && e.spare_ok && e.power_cycled;
-    let residual = if e.old_rbb_erase_failed + e.final_erase_failed > 0 {
+    let qualified = e.capacity_stable
+        && e.spare_ok
+        && e.power_cycled
+        && e.logical_reads_ok
+        && e.logical_blank_verified
+        && e.signature_free
+        && e.flush_ok;
+    let residual = if e.old_rbb_erase_failed.saturating_add(e.final_erase_failed) > 0 {
         Residual::EraseFailed
     } else if qualified {
         // Physical-scope completeness (C4) is not certified here.
@@ -341,6 +400,10 @@ pub fn compute_controller_c3(e: &ControllerReinitEvidence) -> GradeResult {
 pub struct PhysicalScopeEvidence {
     /// Every non-FBB block was enumerated and categorized.
     pub enumeration_complete: bool,
+    /// Total physical blocks declared by the profile-backed backend and the
+    /// number covered by its category counts.
+    pub blocks_declared: u64,
+    pub blocks_classified: u64,
     /// Total data-bearing blocks enumerated (user + spare + obsolete + old RBB).
     pub blocks_enumerated: u64,
     /// Blocks whose erase succeeded.
@@ -368,6 +431,14 @@ pub struct PhysicalScopeEvidence {
     pub excluded_unreadable_pages: u64,
     /// Old RBBs were individually attempted.
     pub old_rbb_erase_attempted: bool,
+    /// Number of old RBBs whose individual erase failed.
+    pub old_rbb_erase_failed: u64,
+    /// Old BBT copies and generation were captured before erasure.
+    pub old_bbt_captured: bool,
+    /// Digest of the complete captured old BBT payload.
+    pub old_bbt_sha256: Option<String>,
+    /// Number of old BBT copies included in that payload.
+    pub old_bbt_copies: Option<u64>,
     /// FBB markers preserved.
     pub fbb_preserved: bool,
     /// Blocks whose category could not be determined (left untouched,
@@ -378,6 +449,8 @@ pub struct PhysicalScopeEvidence {
     pub protected_area: bool,
     /// New BBT/FTL committed (fresh build, old generation invalidated).
     pub bbt_ftl_rebuilt: bool,
+    /// The previous mapping generation was explicitly invalidated.
+    pub old_mapping_invalidated: bool,
     /// Old BBT generation captured before any erase.
     pub old_bbt_generation: Option<u64>,
     /// New BBT/FTL generations committed by the rebuild.
@@ -389,12 +462,24 @@ pub struct PhysicalScopeEvidence {
     pub rbb_count: Option<u64>,
     /// Old RBBs successfully erased.
     pub old_rbb_erased: u64,
+    /// Qualification explicitly isolated every weak or failed candidate.
+    pub weak_isolated: bool,
+    /// Number of candidates isolated by qualification.
+    pub isolated_blocks: u64,
     /// Measured LBA throughput (MB/s) from the qualification sweep.
     pub throughput_mbps: Option<f64>,
     /// Measured flush latency (ms).
     pub flush_latency_ms: Option<u64>,
     /// Capacity stable across the power cycle.
     pub capacity_stable: bool,
+    /// Full logical range is readable and matches the profile-pinned blank
+    /// mapping after the power cycle.
+    pub logical_reads_ok: bool,
+    pub logical_blank_verified: bool,
+    /// No known partition/filesystem signature remains after the rebuild.
+    pub signature_free: bool,
+    /// Post-rebuild flush completed successfully.
+    pub flush_ok: bool,
     /// Spare pool meets the profile minimum.
     pub spare_ok: bool,
     /// Power cycle performed after the rebuild.
@@ -406,23 +491,58 @@ pub struct PhysicalScopeEvidence {
 }
 
 pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
+    let generations_accounted = matches!(
+        (
+            e.old_bbt_generation,
+            e.new_bbt_generation,
+            e.new_ftl_generation,
+        ),
+        (Some(old), Some(new_bbt), Some(_)) if new_bbt != old
+    );
+    let old_bbt_accounted = e.old_bbt_captured
+        && e.fbb_count.is_some()
+        && e.rbb_count.is_some()
+        && e.old_bbt_copies.is_some_and(|copies| copies > 0)
+        && e.old_bbt_sha256.as_deref().is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+    let old_rbb_accounted = e.rbb_count.is_some_and(|total| {
+        e.old_rbb_erased
+            .checked_add(e.old_rbb_erase_failed)
+            .is_some_and(|accounted| accounted == total)
+    });
     let sweep_digest_valid = e.ordered_sweep_sha256.as_deref().is_some_and(|digest| {
         digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
     });
     let sweep_accounted = e.physical_pages > 0
         && e.physical_readable_pages
-            .saturating_add(e.physical_unreadable_pages)
-            == e.physical_pages
+            .checked_add(e.physical_unreadable_pages)
+            == Some(e.physical_pages)
         && e.target_pages <= e.physical_pages
+        && e.target_readable_pages
+            .checked_add(e.target_unreadable_pages)
+            == Some(e.target_pages)
+        && e.target_readable_pages <= e.physical_readable_pages
         && e.target_unreadable_pages
-            .saturating_add(e.excluded_unreadable_pages)
-            == e.physical_unreadable_pages
-        && e.target_uncorrectable_pages <= e.physical_uncorrectable_pages;
+            .checked_add(e.excluded_unreadable_pages)
+            == Some(e.physical_unreadable_pages)
+        && e.physical_uncorrectable_pages <= e.physical_readable_pages
+        && e.target_uncorrectable_pages <= e.target_readable_pages
+        && e.target_uncorrectable_pages <= e.physical_uncorrectable_pages
+        && e.target_non_erased_pages <= e.target_readable_pages;
     if !e.enumeration_complete
+        || e.blocks_declared == 0
+        || e.blocks_classified != e.blocks_declared
+        || e.blocks_enumerated == 0
+        || e.target_pages == 0
         || !e.physical_sweep_complete
         || !sweep_accounted
         || !sweep_digest_valid
         || !e.bbt_ftl_rebuilt
+        || !e.old_mapping_invalidated
+        || !old_bbt_accounted
+        || !generations_accounted
+        || e.expected_capacity_bytes.is_none()
         || e.io_errors > 0
     {
         return GradeResult {
@@ -431,7 +551,7 @@ pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
             residual: Residual::UnknownScope,
         };
     }
-    if !e.old_rbb_erase_attempted || !e.fbb_preserved {
+    if !e.old_rbb_erase_attempted || !old_rbb_accounted || !e.fbb_preserved || !e.weak_isolated {
         return GradeResult {
             grade: CGrade::C0,
             qualified: false,
@@ -441,24 +561,37 @@ pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
     // Every enumerated data-bearing block must have an individual erase
     // result; failures keep the grade at C4 but with an erase-failed
     // residual (the reach scope is still fully accounted).
-    let all_accounted = e.blocks_erased + e.blocks_erase_failed == e.blocks_enumerated;
+    let all_accounted = e
+        .blocks_erased
+        .checked_add(e.blocks_erase_failed)
+        .is_some_and(|blocks| blocks == e.blocks_enumerated);
     let all_target_pages_verified = e.target_pages == e.target_readable_pages
         && e.target_unreadable_pages == 0
         && e.target_uncorrectable_pages == 0
         && e.target_non_erased_pages == 0;
-    let qualified = all_accounted && e.capacity_stable && e.spare_ok && e.power_cycled;
+    let no_erase_failures = e.old_rbb_erase_failed == 0 && e.blocks_erase_failed == 0;
+    let qualified = all_accounted
+        && no_erase_failures
+        && e.capacity_stable
+        && e.spare_ok
+        && e.power_cycled
+        && e.logical_reads_ok
+        && e.logical_blank_verified
+        && e.signature_free
+        && e.flush_ok;
     let residual = if e.unknown_reservation > 0 {
         Residual::UnknownScope
-    } else if e.protected_area {
-        // The protected area retains data we cannot reach without
-        // authentication: documented exclusion from the erased scope.
-        Residual::DocumentedExclusion
-    } else if e.blocks_erase_failed > 0
+    } else if e.old_rbb_erase_failed > 0
+        || e.blocks_erase_failed > 0
         || e.target_unreadable_pages > 0
         || e.target_uncorrectable_pages > 0
         || e.target_non_erased_pages > 0
     {
         Residual::EraseFailed
+    } else if e.protected_area {
+        // The protected area retains data we cannot reach without
+        // authentication: documented exclusion from the erased scope.
+        Residual::DocumentedExclusion
     } else if qualified && all_target_pages_verified {
         Residual::NoneKnown
     } else {
@@ -580,6 +713,9 @@ mod tests {
             signature_free: true,
             power_cycled: true,
             capacity_stable: true,
+            postcheck_reads_ok: true,
+            postcheck_signature_free: true,
+            postcheck_flush_ok: true,
             discard_only: false,
             io_errors: 0,
         }
@@ -620,6 +756,12 @@ mod tests {
         assert_eq!(g.grade, CGrade::C2);
         assert!(!g.qualified);
         assert_eq!(g.residual, Residual::EraseFailed);
+
+        let mut missing_postcheck = c2_ok_evidence();
+        missing_postcheck.postcheck_flush_ok = false;
+        let g = compute_device_c2(&missing_postcheck);
+        assert_eq!(g.grade, CGrade::C2);
+        assert!(!g.qualified);
     }
 
     #[test]
@@ -635,13 +777,20 @@ mod tests {
     fn c3_ok_evidence() -> ControllerReinitEvidence {
         ControllerReinitEvidence {
             old_bbt_captured: true,
+            old_bbt_sha256: Some("0".repeat(64)),
+            old_bbt_copies: Some(2),
             old_rbb_erase_attempted: true,
             old_rbb_erase_failed: 0,
             final_erase_failed: 0,
             fbb_preserved: true,
             new_bbt_committed: true,
             ftl_rebuilt: true,
+            old_mapping_invalidated: true,
             capacity_stable: true,
+            logical_reads_ok: true,
+            logical_blank_verified: true,
+            signature_free: true,
+            flush_ok: true,
             spare_ok: true,
             weak_isolated: true,
             isolated_blocks: 0,
@@ -674,6 +823,21 @@ mod tests {
         let g = compute_controller_c3(&e);
         assert_eq!(g.grade, CGrade::C0);
         assert!(!g.qualified);
+
+        let mut missing_digest = c3_ok_evidence();
+        missing_digest.old_bbt_sha256 = None;
+        assert_eq!(compute_controller_c3(&missing_digest).grade, CGrade::C0);
+
+        let mut missing_copies = c3_ok_evidence();
+        missing_copies.old_bbt_copies = None;
+        assert_eq!(compute_controller_c3(&missing_copies).grade, CGrade::C0);
+
+        let mut incomplete_rbb_results = c3_ok_evidence();
+        incomplete_rbb_results.old_rbb_erased = 2;
+        assert_eq!(
+            compute_controller_c3(&incomplete_rbb_results).grade,
+            CGrade::C0
+        );
     }
 
     #[test]
@@ -683,12 +847,38 @@ mod tests {
         let g = compute_controller_c3(&e);
         assert_eq!(g.grade, CGrade::C0);
         assert!(!g.qualified);
+
+        let mut missing_qualification = c3_ok_evidence();
+        missing_qualification.weak_isolated = false;
+        assert_eq!(
+            compute_controller_c3(&missing_qualification).grade,
+            CGrade::C0
+        );
+    }
+
+    #[test]
+    fn c3_requires_generation_and_old_mapping_invalidation_evidence() {
+        let mut missing_generation = c3_ok_evidence();
+        missing_generation.new_bbt_generation = None;
+        assert_eq!(compute_controller_c3(&missing_generation).grade, CGrade::C0);
+
+        let mut unchanged_generation = c3_ok_evidence();
+        unchanged_generation.new_bbt_generation = unchanged_generation.old_bbt_generation;
+        assert_eq!(
+            compute_controller_c3(&unchanged_generation).grade,
+            CGrade::C0
+        );
+
+        let mut mapping_live = c3_ok_evidence();
+        mapping_live.old_mapping_invalidated = false;
+        assert_eq!(compute_controller_c3(&mapping_live).grade, CGrade::C0);
     }
 
     #[test]
     fn c3_old_rbb_failures_are_residual() {
         let mut e = c3_ok_evidence();
         e.old_rbb_erase_failed = 1;
+        e.old_rbb_erased = 2;
         let g = compute_controller_c3(&e);
         assert_eq!(g.grade, CGrade::C3);
         assert!(g.qualified);
@@ -700,6 +890,12 @@ mod tests {
         let mut e = c3_ok_evidence();
         e.capacity_stable = false;
         let g = compute_controller_c3(&e);
+        assert_eq!(g.grade, CGrade::C3);
+        assert!(!g.qualified);
+
+        let mut missing_logical_postcheck = c3_ok_evidence();
+        missing_logical_postcheck.logical_reads_ok = false;
+        let g = compute_controller_c3(&missing_logical_postcheck);
         assert_eq!(g.grade, CGrade::C3);
         assert!(!g.qualified);
     }
@@ -715,6 +911,8 @@ mod tests {
     fn c4_ok_evidence() -> PhysicalScopeEvidence {
         PhysicalScopeEvidence {
             enumeration_complete: true,
+            blocks_declared: 64,
+            blocks_classified: 64,
             blocks_enumerated: 59,
             blocks_erased: 59,
             blocks_erase_failed: 0,
@@ -731,19 +929,30 @@ mod tests {
             target_non_erased_pages: 0,
             excluded_unreadable_pages: 0,
             old_rbb_erase_attempted: true,
+            old_rbb_erase_failed: 0,
+            old_bbt_captured: true,
+            old_bbt_sha256: Some("0".repeat(64)),
+            old_bbt_copies: Some(2),
             fbb_preserved: true,
             unknown_reservation: 0,
             protected_area: false,
             bbt_ftl_rebuilt: true,
+            old_mapping_invalidated: true,
             old_bbt_generation: Some(1),
             new_bbt_generation: Some(2),
             new_ftl_generation: Some(2),
             fbb_count: Some(2),
             rbb_count: Some(3),
             old_rbb_erased: 3,
+            weak_isolated: true,
+            isolated_blocks: 0,
             throughput_mbps: Some(120.0),
             flush_latency_ms: Some(1),
             capacity_stable: true,
+            logical_reads_ok: true,
+            logical_blank_verified: true,
+            signature_free: true,
+            flush_ok: true,
             spare_ok: true,
             power_cycled: true,
             io_errors: 0,
@@ -786,6 +995,49 @@ mod tests {
         let g = compute_physical_c4(&e);
         assert_eq!(g.grade, CGrade::C0);
         assert!(!g.qualified);
+
+        let mut unclassified = c4_ok_evidence();
+        unclassified.blocks_classified -= 1;
+        let g = compute_physical_c4(&unclassified);
+        assert_eq!(g.grade, CGrade::C0);
+        assert!(!g.qualified);
+    }
+
+    #[test]
+    fn c4_requires_old_bbt_and_fresh_mapping_evidence() {
+        let mut old_bbt_missing = c4_ok_evidence();
+        old_bbt_missing.old_bbt_captured = false;
+        assert_eq!(compute_physical_c4(&old_bbt_missing).grade, CGrade::C0);
+
+        let mut mapping_live = c4_ok_evidence();
+        mapping_live.old_mapping_invalidated = false;
+        assert_eq!(compute_physical_c4(&mapping_live).grade, CGrade::C0);
+
+        let mut unchanged_generation = c4_ok_evidence();
+        unchanged_generation.new_bbt_generation = unchanged_generation.old_bbt_generation;
+        assert_eq!(compute_physical_c4(&unchanged_generation).grade, CGrade::C0);
+
+        let mut missing_digest = c4_ok_evidence();
+        missing_digest.old_bbt_sha256 = None;
+        assert_eq!(compute_physical_c4(&missing_digest).grade, CGrade::C0);
+
+        let mut missing_copies = c4_ok_evidence();
+        missing_copies.old_bbt_copies = None;
+        assert_eq!(compute_physical_c4(&missing_copies).grade, CGrade::C0);
+
+        let mut incomplete_rbb_results = c4_ok_evidence();
+        incomplete_rbb_results.old_rbb_erased = 2;
+        assert_eq!(
+            compute_physical_c4(&incomplete_rbb_results).grade,
+            CGrade::C0
+        );
+
+        let mut missing_qualification = c4_ok_evidence();
+        missing_qualification.weak_isolated = false;
+        assert_eq!(
+            compute_physical_c4(&missing_qualification).grade,
+            CGrade::C0
+        );
     }
 
     #[test]
@@ -814,6 +1066,12 @@ mod tests {
         assert_eq!(g.grade, CGrade::C4);
         assert!(!g.qualified);
         assert_eq!(g.residual, Residual::EraseFailed);
+
+        let mut inconsistent = c4_ok_evidence();
+        inconsistent.target_readable_pages -= 1;
+        let g = compute_physical_c4(&inconsistent);
+        assert_eq!(g.grade, CGrade::C0);
+        assert!(!g.qualified);
     }
 
     #[test]
@@ -823,8 +1081,27 @@ mod tests {
         e.blocks_erase_failed = 1;
         let g = compute_physical_c4(&e);
         assert_eq!(g.grade, CGrade::C4);
-        assert!(g.qualified);
+        assert!(!g.qualified);
         assert_eq!(g.residual, Residual::EraseFailed);
+
+        let mut old_rbb_failure = c4_ok_evidence();
+        old_rbb_failure.old_rbb_erased = 2;
+        old_rbb_failure.old_rbb_erase_failed = 1;
+        let g = compute_physical_c4(&old_rbb_failure);
+        assert_eq!(g.grade, CGrade::C4);
+        assert!(!g.qualified);
+        assert_eq!(g.residual, Residual::EraseFailed);
+    }
+
+    #[test]
+    fn c4_erase_failure_outranks_documented_exclusion() {
+        let mut evidence = c4_ok_evidence();
+        evidence.protected_area = true;
+        evidence.blocks_erased -= 1;
+        evidence.blocks_erase_failed = 1;
+        let result = compute_physical_c4(&evidence);
+        assert!(!result.qualified);
+        assert_eq!(result.residual, Residual::EraseFailed);
     }
 
     #[test]

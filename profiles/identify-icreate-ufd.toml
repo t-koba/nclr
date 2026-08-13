@@ -1,0 +1,7 @@
+# Candidate-only identification profile: iCreate i5xxx UFD.
+# The vendor-owned VID selects no command; exact identity comes from a
+# digest-pinned bootstrap recipe.
+schema = 1
+id = "icreate-ufd"
+family = "icreate-ufd"
+usb_vid_hints = [0x1043]

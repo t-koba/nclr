@@ -135,6 +135,12 @@ fn identify_name(name: &str) -> Option<DeviceIdentity> {
             date: read_attr(&dev_dir, "date").unwrap_or_default(),
             host,
             kind: read_attr(&dev_dir, "type").unwrap_or_default(),
+            erase_size_bytes: read_attr(&dev_dir, "erase_size")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            preferred_erase_size_bytes: read_attr(&dev_dir, "preferred_erase_size")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
         })
     } else {
         None

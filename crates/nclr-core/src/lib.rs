@@ -26,6 +26,7 @@ pub mod profile;
 pub mod report;
 pub mod safety;
 pub mod scsi;
+pub mod sd;
 pub mod signal;
 pub mod sim;
 pub mod usb_bot;

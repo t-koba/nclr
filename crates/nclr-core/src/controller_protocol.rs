@@ -15,35 +15,186 @@ use serde::Serialize;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Family {
-    PhisonPs2251,
-    AlcorAu698x,
+    PhisonUfd,
+    AlcorUfd,
     SiliconMotionUfd,
     SandiskCruzer,
-    UsbestUt163,
+    UsbestUfd,
+    ChipsbankUfd,
+    InnostorUfd,
+    FirstchipUfd,
+    SolidStateSystemUfd,
+    SkymediUfd,
+    AppotechUfd,
+    SilicongoUfd,
+    IcreateUfd,
+    OtiUfd,
+    ProlificUfd,
+    AmecoUfd,
+    NetacUfd,
+    EfortuneUfd,
+    IteUfd,
+    HyperstoneUfd,
+    YeestorUfd,
+    RamosUfd,
+    Trek2000Ufd,
+    MoaiUfd,
+    RealwayUfd,
+    HuayiUfd,
+    KtcUfd,
+    SmscUfd,
 }
 
 impl Family {
+    /// Every controller family understood by the profile and recipe layer.
+    /// Keep all user-facing enumeration on this registry so adding a family
+    /// cannot silently omit it from one command or validator.
+    pub const ALL: &'static [Self] = &[
+        Self::PhisonUfd,
+        Self::AlcorUfd,
+        Self::SiliconMotionUfd,
+        Self::SandiskCruzer,
+        Self::UsbestUfd,
+        Self::ChipsbankUfd,
+        Self::InnostorUfd,
+        Self::FirstchipUfd,
+        Self::SolidStateSystemUfd,
+        Self::SkymediUfd,
+        Self::AppotechUfd,
+        Self::SilicongoUfd,
+        Self::IcreateUfd,
+        Self::OtiUfd,
+        Self::ProlificUfd,
+        Self::AmecoUfd,
+        Self::NetacUfd,
+        Self::EfortuneUfd,
+        Self::IteUfd,
+        Self::HyperstoneUfd,
+        Self::YeestorUfd,
+        Self::RamosUfd,
+        Self::Trek2000Ufd,
+        Self::MoaiUfd,
+        Self::RealwayUfd,
+        Self::HuayiUfd,
+        Self::KtcUfd,
+        Self::SmscUfd,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
-            Family::PhisonPs2251 => "phison-ps2251",
-            Family::AlcorAu698x => "alcor-au698x",
+            Family::PhisonUfd => "phison-ufd",
+            Family::AlcorUfd => "alcor-ufd",
             Family::SiliconMotionUfd => "silicon-motion-ufd",
             Family::SandiskCruzer => "sandisk-cruzer",
-            Family::UsbestUt163 => "usbest-ut163",
+            Family::UsbestUfd => "usbest-ufd",
+            Family::ChipsbankUfd => "chipsbank-ufd",
+            Family::InnostorUfd => "innostor-ufd",
+            Family::FirstchipUfd => "firstchip-ufd",
+            Family::SolidStateSystemUfd => "solid-state-system-ufd",
+            Family::SkymediUfd => "skymedi-ufd",
+            Family::AppotechUfd => "appotech-ufd",
+            Family::SilicongoUfd => "silicongo-ufd",
+            Family::IcreateUfd => "icreate-ufd",
+            Family::OtiUfd => "oti-ufd",
+            Family::ProlificUfd => "prolific-ufd",
+            Family::AmecoUfd => "ameco-ufd",
+            Family::NetacUfd => "netac-ufd",
+            Family::EfortuneUfd => "efortune-ufd",
+            Family::IteUfd => "ite-ufd",
+            Family::HyperstoneUfd => "hyperstone-ufd",
+            Family::YeestorUfd => "yeestor-ufd",
+            Family::RamosUfd => "ramos-ufd",
+            Family::Trek2000Ufd => "trek2000-ufd",
+            Family::MoaiUfd => "moai-ufd",
+            Family::RealwayUfd => "realway-ufd",
+            Family::HuayiUfd => "huayi-ufd",
+            Family::KtcUfd => "ktc-ufd",
+            Family::SmscUfd => "smsc-ufd",
         }
+    }
+
+    /// Recipe family names are deliberately identical to profile family
+    /// names. A second mapping previously made SMI support easy to omit.
+    pub fn recipe_str(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Production controller ids are namespace-qualified. The value is
+    /// still verified byte-for-byte by the signed recipe response; this
+    /// prefix check only catches a profile filed under the wrong family.
+    pub fn accepts_controller_id(self, value: &str) -> bool {
+        let prefix = match self {
+            Family::PhisonUfd => "phison-",
+            Family::AlcorUfd => "alcor-au",
+            Family::SiliconMotionUfd => "smi-sm",
+            Family::SandiskCruzer => "sandisk-",
+            Family::UsbestUfd => "usbest-",
+            Family::ChipsbankUfd => "chipsbank-",
+            Family::InnostorUfd => "innostor-",
+            Family::FirstchipUfd => "firstchip-",
+            Family::SolidStateSystemUfd => "sss-",
+            Family::SkymediUfd => "skymedi-",
+            Family::AppotechUfd => "appotech-",
+            Family::SilicongoUfd => "silicongo-",
+            Family::IcreateUfd => "icreate-",
+            Family::OtiUfd => "oti-",
+            Family::ProlificUfd => "prolific-",
+            Family::AmecoUfd => "ameco-",
+            Family::NetacUfd => "netac-",
+            Family::EfortuneUfd => "efortune-",
+            Family::IteUfd => "ite-it",
+            Family::HyperstoneUfd => "hyperstone-u",
+            Family::YeestorUfd => "yeestor-ys",
+            Family::RamosUfd => "ramos-ur",
+            Family::Trek2000Ufd => "trek2000-",
+            Family::MoaiUfd => "moai-ma",
+            Family::RealwayUfd => "realway-rw",
+            Family::HuayiUfd => "huayi-hy",
+            Family::KtcUfd => "ktc-fc",
+            Family::SmscUfd => "smsc-usb",
+        };
+        value.starts_with(prefix) && value.len() > prefix.len()
     }
 }
 
 /// Parse a family from its canonical string.
 pub fn family_from_str(value: &str) -> Option<Family> {
     match value {
-        "phison-ps2251" => Some(Family::PhisonPs2251),
-        "alcor-au698x" => Some(Family::AlcorAu698x),
+        "phison-ufd" => Some(Family::PhisonUfd),
+        "alcor-ufd" => Some(Family::AlcorUfd),
         "silicon-motion-ufd" => Some(Family::SiliconMotionUfd),
         "sandisk-cruzer" => Some(Family::SandiskCruzer),
-        "usbest-ut163" => Some(Family::UsbestUt163),
+        "usbest-ufd" => Some(Family::UsbestUfd),
+        "chipsbank-ufd" => Some(Family::ChipsbankUfd),
+        "innostor-ufd" => Some(Family::InnostorUfd),
+        "firstchip-ufd" => Some(Family::FirstchipUfd),
+        "solid-state-system-ufd" => Some(Family::SolidStateSystemUfd),
+        "skymedi-ufd" => Some(Family::SkymediUfd),
+        "appotech-ufd" => Some(Family::AppotechUfd),
+        "silicongo-ufd" => Some(Family::SilicongoUfd),
+        "icreate-ufd" => Some(Family::IcreateUfd),
+        "oti-ufd" => Some(Family::OtiUfd),
+        "prolific-ufd" => Some(Family::ProlificUfd),
+        "ameco-ufd" => Some(Family::AmecoUfd),
+        "netac-ufd" => Some(Family::NetacUfd),
+        "efortune-ufd" => Some(Family::EfortuneUfd),
+        "ite-ufd" => Some(Family::IteUfd),
+        "hyperstone-ufd" => Some(Family::HyperstoneUfd),
+        "yeestor-ufd" => Some(Family::YeestorUfd),
+        "ramos-ufd" => Some(Family::RamosUfd),
+        "trek2000-ufd" => Some(Family::Trek2000Ufd),
+        "moai-ufd" => Some(Family::MoaiUfd),
+        "realway-ufd" => Some(Family::RealwayUfd),
+        "huayi-ufd" => Some(Family::HuayiUfd),
+        "ktc-ufd" => Some(Family::KtcUfd),
+        "smsc-ufd" => Some(Family::SmscUfd),
         _ => None,
     }
+}
+
+/// Parse the canonical family carried by a protocol recipe.
+pub fn family_from_recipe_str(value: &str) -> Option<Family> {
+    family_from_str(value).filter(|family| support(*family).recipe_engine)
 }
 
 /// Whether the string names a known controller family (profile validation).
@@ -55,6 +206,12 @@ pub fn is_known_family(value: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct FamilySupport {
     pub family: Family,
+    /// Controller lines covered by the family adapter. These are catalog
+    /// coverage, not certified hardware tuples.
+    pub controller_lines: &'static [&'static str],
+    /// Controller lines for which the compiled read-only probe has a bounded
+    /// response parser. An empty list means that identification is recipe-only.
+    pub fixed_probe_lines: &'static [&'static str],
     pub identify: bool,
     pub recipe_identify: bool,
     pub nand_identify: bool,
@@ -62,11 +219,35 @@ pub struct FamilySupport {
     pub service_entry_documented: bool,
     pub volatile_loader_documented: bool,
     pub recipe_engine: bool,
-    pub physical_erase: bool,
-    pub bbt_rebuild: bool,
-    pub ftl_rebuild: bool,
+    pub physical_erase_recipe_role: bool,
+    pub bbt_rebuild_recipe_role: bool,
+    pub ftl_rebuild_recipe_role: bool,
     pub production_tuple_bundled: bool,
     pub reason: &'static str,
+}
+
+fn recipe_only_support(
+    family: Family,
+    controller_lines: &'static [&'static str],
+    reason: &'static str,
+) -> FamilySupport {
+    FamilySupport {
+        family,
+        controller_lines,
+        fixed_probe_lines: &[],
+        identify: false,
+        recipe_identify: true,
+        nand_identify: false,
+        recipe_nand_identify: true,
+        service_entry_documented: false,
+        volatile_loader_documented: false,
+        recipe_engine: true,
+        physical_erase_recipe_role: true,
+        bbt_rebuild_recipe_role: true,
+        ftl_rebuild_recipe_role: true,
+        production_tuple_bundled: false,
+        reason,
+    }
 }
 
 /// Compile-time implementation matrix. Destructive booleans describe the
@@ -75,8 +256,16 @@ pub struct FamilySupport {
 /// recipe and qualification report.
 pub fn support(family: Family) -> FamilySupport {
     match family {
-        Family::PhisonPs2251 => FamilySupport {
+        Family::PhisonUfd => FamilySupport {
             family,
+            controller_lines: &[
+                "PS2251-01/02/03/06/07/08/09/12/13",
+                "PS2251-30/33/37/38/39/50",
+                "PS2251-60/61/62/63/67/68/69/70/80/85",
+                "PS2251-18/19 (PS2318/PS2319)",
+                "U17/U18 native USB 3.2",
+            ],
+            fixed_probe_lines: &["PS2251 version-page-compatible controllers"],
             identify: true,
             recipe_identify: true,
             nand_identify: true,
@@ -84,14 +273,20 @@ pub fn support(family: Family) -> FamilySupport {
             service_entry_documented: true,
             volatile_loader_documented: true,
             recipe_engine: true,
-            physical_erase: true,
-            bbt_rebuild: true,
-            ftl_rebuild: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
-            reason: "identification, BootROM/PRAM loading and the bounded physical/BBT/FTL recipe engine are implemented; an exact NAND burner recipe and independent HIL qualification are not bundled",
+            reason: "PS2251 identification and BootROM/PRAM loading plus the family-wide bounded physical/BBT/FTL recipe engine are implemented; U17/U18 and destructive tuples require separate exact recipes and independent HIL qualification",
         },
-        Family::AlcorAu698x => FamilySupport {
+        Family::AlcorUfd => FamilySupport {
             family,
+            controller_lines: &[
+                "AU698x",
+                "AU6989SN-TA/GTC/GTD/GTE",
+                "AU6990/AU6998",
+            ],
+            fixed_probe_lines: &["AU698x 0x99/0x07 configuration-page-compatible controllers"],
             identify: true,
             recipe_identify: true,
             nand_identify: true,
@@ -99,14 +294,20 @@ pub fn support(family: Family) -> FamilySupport {
             service_entry_documented: false,
             volatile_loader_documented: false,
             recipe_engine: true,
-            physical_erase: true,
-            bbt_rebuild: true,
-            ftl_rebuild: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
             reason: "configuration/flash-ID identification and the bounded physical/BBT/FTL recipe engine are implemented; no exact destructive AU698x tuple recipe is bundled",
         },
         Family::SiliconMotionUfd => FamilySupport {
             family,
+            controller_lines: &[
+                "SM32X/SM3255/SM3257",
+                "SM3265/SM3267/SM3271/SM3281",
+                "SM2320/SM2321/SM2322 native USB 3.2",
+            ],
+            fixed_probe_lines: &["SM32X 0xf0/0x04 identity-page-compatible controllers"],
             identify: true,
             recipe_identify: true,
             nand_identify: false,
@@ -114,14 +315,16 @@ pub fn support(family: Family) -> FamilySupport {
             service_entry_documented: false,
             volatile_loader_documented: false,
             recipe_engine: true,
-            physical_erase: true,
-            bbt_rebuild: true,
-            ftl_rebuild: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
             reason: "the bounded SMI32X identity-page read and physical/BBT/FTL recipe engine are implemented; NAND identity and destructive commands require an exact trace-derived recipe and HIL qualification",
         },
         Family::SandiskCruzer => FamilySupport {
             family,
+            controller_lines: &["Cruzer proprietary", "82-00263-1"],
+            fixed_probe_lines: &[],
             identify: false,
             recipe_identify: true,
             nand_identify: false,
@@ -129,27 +332,226 @@ pub fn support(family: Family) -> FamilySupport {
             service_entry_documented: false,
             volatile_loader_documented: false,
             recipe_engine: true,
-            physical_erase: true,
-            bbt_rebuild: true,
-            ftl_rebuild: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
             reason: "SanDisk Cruzer proprietary controllers use exact USB/SCSI bootstrap selection followed by recipe-owned controller and NAND identity commands; destructive commands require an exact trace-derived recipe and HIL qualification",
         },
-        Family::UsbestUt163 => FamilySupport {
+        Family::UsbestUfd => FamilySupport {
             family,
+            controller_lines: &["UT163", "UT165/UT166/UT167", "UT190/UT192"],
+            fixed_probe_lines: &["UT163 standard-INQUIRY-marker-compatible controllers"],
             identify: true,
-            recipe_identify: false,
+            recipe_identify: true,
             nand_identify: false,
-            recipe_nand_identify: false,
+            recipe_nand_identify: true,
             service_entry_documented: false,
             volatile_loader_documented: false,
-            recipe_engine: false,
-            physical_erase: false,
-            bbt_rebuild: false,
-            ftl_rebuild: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
-            reason: "USBest UT163 identification uses the controller-owned vendor-specific INQUIRY marker (\"U163\"); no public service CDB, NAND identity or service-mode entry is documented, so destructive commands are unavailable",
+            reason: "UT163 identification uses the controller-owned vendor-specific INQUIRY marker; the wider USBest family uses the bounded recipe engine, but no exact destructive tuple or HIL qualification is bundled",
         },
+        Family::ChipsbankUfd => FamilySupport {
+            family,
+            controller_lines: &[
+                "CBM2098/2099S/2099E",
+                "CBM2198/2199A/2199C/2199S/2199SC",
+            ],
+            fixed_probe_lines: &[],
+            identify: false,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "CBM20xx/21xx tool packages split controller firmware, NAND code and scan code; exact USB/SCSI bootstrap plus recipe-owned controller/NAND identity and tuple-specific artifacts are required",
+        },
+        Family::InnostorUfd => FamilySupport {
+            family,
+            controller_lines: &["IS916/IS917/IS917CP", "IS918/IS918M", "IS818"],
+            fixed_probe_lines: &[],
+            identify: false,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "Innostor packages select preformat, PC1, PC2 and NFTL images by controller and NAND organization; exact bootstrap, recipe identity and every selected runtime artifact are required",
+        },
+        Family::FirstchipUfd => FamilySupport {
+            family,
+            controller_lines: &[
+                "FC1178BC/FC1179/FC2279",
+                "FC3379/ZC3281",
+                "chipYB2019/chipYC2019",
+            ],
+            fixed_probe_lines: &[],
+            identify: false,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "FirstChip packages select external code, scan code, MP code, seed and read-retry data by controller and NAND; exact bootstrap, recipe identity and pinned artifacts are required",
+        },
+        Family::SolidStateSystemUfd => FamilySupport {
+            family,
+            controller_lines: &["SSS6677/6679", "SSS6688/6689", "SSS6690/6691/6692"],
+            fixed_probe_lines: &[],
+            identify: false,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "SSS packages contain controller-revision and NAND-specific ISP images; the inspected distribution was corrupt, so only exact independently acquired artifacts and a trace-derived recipe may be used",
+        },
+        Family::SkymediUfd => FamilySupport {
+            family,
+            controller_lines: &["SK6211", "SK62xx", "SK66xx"],
+            fixed_probe_lines: &[],
+            identify: false,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: false,
+            volatile_loader_documented: false,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "Skymedi controller and NAND geometry vary across SK62xx/SK66xx; exact bootstrap and controller-owned recipe identities are required before the bounded physical recipe engine is executable",
+        },
+        Family::AppotechUfd => recipe_only_support(
+            family,
+            &["DM8216/DM8231/DM8235", "DM8261/DM8261A", "YS8231"],
+            "AppoTech tools expose partitioning and factory initialization but use OEM identities and controller/NAND-specific payloads; exact bootstrap and trace-derived recipe identities are required",
+        ),
+        Family::SilicongoUfd => recipe_only_support(
+            family,
+            &[
+                "SG1580/SG1581",
+                "KS6808/UD6809",
+                "SG1581 with DM8235-compatible tool generation",
+            ],
+            "SiliconGo SG1581 production packages share tool generations with some DM8235 media but are a separate family; exact controller/NAND identity and pinned payloads are required",
+        ),
+        Family::IcreateUfd => recipe_only_support(
+            family,
+            &["i5060/i5062", "i5122/i5127/i5128/i5129", "i5188"],
+            "iCreate packages separate RAM, timing, low-level-format, page-scan and two-plane payloads; exact bootstrap and every tuple-selected payload are required",
+        ),
+        Family::OtiUfd => recipe_only_support(
+            family,
+            &[
+                "OTi2165/2166/2167/2168/2169",
+                "OTi2189/6128/6228/6828",
+            ],
+            "OTi production tools cover several incompatible controller revisions and embed their factory logic in an unsigned executable; exact bootstrap, controller/NAND identity and trace-derived commands are required",
+        ),
+        Family::ProlificUfd => recipe_only_support(
+            family,
+            &["PL-2515/PL-2515PRO", "PL-2518", "PL-2528"],
+            "Prolific utilities support hidden-LUN and factory formatting operations, but those operations do not prove physical coverage; an exact recipe and metadata contract are required",
+        ),
+        Family::AmecoUfd => recipe_only_support(
+            family,
+            &["MXT6208A/MXT6208E", "MXT8208/MW8209", "MW8289/MW8690"],
+            "Ameco/MXTronics tools are NAND- and revision-specific and commonly use reprogrammable OEM descriptors; exact bootstrap and recipe-owned identities are required",
+        ),
+        Family::NetacUfd => recipe_only_support(
+            family,
+            &["NT2033/NT2039", "NT2060"],
+            "Netac factory and repair tools cover distinct NT20xx controllers, with some products using SSS silicon; exact controller-owned identity must resolve the ambiguity before a recipe runs",
+        ),
+        Family::EfortuneUfd => recipe_only_support(
+            family,
+            &["eU201/eU201F/eU201CT", "eU202"],
+            "eFortune packages split preformat, read, run, die-sorting and NAND organization firmware; exact bootstrap and all selected runtime artifacts are required",
+        ),
+        Family::IteUfd => recipe_only_support(
+            family,
+            &[
+                "IT1165/IT1167B",
+                "IT1171/IT1172/IT1176/IT1177",
+                "IT1181/IT1199",
+            ],
+            "ITE UFD controllers span several incompatible generations and expose programmable USB identities; exact bootstrap, controller/NAND identity and revision-specific production artifacts are required",
+        ),
+        Family::HyperstoneUfd => recipe_only_support(
+            family,
+            &["U8/U8B USB 2.0", "U9 USB 3.1"],
+            "Hyperstone U8/U9 use application-specific firmware, hyMap FTL and a permission-controlled manufacturing kit; exact controller firmware, NAND organization and authenticated kit artifacts are required",
+        ),
+        Family::YeestorUfd => recipe_only_support(
+            family,
+            &[
+                "YS USB2.0 generations",
+                "YS5083/YS5085 USB 3.2 Gen1",
+                "YS5283HP USB 3.2 Gen2",
+            ],
+            "Yeestor USB controllers integrate LDPC and support multiple 3D NAND organizations; exact bootstrap, controller/NAND identity and tuple-selected firmware are required",
+        ),
+        Family::RamosUfd => recipe_only_support(
+            family,
+            &["UR22/UR24/UR25/UR26", "UR28/UR30/UR31"],
+            "Ramos RunDisk generations use controller-specific settings and expose partition/password operations that do not prove physical coverage; an exact raw-NAND recipe and metadata contract are required",
+        ),
+        Family::Trek2000Ufd => recipe_only_support(
+            family,
+            &["TD2SMG9/TD2SM9", "legacy Trek ThumbDrive controllers"],
+            "Trek 2000 controllers include multi-NAND and proprietary firmware generations; exact controller response, physical interleave and metadata layouts are required",
+        ),
+        Family::MoaiUfd => recipe_only_support(
+            family,
+            &["MA8100/MA8102/MA8103", "MA8125"],
+            "Moai MA81xx factory tools expose scan and reinitialization paths but no authenticated public physical-coverage contract; exact trace-derived commands and NAND geometry are required",
+        ),
+        Family::RealwayUfd => recipe_only_support(
+            family,
+            &["RW8021", "CION AR192/AP192"],
+            "Real-Way/CION repair packages target revision-specific controllers and OEM descriptors; exact bootstrap and recipe-owned identities must resolve the silicon before execution",
+        ),
+        Family::HuayiUfd => recipe_only_support(
+            family,
+            &["HY6919"],
+            "HuaYi HY6919 production packages are available only as controller-specific binaries with programmable OEM identity; exact trace evidence, NAND identity and pinned artifacts are required",
+        ),
+        Family::KtcUfd => recipe_only_support(
+            family,
+            &["FC1325N"],
+            "KTC FC1325N is an older UFD controller with a dedicated service utility; exact command traces, physical geometry and metadata layout are required",
+        ),
+        Family::SmscUfd => recipe_only_support(
+            family,
+            &["USB97C242"],
+            "SMSC USB97C242 is a legacy direct-NAND USB flash-drive controller with public hardware documentation but no public raw-NAND host command contract; exact firmware and trace-derived recipe evidence are required",
+        ),
     }
 }
 
@@ -174,14 +576,14 @@ pub fn identify_with(
     mut read: impl FnMut(&[u8], usize) -> Result<Vec<u8>>,
 ) -> Result<Option<ControllerIdentity>> {
     match family {
-        Family::PhisonPs2251 => {
+        Family::PhisonUfd => {
             let page = read(&phison_version_cdb(), PHISON_VERSION_PAGE_LEN)?;
             let mut identity = parse_phison_version_page(&page)?;
             let nand = read(&phison_nand_id_cdb(), PHISON_NAND_ID_LEN)?;
             identity.nand_id = Some(parse_six_byte_nand_id(&nand, "Phison")?);
             Ok(Some(identity))
         }
-        Family::AlcorAu698x => {
+        Family::AlcorUfd => {
             let config = read(&alcor_config_read_cdb(), ALCOR_CONFIG_LEN)?;
             let mut identity = parse_alcor_config(&config)?;
             let nand = read(&alcor_flash_id_cdb(), ALCOR_FLASH_ID_LEN)?;
@@ -195,12 +597,35 @@ pub fn identify_with(
         // No public fixed vendor CDB is known for the proprietary SanDisk
         // Cruzer family. Identification is supplied by an authenticated
         // exact-tuple recipe after a read-only USB/SCSI bootstrap match.
-        Family::SandiskCruzer => Ok(None),
+        Family::SandiskCruzer
+        | Family::ChipsbankUfd
+        | Family::InnostorUfd
+        | Family::FirstchipUfd
+        | Family::SolidStateSystemUfd
+        | Family::SkymediUfd
+        | Family::AppotechUfd
+        | Family::SilicongoUfd
+        | Family::IcreateUfd
+        | Family::OtiUfd
+        | Family::ProlificUfd
+        | Family::AmecoUfd
+        | Family::NetacUfd
+        | Family::EfortuneUfd
+        | Family::IteUfd
+        | Family::HyperstoneUfd
+        | Family::YeestorUfd
+        | Family::RamosUfd
+        | Family::Trek2000Ufd
+        | Family::MoaiUfd
+        | Family::RealwayUfd
+        | Family::HuayiUfd
+        | Family::KtcUfd
+        | Family::SmscUfd => Ok(None),
         // USBest UT163: the controller embeds its identity in the standard
         // INQUIRY response's vendor-specific area (beyond the standard
         // data). No vendor CDB is sent, so a non-UT163 device answers
         // INQUIRY harmlessly and the marker simply does not match.
-        Family::UsbestUt163 => {
+        Family::UsbestUfd => {
             let marker = marker.ok_or_else(|| {
                 Error::Invalid("USBest UT163 identification requires an inquiry marker".into())
             })?;
@@ -333,13 +758,10 @@ pub fn parse_inquiry_marker(
             marker.marker
         )));
     }
-    let ascii = |range: std::ops::Range<usize>| {
-        String::from_utf8_lossy(&data[range])
-            .trim()
-            .to_string()
-    };
+    let ascii =
+        |range: std::ops::Range<usize>| String::from_utf8_lossy(&data[range]).trim().to_string();
     Ok(ControllerIdentity {
-        family: Family::UsbestUt163,
+        family: Family::UsbestUfd,
         controller_id: "usbest-ut163".into(),
         // The product revision (bytes 32-35) is the firmware-provided
         // revision of the mass-storage firmware.
@@ -351,7 +773,8 @@ pub fn parse_inquiry_marker(
 
 // Phison PS2251 ------------------------------------------------------------
 
-pub const PHISON_VERSION_PAGE_LEN: usize = 528;pub const PHISON_NAND_ID_LEN: usize = 512;
+pub const PHISON_VERSION_PAGE_LEN: usize = 528;
+pub const PHISON_NAND_ID_LEN: usize = 512;
 
 pub fn phison_version_cdb() -> [u8; 16] {
     let mut cdb = [0u8; 16];
@@ -635,7 +1058,7 @@ pub fn parse_phison_version_page(data: &[u8]) -> Result<ControllerIdentity> {
         _ => "firmware",
     };
     Ok(ControllerIdentity {
-        family: Family::PhisonPs2251,
+        family: Family::PhisonUfd,
         controller_id: format!("phison-ps{chip:04x}"),
         firmware,
         nand_id: None,
@@ -697,7 +1120,7 @@ pub fn parse_alcor_config(data: &[u8]) -> Result<ControllerIdentity> {
     }
     validate_alcor_descriptors(data)?;
     Ok(ControllerIdentity {
-        family: Family::AlcorAu698x,
+        family: Family::AlcorUfd,
         controller_id: format!("alcor-au698x-{vid:04x}:{pid:04x}"),
         firmware: format!("{bcd:04x}"),
         nand_id: None,
@@ -748,14 +1171,9 @@ mod tests {
 
     #[test]
     fn family_names_round_trip() {
-        for family in [
-            Family::PhisonPs2251,
-            Family::AlcorAu698x,
-            Family::SiliconMotionUfd,
-            Family::SandiskCruzer,
-            Family::UsbestUt163,
-        ] {
+        for &family in Family::ALL {
             assert_eq!(family_from_str(family.as_str()), Some(family));
+            assert_eq!(family.recipe_str(), family.as_str());
         }
         assert_eq!(family_from_str("bogus"), None);
         assert!(!is_known_family("bogus"));
@@ -777,7 +1195,7 @@ mod tests {
     fn ut163_parses_from_vendor_specific_inquiry_marker() {
         let inquiry = imation_ut163_inquiry();
         let identity = parse_inquiry_marker(&inquiry, &ut163_marker_profile()).unwrap();
-        assert_eq!(identity.family, Family::UsbestUt163);
+        assert_eq!(identity.family, Family::UsbestUfd);
         assert_eq!(identity.controller_id, "usbest-ut163");
         assert_eq!(identity.firmware, "1.00");
         assert_eq!(identity.nand_id, None);
@@ -956,20 +1374,21 @@ mod tests {
 
     #[test]
     fn destructive_recipe_engine_is_compiled_for_every_supported_family() {
-        for family in [
-            Family::PhisonPs2251,
-            Family::AlcorAu698x,
-            Family::SiliconMotionUfd,
-            Family::SandiskCruzer,
-        ] {
+        assert_eq!(Family::ALL.len(), 28);
+        let mut fixed_probe_families = 0;
+        for &family in Family::ALL {
             let s = support(family);
+            assert_eq!(s.family, family);
+            assert_eq!(s.identify, !s.fixed_probe_lines.is_empty());
+            fixed_probe_families += usize::from(s.identify);
             assert!(s.recipe_engine);
             assert!(s.recipe_nand_identify);
-            assert!(s.physical_erase);
-            assert!(s.bbt_rebuild);
-            assert!(s.ftl_rebuild);
+            assert!(s.physical_erase_recipe_role);
+            assert!(s.bbt_rebuild_recipe_role);
+            assert!(s.ftl_rebuild_recipe_role);
             assert!(!s.production_tuple_bundled);
         }
+        assert_eq!(fixed_probe_families, 4);
     }
 
     #[test]
@@ -985,9 +1404,27 @@ mod tests {
     }
 
     #[test]
+    fn recipe_only_families_never_issue_an_implicit_probe() {
+        for family in Family::ALL
+            .iter()
+            .copied()
+            .filter(|family| !support(*family).identify)
+        {
+            let mut called = false;
+            let identity = identify_with(family, None, |_, _| {
+                called = true;
+                Err(Error::Invalid("unexpected transport call".into()))
+            })
+            .unwrap();
+            assert!(identity.is_none());
+            assert!(!called, "{} issued an implicit command", family.as_str());
+        }
+    }
+
+    #[test]
     fn phison_probe_sequence_is_bounded_and_signed() {
         let mut calls = Vec::<(Vec<u8>, usize)>::new();
-        let identity = identify_with(Family::PhisonPs2251, None, |cdb, len| {
+        let identity = identify_with(Family::PhisonUfd, None, |cdb, len| {
             calls.push((cdb.to_vec(), len));
             if cdb == phison_version_cdb() {
                 let mut page = vec![0u8; PHISON_VERSION_PAGE_LEN];

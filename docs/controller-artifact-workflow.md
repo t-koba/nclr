@@ -2,7 +2,7 @@
 
 ## 目的
 
-Phison、Alcor、Silicon Motion、SanDisk の量産 tool、service loader、USB capture は nclr に再配布しない。代わりに、利用者が正当な入手元から取得した完全一致 byte 列を manifest で固定し、content-addressed store へ格納する。controller backend は path を受け取らず、core が検証して開いた read-only FD だけを継承する。
+28 系統の登録済み USB flash controller family に必要な量産 tool、service loader、USB capture は nclr に再配布しない。代わりに、利用者が正当な入手元から取得した完全一致 byte 列を manifest で固定し、content-addressed store へ格納する。controller backend は path を受け取らず、core が検証して開いた read-only FD だけを継承する。
 
 この仕組みは vendor tool が存在することを D1–D4 到達の証拠に変換するものではない。実装 provenance、NAND geometry、metadata layout、電源断 recovery、独立 HIL report がすべて揃うまで、実媒体の `CONTROLLER_REINITIALIZE` capability は無効のままである。
 
@@ -16,7 +16,7 @@ Phison、Alcor、Silicon Motion、SanDisk の量産 tool、service loader、USB 
 - Silicon Motion の公開 [SM3282 product brief](https://www.siliconmotion.com/download/p/a/SM3282_PB_EN_201910.pdf) は controller capability を説明するが、service CDB は定義しない。公開された `sg_raw` transcript の `F0 04 ... 02` identity page は読み取り専用識別にだけ実装し、未公開の erase / NAND command は推測しない。
 - SanDisk Cruzer `82-00263-1` は board marking と NAND の組み合わせまでは複数の実基板情報で確認できるが、固定 service CDB は公開されていない。正規 tool capture の先頭から、媒体変更前に controller / firmware と NAND ID を返す command を特定し、それぞれ `read-controller-id` と `read-nand-id` に固定する。USB VID `0781` や SCSI product 文字列だけでは command を replay しない。同じ exact bootstrap は OEM VID の Phison / Alcor / SMI にも使えるが、profile に family を明記し、runtime の 2 段 identity が一致するまで capability を有効にしない。
 
-実 tool の静的解析では、Phison MPALL は `BtPramCd` burner と ID block/timing table、SM3257ENAA MPTool は controller 別 DBF / ForceFW と NAND 別 ISP / PTEST、AlcorMP は controller GEN code と NAND 別 scan/sort code を分離していた。したがって factory-tool archive や PE 全体を backend で実行する設計にはしない。取得環境で次の単位へ分離し、それぞれ exact size / SHA-256 と hardware tuple を manifest に固定する。
+実 tool の静的解析では、Phison MPALL は `BtPramCd` burner と ID block/timing table、SM3257ENAA MPTool は controller 別 DBF / ForceFW と NAND 別 ISP / PTEST、AlcorMP は controller GEN code と NAND 別 scan/sort code を分離していた。FirstChip、ChipsBank、Innostor、SSS、iCreate、OTi、eFortune の package でも controller/NAND 別の external code、scan、preformat、ISP、timing、low-level-format、BBT/FTL 相当 payload が分離されていた。したがって factory-tool archive や PE 全体を backend で実行する設計にはしない。取得環境で次の単位へ分離し、それぞれ exact size / SHA-256 と hardware tuple を manifest に固定する。
 
 - controller へ転送する loader / ISP / pretest code
 - Flash ID と geometry / timing / ECC の table
@@ -106,6 +106,22 @@ cargo run -p nclr-core --bin nclr-lab -- \
 
 recipe の契約は [`controller-protocol-recipe.md`](controller-protocol-recipe.md) に記載する。
 
+## 未対応媒体からの情報収集
+
+実 USB flash drive を接続した最初の操作は読み取り専用の `info` である。
+
+```sh
+nclr info -j /dev/diskN > controller-inventory.json
+```
+
+macOS では `diskutil` と IOKit registry を結合し、対象 BSD whole disk の provider chain にある exact USB VID、PID、bcdDevice、manufacturer、product、serial、location ID と SCSI vendor、product、revision を取得する。multi-LUN device では対象 BSD node の経路だけを検索し、兄弟 LUN の SCSI tuple を混入させない。OS identity 取得だけでは media command を送信しない。
+
+JSON の `controller_research` は、selection 根拠、候補 family、観測した exact bootstrap、identity source、実際に送信した read-only command 一覧、production 化に不足する証拠を返す。VID だけで選ばれた family は候補にすぎず、未知 vendor command は送信せず capability も公開しない。固定 probe が利用できない macOS でも、この bundle から exact bootstrap profile の作成、正規 tool trace の対応付け、追加調査の不足項目を再現できる。
+
+この出力には USB serial が含まれるため、外部共有前に取り扱いを決める。ただし production bootstrap では serial の空文字も wildcard ではなく exact absence として扱い、識別強度を下げる暗黙 fallback は行わない。
+
+native SD では同じ `info -j` が command-free の `sd_research` を返す。Linux の MMC registry から取得できる CID、CSD、SCR、manufacturer/OEM ID、product、serial、製造日、host、card kind、erase group を complete / partial に分類し、macOS で card register が公開されない場合は `os-identity-only` と明示する。CSD の address structure と erase command class から、SDSC の byte-addressed または SDHC/SDXC/SDUC の block-addressed standard full-user erase が protocol 上成立するかも事前計算する。CID/CSD/SCR は card identity であって内部 controller / firmware identity ではないため、vendor service command、NAND geometry、page/OOB addressing、BBT/FTL metadata、loader、recovery と HIL 証拠を別の不足項目として保持し、C3/C4 capability へ変換しない。
+
 ## USB BOT trace の抽出
 
 正規 factory tool が動作する隔離済み環境で USB capture を pcapng として保存する。capture には媒体 user data、serial、鍵、credential が含まれる可能性があるため、公開してはならない。Mac では Wireshark を install して offline 解析だけを行える。Linux 実機検証は不要である。
@@ -143,7 +159,7 @@ normalized NDJSON は `decode`、`diff`、`infer`、read-only 限定の `replay`
 1. `implementation.strategy`: `clean-room` または `runtime-artifact`。
 2. `protocol_evidence_sha256`: 同じ profile 内の `protocol-trace` artifact と一致。
 3. `source_reference`: user information を含まない HTTPS URL。
-4. runtime artifact id: profile 内の exact controller / firmware / NAND artifact を参照。`protocol-recipe` はちょうど 1 個、`role = "runtime"` でなければならない。`strategy = "runtime-artifact"` は backend が実際に controller へ渡す `service-loader` を最低 1 個要求し、factory-tool PE / archive だけでは成立しない。
+4. runtime artifact id: profile 内の exact controller / firmware / NAND artifact を参照。`protocol-recipe` はちょうど 1 個、`role = "runtime"` でなければならない。`strategy = "runtime-artifact"` は backend が実際に controller へ渡す `service-loader` を最低 1 個要求し、factory-tool PE / archive だけでは成立しない。固定 probe を持たない family の bootstrap は USB VID / PID / bcdDevice / manufacturer / product / serial と SCSI vendor / product / revision を全て exact に固定する。
 5. geometry: channel、CE、LUN、plane、block、page、page/OOB size、address cycle、bits/cell、FBB marker、randomizer、read-retry、ECC layout。
 6. metadata: BBT / FTL / spare format、atomic commit protocol、順序付けされた非重複 system block range。
 7. qualification report: `qualification-report` artifact の SHA-256 と `report_sha256` が一致。
@@ -167,15 +183,15 @@ TOML だけでは capability を有効化できない。profile、recipe、trace
 
 ### Alcor
 
-config read と flash-ID read は identity にだけ使う。`0x81 00 ff` config write を erase / rebuild と解釈しない。正規 tool capture から確定した service transition、raw NAND operation、metadata commit は `family = "alcor-au698x"` recipe として engine に渡せる。成功 / 失敗 trace の response signature と各 field を HIL で確定する必要がある。
+config read と flash-ID read は identity にだけ使う。`0x81 00 ff` config write を erase / rebuild と解釈しない。正規 tool capture から確定した service transition、raw NAND operation、metadata commit は `family = "alcor-ufd"` recipe として engine に渡せる。成功 / 失敗 trace の response signature と各 field を HIL で確定する必要がある。
 
 ### Silicon Motion
 
-公開 transcript の identity CDB 以外に、D1–D4 用 service CDB の確定資料はない。正規 tool を利用環境で取得できた場合は、USB capture を上記 decoder へ通し、controller-owned response signature と bounded command grammar を `family = "smi-sm32x"` recipe に固定する。VID、tool filename、二次配布 archive だけを根拠に opcode を実装しない。
+公開 transcript の identity CDB 以外に、D1–D4 用 service CDB の確定資料はない。正規 tool を利用環境で取得できた場合は、USB capture を上記 decoder へ通し、controller-owned response signature と bounded command grammar を `family = "silicon-motion-ufd"` recipe に固定する。VID、tool filename、二次配布 archive だけを根拠に opcode を実装しない。
 
 ### SanDisk Cruzer
 
-`family = "sandisk-cruzer"` は通常 probe で vendor CDB を送信しない。まず profile の `controller_bootstrap` に、実対象から取得した `usb_vid = 0x0781`、exact `usb_pid`、exact `usb_bcd_device`、SCSI INQUIRY の exact vendor / product / revision を固定する。これは plan が必要 artifact を一意に選ぶためだけの selector である。
+`family = "sandisk-cruzer"` は通常 probe で vendor CDB を送信しない。まず profile の `controller_bootstrap` に、実対象から取得した `usb_vid = 0x0781`、exact `usb_pid`、exact `usb_bcd_device`、USB manufacturer / product / serial、SCSI INQUIRY の exact vendor / product / revision を固定する。これは plan が必要 artifact を一意に選ぶためだけの selector である。
 
 正規 tool trace では、書き込みや mode 遷移より前に成功している device-to-host command を抽出し、犠牲媒体の chip marking と response の対応を確認する。controller / firmware を区別する stable payload window を `controller_identity_hex` と `read-controller-id` に、NAND die を区別する raw ID window を `nand_id` と `read-nand-id` に固定する。可変 serial、counter、checksum を identity payload に含めず、固定 signature と field rule で別に検査する。両 response の exact match が終わるまでは service entry を含む破壊 command を実行しない。
 

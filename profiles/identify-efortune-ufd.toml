@@ -1,0 +1,7 @@
+# Candidate-only identification profile: eFortune eU20x UFD.
+# The vendor-owned VID selects no command; exact identity comes from a
+# digest-pinned bootstrap recipe.
+schema = 1
+id = "efortune-ufd"
+family = "efortune-ufd"
+usb_vid_hints = [0x1AA6]

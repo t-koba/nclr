@@ -125,7 +125,7 @@ impl Report {
                 power_cycle_performed: None,
                 details: None,
             },
-            final_state: "raw-uninitialized".to_string(),
+            final_state: "undetermined".to_string(),
             plan_id: plan.id.clone(),
             plan_hash: plan.plan_hash.clone(),
             backend: serde_json::to_value(&plan.backend).unwrap_or(serde_json::json!({})),
@@ -219,32 +219,32 @@ impl SummaryReport {
 
 /// Default coverage for the LBA C1 path.
 pub fn lba_coverage(errors: u64) -> Vec<CoverageEntry> {
-    let mut d0 = CoverageEntry {
+    let d0 = CoverageEntry {
         domain: "D0".into(),
-        final_state: "erased".into(),
+        final_state: if errors == 0 {
+            "erased".into()
+        } else {
+            "erase-failed".into()
+        },
         count: None,
         attempted: None,
         erased: None,
-        failed: None,
-        residual: None,
+        failed: (errors > 0).then_some(errors),
+        residual: Some(errors > 0),
     };
-    let mut d3 = CoverageEntry {
-        domain: "D3".into(),
-        final_state: "unknown".into(),
-        count: None,
-        attempted: None,
-        erased: None,
-        failed: None,
-        residual: None,
-    };
-    if errors > 0 {
-        d0.final_state = "erase-failed".into();
-        d0.failed = Some(errors);
-        d0.residual = Some(true);
+    let mut coverage = vec![d0];
+    for domain in ["D1", "D2", "D3", "D4"] {
+        coverage.push(CoverageEntry {
+            domain: domain.into(),
+            final_state: "unreachable".into(),
+            count: None,
+            attempted: None,
+            erased: None,
+            failed: None,
+            residual: Some(true),
+        });
     }
-    d3.final_state = "unreachable".into();
-    d3.residual = Some(true);
-    vec![d0, d3]
+    coverage
 }
 
 /// Coverage for the C2 (device erase) path: D0-D2 are erased per the
@@ -311,6 +311,10 @@ pub fn d5_coverage(plan: &crate::plan::Plan) -> Option<CoverageEntry> {
 /// individually erased (failures recorded), D4 rebuilt.
 pub fn physical_coverage(
     blocks_erase_failed: u64,
+    old_rbb_erase_attempted: bool,
+    rbb_count: Option<u64>,
+    old_rbb_erased: u64,
+    old_rbb_erase_failed: u64,
     unknown_reservation: u64,
     bbt_ftl_rebuilt: bool,
 ) -> Vec<CoverageEntry> {
@@ -329,18 +333,37 @@ pub fn physical_coverage(
     } else {
         "erased"
     };
-    vec![
+    let old_rbb_attempted = old_rbb_erased.checked_add(old_rbb_erase_failed);
+    let old_rbb_accounted = old_rbb_erase_attempted
+        && rbb_count
+            .zip(old_rbb_attempted)
+            .is_some_and(|(total, attempted)| total == attempted);
+    let coverage = vec![
         mk("D0", d0_d2),
         mk("D1", d0_d2),
         mk("D2", d0_d2),
-        mk(
-            "D3",
-            if blocks_erase_failed > 0 {
-                "erase-failed"
+        CoverageEntry {
+            domain: "D3".into(),
+            final_state: if old_rbb_accounted
+                && blocks_erase_failed == 0
+                && old_rbb_erase_failed == 0
+            {
+                "erased".into()
             } else {
-                "erased"
+                "erase-failed".into()
             },
-        ),
+            count: rbb_count,
+            attempted: if old_rbb_erase_attempted {
+                old_rbb_attempted
+            } else {
+                None
+            },
+            erased: old_rbb_erase_attempted.then_some(old_rbb_erased),
+            failed: old_rbb_erase_attempted.then_some(old_rbb_erase_failed),
+            residual: Some(
+                !old_rbb_accounted || blocks_erase_failed > 0 || old_rbb_erase_failed > 0,
+            ),
+        },
         mk(
             "D4",
             if rebuilt_ok {
@@ -362,23 +385,24 @@ pub fn physical_coverage(
             failed: None,
             residual: Some(unknown_reservation > 0),
         },
-    ]
+    ];
+    coverage
 }
 /// Coverage for the C3 (controller reinitialization) path: D0-D2 erased by
 /// the controller erase, D3 per-block erased (old RBB), D4 rebuilt
 /// (BBT/FTL/spare). D5-D7 preserved.
 pub fn controller_coverage(
-    new_bbt_committed: bool,
-    ftl_rebuilt: bool,
-    old_rbb_erase_failed: u64,
-    io_errors: u64,
+    evidence: &crate::grade::ControllerReinitEvidence,
 ) -> Vec<CoverageEntry> {
-    let rebuilt_ok = new_bbt_committed && ftl_rebuilt && io_errors == 0;
-    let d3_final = if old_rbb_erase_failed > 0 || !rebuilt_ok {
-        "erase-failed"
-    } else {
-        "erased"
-    };
+    let rebuilt_ok = evidence.new_bbt_committed && evidence.ftl_rebuilt && evidence.io_errors == 0;
+    let old_rbb_attempted = evidence
+        .old_rbb_erased
+        .checked_add(evidence.old_rbb_erase_failed);
+    let old_rbb_accounted = evidence.old_rbb_erase_attempted
+        && evidence
+            .rbb_count
+            .zip(old_rbb_attempted)
+            .is_some_and(|(total, attempted)| total == attempted);
     let mk = |id: &str, final_state: &str| CoverageEntry {
         domain: id.into(),
         final_state: final_state.into(),
@@ -389,10 +413,51 @@ pub fn controller_coverage(
         residual: Some(final_state != "erased"),
     };
     vec![
-        mk("D0", if rebuilt_ok { "erased" } else { "erase-failed" }),
-        mk("D1", if rebuilt_ok { "erased" } else { "erase-failed" }),
-        mk("D2", if rebuilt_ok { "erased" } else { "erase-failed" }),
-        mk("D3", d3_final),
+        mk(
+            "D0",
+            if rebuilt_ok && evidence.final_erase_failed == 0 {
+                "erased"
+            } else {
+                "erase-failed"
+            },
+        ),
+        mk(
+            "D1",
+            if rebuilt_ok && evidence.final_erase_failed == 0 {
+                "erased"
+            } else {
+                "erase-failed"
+            },
+        ),
+        mk(
+            "D2",
+            if rebuilt_ok && evidence.final_erase_failed == 0 {
+                "erased"
+            } else {
+                "erase-failed"
+            },
+        ),
+        CoverageEntry {
+            domain: "D3".into(),
+            final_state: if old_rbb_accounted && evidence.old_rbb_erase_failed == 0 {
+                "erased".into()
+            } else {
+                "erase-failed".into()
+            },
+            count: evidence.rbb_count,
+            attempted: if evidence.old_rbb_erase_attempted {
+                old_rbb_attempted
+            } else {
+                None
+            },
+            erased: evidence
+                .old_rbb_erase_attempted
+                .then_some(evidence.old_rbb_erased),
+            failed: evidence
+                .old_rbb_erase_attempted
+                .then_some(evidence.old_rbb_erase_failed),
+            residual: Some(!old_rbb_accounted || evidence.old_rbb_erase_failed > 0),
+        },
         mk(
             "D4",
             if rebuilt_ok {
@@ -402,4 +467,107 @@ pub fn controller_coverage(
             },
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_plan() -> crate::plan::Plan {
+        crate::plan::Plan {
+            schema: crate::SCHEMA_PLAN.into(),
+            id: "test-plan".into(),
+            created: "1970-01-01T00:00:00Z".into(),
+            device: crate::plan::PlanDevice {
+                fingerprint: "test-fingerprint".into(),
+                physical_path: "test-path".into(),
+                capacity_bytes: 512,
+            },
+            requested_level: "lba".into(),
+            minimum_level: "C1".into(),
+            backend: crate::plan::PlanBackend {
+                id: "test".into(),
+                version: "1".into(),
+                profile: None,
+                profile_sha256: None,
+                trust: "production".into(),
+                sha256: None,
+                artifacts: Vec::new(),
+            },
+            domains: Vec::new(),
+            actions: Vec::new(),
+            fallback: Vec::new(),
+            expected_grade: "C1".into(),
+            expected_residual: "unreachable".into(),
+            no_fallback: false,
+            aggressive_lba: false,
+            fallback_plan: None,
+            power: None,
+            safety: None,
+            plan_hash: "test-plan-hash".into(),
+        }
+    }
+
+    #[test]
+    fn new_report_does_not_claim_the_final_state_before_postcheck() {
+        let report = Report::new(&test_plan());
+        assert_eq!(report.final_state, "undetermined");
+        assert!(!report.postcheck.passed);
+    }
+
+    #[test]
+    fn report_self_hash_excludes_only_the_hash_field() {
+        let mut report = Report::new(&test_plan());
+        let initial = report.compute_hash();
+        report.report_hash = "ignored-self-hash".into();
+        assert_eq!(report.compute_hash(), initial);
+
+        report.result = "ok".into();
+        assert_ne!(report.compute_hash(), initial);
+    }
+
+    #[test]
+    fn lba_coverage_marks_every_internal_domain_unreachable() {
+        let coverage = lba_coverage(0);
+        assert_eq!(coverage.len(), 5);
+        assert_eq!(coverage[0].domain, "D0");
+        assert_eq!(coverage[0].final_state, "erased");
+        for (entry, domain) in coverage[1..].iter().zip(["D1", "D2", "D3", "D4"]) {
+            assert_eq!(entry.domain, domain);
+            assert_eq!(entry.final_state, "unreachable");
+            assert_eq!(entry.residual, Some(true));
+        }
+    }
+
+    #[test]
+    fn controller_coverage_keeps_old_rbb_results_separate_from_rebuild() {
+        let coverage = controller_coverage(&crate::grade::ControllerReinitEvidence {
+            new_bbt_committed: true,
+            ftl_rebuilt: true,
+            old_rbb_erase_attempted: true,
+            rbb_count: Some(3),
+            old_rbb_erased: 2,
+            old_rbb_erase_failed: 1,
+            ..Default::default()
+        });
+        let d3 = coverage.iter().find(|entry| entry.domain == "D3").unwrap();
+        assert_eq!(d3.final_state, "erase-failed");
+        assert_eq!(d3.count, Some(3));
+        assert_eq!(d3.attempted, Some(3));
+        assert_eq!(d3.erased, Some(2));
+        assert_eq!(d3.failed, Some(1));
+
+        let rebuild_failed = controller_coverage(&crate::grade::ControllerReinitEvidence {
+            old_rbb_erase_attempted: true,
+            rbb_count: Some(3),
+            old_rbb_erased: 3,
+            ..Default::default()
+        });
+        let d3 = rebuild_failed
+            .iter()
+            .find(|entry| entry.domain == "D3")
+            .unwrap();
+        assert_eq!(d3.final_state, "erased");
+        assert_eq!(d3.residual, Some(false));
+    }
 }

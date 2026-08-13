@@ -7,6 +7,7 @@
 //! Backends must not open any device path themselves.
 
 use crate::errors::{Error, Result};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -42,11 +43,48 @@ pub struct BackendHandle {
     pub operations: Vec<String>,
 }
 
+const MAX_BACKEND_BYTES: u64 = 1024 * 1024 * 1024;
+
 fn sha256_file(path: &Path) -> Result<String> {
-    let data =
-        std::fs::read(path).map_err(|e| Error::io(format!("read {}", path.display()), Some(e)))?;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|error| Error::io(format!("open backend {}", path.display()), Some(error)))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io(format!("stat backend {}", path.display()), Some(error)))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_BACKEND_BYTES {
+        return Err(Error::Invalid(format!(
+            "backend {} must be a non-empty regular file no larger than {MAX_BACKEND_BYTES} bytes",
+            path.display()
+        )));
+    }
+    use std::io::Read;
     let mut h = Sha256::new();
-    h.update(&data);
+    let mut reader = file.take(MAX_BACKEND_BYTES + 1);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| Error::io(format!("read backend {}", path.display()), Some(error)))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_BACKEND_BYTES {
+            return Err(Error::Invalid(format!(
+                "backend {} grew beyond {MAX_BACKEND_BYTES} bytes while reading",
+                path.display()
+            )));
+        }
+        h.update(&buffer[..read]);
+    }
     Ok(hex::encode(h.finalize()))
 }
 
@@ -55,19 +93,77 @@ fn sha256_file(path: &Path) -> Result<String> {
 const BUILTIN_BACKENDS: [&str; 5] = ["sim", "scsi", "sd-native", "lba", "controller"];
 const BACKEND_OPERATIONS: [&str; 5] = ["probe", "plan", "run", "status", "recover"];
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_RESPONSE_LIST_ITEMS: usize = 4096;
+const MAX_RESPONSE_STRING_BYTES: usize = 256;
+const MAX_RESPONSE_MESSAGE_BYTES: usize = 16 * 1024;
 
-fn manifest_string<'a>(manifest: &'a toml::Value, key: &str) -> Result<&'a str> {
-    manifest
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Invalid(format!("backend manifest: {key} is required")))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendManifest {
+    schema: u32,
+    id: String,
+    exec: String,
+    api: u32,
+    version: String,
+    trust: String,
+    operations: Vec<String>,
+    sha256: String,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    profile_dir: Option<PathBuf>,
 }
 
-fn manifest_operations(manifest: &toml::Value) -> Result<Vec<String>> {
-    let values = manifest
-        .get("operations")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| Error::Invalid("backend manifest: operations is required".into()))?;
+fn load_manifest(path: &Path) -> Result<BackendManifest> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(|error| Error::io(format!("open manifest {}", path.display()), Some(error)))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| Error::io(format!("stat manifest {}", path.display()), Some(error)))?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(Error::Invalid(format!(
+            "backend manifest {} must be a regular file no larger than {MAX_MANIFEST_BYTES} bytes",
+            path.display()
+        )));
+    }
+    use std::io::Read;
+    let mut raw = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| Error::io(format!("read manifest {}", path.display()), Some(error)))?;
+    if raw.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(Error::Invalid(format!(
+            "backend manifest {} grew beyond {MAX_MANIFEST_BYTES} bytes while reading",
+            path.display()
+        )));
+    }
+    let source = String::from_utf8(raw).map_err(|error| {
+        Error::Invalid(format!(
+            "backend manifest {} is not UTF-8: {error}",
+            path.display()
+        ))
+    })?;
+    let manifest: BackendManifest = toml::from_str(&source)
+        .map_err(|error| Error::Invalid(format!("backend manifest {}: {error}", path.display())))?;
+    if manifest.schema != 1 {
+        return Err(Error::Invalid(format!(
+            "backend manifest {} schema {} != 1",
+            path.display(),
+            manifest.schema
+        )));
+    }
+    Ok(manifest)
+}
+
+fn manifest_operations(values: &[String]) -> Result<Vec<String>> {
     if values.is_empty() {
         return Err(Error::Invalid(
             "backend manifest: operations must not be empty".into(),
@@ -75,9 +171,7 @@ fn manifest_operations(manifest: &toml::Value) -> Result<Vec<String>> {
     }
     let mut operations = Vec::with_capacity(values.len());
     for value in values {
-        let op = value.as_str().ok_or_else(|| {
-            Error::Invalid("backend manifest: every operation must be a string".into())
-        })?;
+        let op = value.as_str();
         if !BACKEND_OPERATIONS.contains(&op) {
             return Err(Error::Invalid(format!(
                 "backend manifest: unsupported operation {op}"
@@ -152,67 +246,56 @@ pub fn find(id: &str, dirs: &[PathBuf]) -> Result<BackendHandle> {
         let manifest_path = dir.join(format!("{id}.toml"));
         let (trust, sha256, profile, version, profile_dir, operations) = if manifest_path.is_file()
         {
-            let m = std::fs::read_to_string(&manifest_path)
-                .map_err(|e| Error::Invalid(format!("manifest read: {e}")))?;
-            let toml: toml::Value =
-                toml::from_str(&m).map_err(|e| Error::Invalid(format!("manifest parse: {e}")))?;
-            if manifest_string(&toml, "id")? != id {
+            let manifest = load_manifest(&manifest_path)?;
+            if manifest.id != id {
                 return Err(Error::Invalid(format!(
                     "backend {id} manifest id does not match"
                 )));
             }
             let expected_exec = format!("nclr-{id}");
-            if manifest_string(&toml, "exec")? != expected_exec {
+            if manifest.exec != expected_exec {
                 return Err(Error::Invalid(format!(
                     "backend {id} manifest exec must be {expected_exec}"
                 )));
             }
-            if toml.get("api").and_then(|v| v.as_integer()) != Some(PROTOCOL_API as i64) {
+            if manifest.api != PROTOCOL_API {
                 return Err(Error::Invalid(format!(
                     "backend {id} manifest api must be {PROTOCOL_API}"
                 )));
             }
-            let trust = manifest_string(&toml, "trust")?.to_string();
+            let trust = manifest.trust;
             if trust != "production" {
                 return Err(Error::Backend(format!(
                     "backend {id} trust is {trust}; destructive execution requires production"
                 )));
             }
-            let operations = manifest_operations(&toml)?;
-            let declared = toml
-                .get("sha256")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let operations = manifest_operations(&manifest.operations)?;
+            let declared = manifest.sha256;
             let actual = sha256_file(&bin)?;
-            if let Some(d) = &declared {
-                if d.len() != 64 || !d.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(Error::Invalid(format!(
-                        "backend {id} manifest sha256 must be 64 hex characters"
-                    )));
-                }
-                if !d.eq_ignore_ascii_case(&actual) {
-                    return Err(Error::Invalid(format!(
-                        "backend {id} digest mismatch: manifest {d}, binary {actual}"
-                    )));
-                }
+            if declared.len() != 64 || !declared.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Error::Invalid(format!(
+                    "backend {id} manifest sha256 must be 64 hex characters"
+                )));
             }
-            let profile = toml
-                .get("profile")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let version = toml
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let profile_dir = toml.get("profile_dir").and_then(|v| v.as_str()).map(|p| {
-                let p = PathBuf::from(p);
-                if p.is_absolute() {
-                    p
-                } else {
-                    dir.join(p)
-                }
-            });
+            if !declared.eq_ignore_ascii_case(&actual) {
+                return Err(Error::Invalid(format!(
+                    "backend {id} digest mismatch: manifest {declared}, binary {actual}"
+                )));
+            }
+            let profile = manifest.profile;
+            let version = manifest.version;
+            if version.is_empty()
+                || version.len() > 128
+                || !version.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(Error::Invalid(format!(
+                    "backend {id} manifest version is invalid"
+                )));
+            }
+            let profile_dir =
+                manifest
+                    .profile_dir
+                    .map(|p| if p.is_absolute() { p } else { dir.join(p) });
             (trust, actual, profile, version, profile_dir, operations)
         } else {
             // Builtin backends shipped with the core are production-trusted;
@@ -376,18 +459,436 @@ impl BackendResponse {
     /// Whether the family holds a certified physical-scope (C4) validation.
     pub fn physical_certified(&self) -> bool {
         self.value
-            .get("certification")
-            .and_then(|v| v.as_str())
-            .map(|c| c.eq_ignore_ascii_case("C4"))
+            .get("physical_certified")
+            .and_then(|v| v.as_bool())
             .unwrap_or(false)
+            || self
+                .value
+                .get("certification")
+                .and_then(|v| v.as_str())
+                .map(|c| c.eq_ignore_ascii_case("C4"))
+                .unwrap_or(false)
     }
     pub fn message(&self) -> String {
         self.value
             .get("error")
             .and_then(|v| v.as_str())
+            .or_else(|| {
+                self.value
+                    .get("action_results")
+                    .and_then(Value::as_array)
+                    .and_then(|results| results.first())
+                    .and_then(|result| result.get("message"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("backend error")
             .to_string()
     }
+}
+
+fn response_protocol_error(backend: &str, message: impl std::fmt::Display) -> Error {
+    Error::io(
+        format!("backend {backend} response protocol: {message}"),
+        None,
+    )
+}
+
+fn validate_response_string<'a>(backend: &str, field: &str, value: &'a Value) -> Result<&'a str> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| response_protocol_error(backend, format!("{field} must be a string")))?;
+    if text.is_empty()
+        || text.len() > MAX_RESPONSE_STRING_BYTES
+        || !text.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(response_protocol_error(
+            backend,
+            format!("{field} must be non-empty printable ASCII no longer than {MAX_RESPONSE_STRING_BYTES} bytes"),
+        ));
+    }
+    Ok(text)
+}
+
+fn validate_response_string_list(
+    backend: &str,
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<()> {
+    let values = object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| response_protocol_error(backend, format!("{field} must be an array")))?;
+    if values.len() > MAX_RESPONSE_LIST_ITEMS {
+        return Err(response_protocol_error(
+            backend,
+            format!("{field} exceeds {MAX_RESPONSE_LIST_ITEMS} entries"),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    for value in values {
+        let item = validate_response_string(backend, field, value)?;
+        if !seen.insert(item) {
+            return Err(response_protocol_error(
+                backend,
+                format!("{field} contains duplicate value {item}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_response_string(
+    backend: &str,
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<()> {
+    match object.get(field) {
+        Some(Value::Null) => Ok(()),
+        Some(value) => validate_response_string(backend, field, value).map(|_| ()),
+        None => Err(response_protocol_error(backend, format!("missing {field}"))),
+    }
+}
+
+fn validate_optional_response_message(
+    backend: &str,
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<()> {
+    let Some(value) = object.get(field) else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let message = value.as_str().ok_or_else(|| {
+        response_protocol_error(backend, format!("{field} must be a string when present"))
+    })?;
+    if message.len() > MAX_RESPONSE_MESSAGE_BYTES
+        || message
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(response_protocol_error(
+            backend,
+            format!(
+                "{field} must contain no control characters and be no longer than {MAX_RESPONSE_MESSAGE_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_probe_response(backend: &str, object: &serde_json::Map<String, Value>) -> Result<()> {
+    validate_response_string_list(backend, object, "capabilities")?;
+    validate_response_string_list(backend, object, "erase_coverage")?;
+    validate_response_string_list(backend, object, "rebuilds")?;
+
+    let grade = object
+        .get("grade_ceiling")
+        .ok_or_else(|| response_protocol_error(backend, "missing grade_ceiling"))?;
+    let grade = validate_response_string(backend, "grade_ceiling", grade)?;
+    if !matches!(grade, "C0" | "C1" | "C2" | "C3" | "C4") {
+        return Err(response_protocol_error(
+            backend,
+            format!("invalid grade_ceiling {grade}"),
+        ));
+    }
+
+    let coverage = object["erase_coverage"]
+        .as_array()
+        .expect("validated array");
+    for value in coverage {
+        let domain = value.as_str().expect("validated string");
+        if !matches!(domain, "D0" | "D1" | "D2" | "D3" | "D4" | "D5") {
+            return Err(response_protocol_error(
+                backend,
+                format!("invalid erase_coverage domain {domain}"),
+            ));
+        }
+    }
+
+    validate_optional_response_string(backend, object, "erase_method")?;
+    validate_optional_response_string(backend, object, "controller_profile")?;
+    validate_optional_response_string(backend, object, "certification")?;
+
+    match object.get("profile_sha256") {
+        Some(Value::Null) => {}
+        Some(value) => {
+            let digest = validate_response_string(backend, "profile_sha256", value)?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(response_protocol_error(
+                    backend,
+                    "profile_sha256 must be 64 hexadecimal characters",
+                ));
+            }
+        }
+        None => {
+            return Err(response_protocol_error(backend, "missing profile_sha256"));
+        }
+    }
+
+    match object.get("capacity_policy") {
+        Some(Value::Null) => {}
+        Some(value @ Value::Object(_)) => {
+            let policy: crate::profile::CapacityPolicy = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    response_protocol_error(backend, format!("capacity_policy is invalid: {error}"))
+                })?;
+            crate::profile::validate_capacity_policy(&policy).map_err(|error| {
+                response_protocol_error(backend, format!("capacity_policy is invalid: {error}"))
+            })?;
+        }
+        _ => {
+            return Err(response_protocol_error(
+                backend,
+                "capacity_policy must be an object or null",
+            ));
+        }
+    }
+    if object
+        .get("protected_area_bytes")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Err(response_protocol_error(
+            backend,
+            "protected_area_bytes must be an unsigned integer",
+        ));
+    }
+    if !matches!(object.get("artifacts"), Some(Value::Array(_))) {
+        return Err(response_protocol_error(
+            backend,
+            "artifacts must be an array",
+        ));
+    }
+    if object
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.len() > MAX_RESPONSE_LIST_ITEMS)
+    {
+        return Err(response_protocol_error(
+            backend,
+            format!("artifacts exceeds {MAX_RESPONSE_LIST_ITEMS} entries"),
+        ));
+    }
+    let response = BackendResponse {
+        value: Value::Object(object.clone()),
+    };
+    response.artifacts().map_err(|error| {
+        response_protocol_error(backend, format!("invalid artifacts declaration: {error}"))
+    })?;
+    if let Some(value) = object.get("physical_certified") {
+        if !value.is_boolean() {
+            return Err(response_protocol_error(
+                backend,
+                "physical_certified must be a boolean",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_run_response(
+    backend: &str,
+    object: &serde_json::Map<String, Value>,
+    expected_action: &str,
+    ok: bool,
+) -> Result<()> {
+    match object.get("action") {
+        Some(value) => {
+            let reported = validate_response_string(backend, "action", value)?;
+            if reported != expected_action {
+                return Err(response_protocol_error(
+                    backend,
+                    format!(
+                        "action mismatch: requested {expected_action}, response reports {reported}"
+                    ),
+                ));
+            }
+        }
+        None if ok => {
+            return Err(response_protocol_error(
+                backend,
+                "successful run response is missing action",
+            ));
+        }
+        None => {}
+    }
+
+    let results = object
+        .get("action_results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| response_protocol_error(backend, "action_results must be an array"))?;
+    if results.len() != 1 {
+        return Err(response_protocol_error(
+            backend,
+            "action_results must contain exactly one result",
+        ));
+    }
+    let result = results[0].as_object().ok_or_else(|| {
+        response_protocol_error(backend, "action_results entry must be an object")
+    })?;
+    let status = result
+        .get("status")
+        .ok_or_else(|| response_protocol_error(backend, "action result is missing status"))?;
+    let status = validate_response_string(backend, "action result status", status)?;
+    if !matches!(status, "ok" | "error" | "interrupted" | "partial" | "found") {
+        return Err(response_protocol_error(
+            backend,
+            format!("invalid action result status {status}"),
+        ));
+    }
+    for field in ["errors", "duration_ms"] {
+        if result
+            .get(field)
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        {
+            return Err(response_protocol_error(
+                backend,
+                format!("action result {field} must be an unsigned integer when present"),
+            ));
+        }
+    }
+    for field in ["started", "completed"] {
+        if result
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
+        {
+            return Err(response_protocol_error(
+                backend,
+                format!("action result {field} must be a boolean when present"),
+            ));
+        }
+    }
+    validate_optional_response_message(backend, result, "message")?;
+    Ok(())
+}
+
+fn validate_status_response(backend: &str, object: &serde_json::Map<String, Value>) -> Result<()> {
+    let state = object
+        .get("state")
+        .ok_or_else(|| response_protocol_error(backend, "status response is missing state"))?;
+    let state = validate_response_string(backend, "state", state)?;
+    if !matches!(state, "ready" | "in-progress" | "failed") {
+        return Err(response_protocol_error(
+            backend,
+            format!("invalid device state {state}"),
+        ));
+    }
+
+    let Some(sanitize) = object.get("sanitize") else {
+        return Ok(());
+    };
+    let sanitize = sanitize
+        .as_object()
+        .ok_or_else(|| response_protocol_error(backend, "sanitize must be an object"))?;
+    let completed = sanitize
+        .get("completed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| response_protocol_error(backend, "sanitize.completed must be a boolean"))?;
+    let failed = sanitize
+        .get("failed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| response_protocol_error(backend, "sanitize.failed must be a boolean"))?;
+    if completed && failed {
+        return Err(response_protocol_error(
+            backend,
+            "sanitize cannot be both completed and failed",
+        ));
+    }
+    let progress = sanitize
+        .get("progress")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            response_protocol_error(backend, "sanitize.progress must be an unsigned integer")
+        })?;
+    if progress > 1000 {
+        return Err(response_protocol_error(
+            backend,
+            "sanitize.progress exceeds 1000",
+        ));
+    }
+    if sanitize
+        .get("started")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(response_protocol_error(
+            backend,
+            "sanitize.started must be a boolean when present",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backend_response(
+    handle: &BackendHandle,
+    op: &str,
+    expected_action: Option<&str>,
+    value: &Value,
+) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| response_protocol_error(&handle.id, "top-level value must be an object"))?;
+    if object.get("api").and_then(Value::as_u64) != Some(PROTOCOL_API as u64) {
+        return Err(response_protocol_error(
+            &handle.id,
+            format!("api does not match {PROTOCOL_API}"),
+        ));
+    }
+    let ok = object
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| response_protocol_error(&handle.id, "ok must be a boolean"))?;
+    let reported = object
+        .get("backend")
+        .ok_or_else(|| response_protocol_error(&handle.id, "missing backend"))?;
+    let reported = validate_response_string(&handle.id, "backend", reported)?;
+    if reported != handle.id {
+        return Err(response_protocol_error(
+            &handle.id,
+            format!("identity mismatch: response reports {reported}"),
+        ));
+    }
+    let version = object
+        .get("version")
+        .ok_or_else(|| response_protocol_error(&handle.id, "missing version"))?;
+    let version = validate_response_string(&handle.id, "version", version)?;
+    if version != handle.version {
+        return Err(response_protocol_error(
+            &handle.id,
+            format!(
+                "version mismatch: manifest declares {}, response reports {version}",
+                handle.version
+            ),
+        ));
+    }
+    validate_optional_response_message(&handle.id, object, "error")?;
+
+    if ok && matches!(op, "probe" | "plan") {
+        validate_probe_response(&handle.id, object)?;
+    }
+    if op == "run" {
+        let expected_action = expected_action
+            .ok_or_else(|| Error::Invalid("run request must declare exactly one action".into()))?;
+        validate_run_response(&handle.id, object, expected_action, ok)?;
+    }
+    if op == "status" {
+        validate_status_response(&handle.id, object)?;
+    }
+    if !ok
+        && object.get("error").and_then(Value::as_str).is_none()
+        && object
+            .get("action_results")
+            .and_then(Value::as_array)
+            .is_none()
+        && object.get("state").and_then(Value::as_str) != Some("failed")
+    {
+        return Err(response_protocol_error(
+            &handle.id,
+            "ok=false requires error, action_results, or state=failed",
+        ));
+    }
+    Ok(())
 }
 
 /// Spawn the backend with the inherited FDs dup2'd onto the protocol fd
@@ -400,6 +901,13 @@ fn spawn_backend(
     events_fd: Option<&OwnedFd>,
     extra_fds: &[(i32, String)],
 ) -> Result<std::process::Child> {
+    let current_digest = sha256_file(&handle.path)?;
+    if !current_digest.eq_ignore_ascii_case(&handle.sha256) {
+        return Err(Error::Invalid(format!(
+            "backend {} changed after it was selected",
+            handle.id
+        )));
+    }
     let mut cmd = Command::new(&handle.path);
     cmd.arg(op)
         .arg("--request-fd")
@@ -439,18 +947,24 @@ fn spawn_backend(
                 if *src < 0 {
                     continue;
                 }
-                // dup2(fd, fd) is a no-op that does NOT clear FD_CLOEXEC, and
-                // our fds are opened with CLOEXEC. Clear it explicitly.
-                if libc::fcntl(*src, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
                 if *src != *dst {
-                    let t = libc::fcntl(*src, libc::F_DUPFD, 10);
+                    let t = libc::fcntl(*src, libc::F_DUPFD_CLOEXEC, 10);
                     if t < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // The staged descriptor is used only until dup2 below.
+                    // Keep the original source closed across exec so the
+                    // backend receives only the documented protocol fds.
+                    if libc::fcntl(*src, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                        libc::close(t);
                         return Err(std::io::Error::last_os_error());
                     }
                     staged.push(t);
                 } else {
+                    // dup2(fd, fd) is a no-op and does not clear CLOEXEC.
+                    if libc::fcntl(*src, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     staged.push(-1);
                 }
             }
@@ -506,6 +1020,20 @@ pub fn call(
             "backend request envelope mismatch: api {}, op {} (expected api {PROTOCOL_API}, op {op})",
             request.api, request.op
         )));
+    }
+    if op == "run" {
+        let action = request
+            .action
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("run request must declare exactly one action".into()))?;
+        if action.is_empty()
+            || action.len() > MAX_RESPONSE_STRING_BYTES
+            || !action.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(Error::Invalid(
+                "run request action must be non-empty printable ASCII".into(),
+            ));
+        }
     }
     if !handle.operations.iter().any(|declared| declared == op) {
         return Err(Error::Backend(format!(
@@ -634,40 +1162,23 @@ pub fn call(
         .map_err(|e| Error::Backend(format!("read backend stdout: {e}")))?;
     let _ = reader.join();
     if oversized {
-        return Err(Error::Backend(format!(
-            "backend {} response exceeded the {} byte limit",
-            handle.id, response_limit
-        )));
+        return Err(response_protocol_error(
+            &handle.id,
+            format!("exceeded the {response_limit} byte limit"),
+        ));
     }
-    let stdout = String::from_utf8(stdout).map_err(|e| {
-        Error::Backend(format!(
-            "backend {} response is not valid UTF-8: {e}",
-            handle.id
-        ))
-    })?;
+    let stdout = String::from_utf8(stdout)
+        .map_err(|e| response_protocol_error(&handle.id, format!("is not valid UTF-8: {e}")))?;
 
     let value: Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| Error::Backend(format!("backend {} produced invalid JSON: {e}", handle.id)))?;
+        .map_err(|e| response_protocol_error(&handle.id, format!("is invalid JSON: {e}")))?;
     if !status.success() {
         return Err(Error::Backend(format!(
             "backend {} exited with {status}",
             handle.id
         )));
     }
-    if value.get("api").and_then(|v| v.as_u64()) != Some(PROTOCOL_API as u64) {
-        return Err(Error::Backend(format!(
-            "backend {} response api does not match {PROTOCOL_API}",
-            handle.id
-        )));
-    }
-    if let Some(reported) = value.get("backend").and_then(|v| v.as_str()) {
-        if reported != handle.id {
-            return Err(Error::Backend(format!(
-                "backend identity mismatch: executed {}, response reports {reported}",
-                handle.id
-            )));
-        }
-    }
+    validate_backend_response(handle, op, request.action.as_deref(), &value)?;
     Ok(BackendResponse { value })
 }
 
@@ -811,5 +1322,53 @@ impl BackendEvents {
                 .map_err(|e| Error::io("event fd write", Some(e)))?;
         }
         Ok(())
+    }
+
+    pub fn heartbeat(
+        &mut self,
+        phase: &str,
+        progress: u64,
+        unit: &str,
+    ) -> crate::errors::Result<()> {
+        use std::io::Write;
+        if let Some(f) = &mut self.file {
+            let ev = serde_json::json!({
+                "seq": self.seq,
+                "phase": phase,
+                "heartbeat": true,
+                "progress": progress,
+                "unit": unit,
+            });
+            self.seq += 1;
+            let mut line = serde_json::to_vec(&ev)
+                .map_err(|e| Error::Invalid(format!("event serialization: {e}")))?;
+            line.push(b'\n');
+            f.write_all(&line)
+                .map_err(|e| Error::io("event fd write", Some(e)))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendResponse;
+
+    #[test]
+    fn physical_certification_accepts_the_protocol_boolean_or_grade() {
+        let boolean = BackendResponse {
+            value: serde_json::json!({ "physical_certified": true }),
+        };
+        assert!(boolean.physical_certified());
+
+        let grade = BackendResponse {
+            value: serde_json::json!({ "certification": "C4" }),
+        };
+        assert!(grade.physical_certified());
+
+        let absent = BackendResponse {
+            value: serde_json::json!({ "certification": "C3" }),
+        };
+        assert!(!absent.physical_certified());
     }
 }

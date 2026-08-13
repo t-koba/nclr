@@ -4,5 +4,4 @@
 schema = 1
 id = "sandisk-cruzer"
 family = "sandisk-cruzer"
-controller_id = "sandisk-cruzer"
 usb_vid_hints = [0x0781]

@@ -4,12 +4,38 @@
 //! System disk / mount detection uses the `mount` table; holders are
 //! limited to APFS physical stores (macOS has no dm/md concept).
 
-use super::{DeviceIdentity, MacInfo, TRANSPORT_USB_MSD};
+use super::{DeviceIdentity, MacInfo, ScsiInfo, UsbInfo, TRANSPORT_MMC, TRANSPORT_USB_MSD};
 use crate::errors::{Error, Result};
 use std::process::{Command, Stdio};
 
+fn plist_json(bytes: &[u8], source: &str) -> Result<serde_json::Value> {
+    let json = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "plutil stdin unavailable")
+            })?;
+            stdin.write_all(bytes)?;
+            child.wait_with_output()
+        })
+        .map_err(|e| Error::Backend(format!("cannot execute plutil: {e}")))?;
+    if !json.status.success() {
+        return Err(Error::Invalid(format!(
+            "plutil failed while converting {source} output: {}",
+            String::from_utf8_lossy(&json.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(&json.stdout)
+        .map_err(|e| Error::Invalid(format!("cannot parse {source} JSON: {e}")))
+}
+
 fn diskutil(args: &[&str]) -> Result<serde_json::Value> {
-    let out = Command::new("diskutil")
+    let out = Command::new("/usr/sbin/diskutil")
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -24,29 +50,40 @@ fn diskutil(args: &[&str]) -> Result<serde_json::Value> {
             None,
         ));
     }
-    let json = Command::new("plutil")
-        .args(["-convert", "json", "-o", "-", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "plutil stdin unavailable")
-            })?;
-            stdin.write_all(&out.stdout)?;
-            child.wait_with_output()
-        })
-        .map_err(|e| Error::Backend(format!("cannot execute plutil: {e}")))?;
-    if !json.status.success() {
-        return Err(Error::Invalid(format!(
-            "plutil failed while converting diskutil output: {}",
-            String::from_utf8_lossy(&json.stderr).trim()
-        )));
+    plist_json(&out.stdout, "diskutil")
+}
+
+/// Return the IOService paths to every object with a BSD name. `-t` keeps
+/// each provider chain, including the USB device which owns VID/PID and the
+/// storage driver which owns SCSI identity strings. No device command is
+/// sent by this query.
+fn ioreg_bsd_paths() -> Result<serde_json::Value> {
+    let out = Command::new("/usr/sbin/ioreg")
+        .args([
+            "-a",
+            "-p",
+            "IOService",
+            "-r",
+            "-k",
+            "BSD Name",
+            "-t",
+            "-l",
+            "-w",
+            "0",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| Error::Backend(format!("cannot execute ioreg: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::io(
+            format!(
+                "ioreg USB identity query failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            None,
+        ));
     }
-    serde_json::from_slice(&json.stdout)
-        .map_err(|e| Error::Invalid(format!("cannot parse plutil output: {e}")))
+    plist_json(&out.stdout, "ioreg")
 }
 
 fn get<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
@@ -72,6 +109,199 @@ fn u64_field(v: &serde_json::Value, key: &str) -> u64 {
     get(v, key).and_then(|x| x.as_u64()).unwrap_or(0)
 }
 
+fn numeric_property(v: &serde_json::Value, key: &str) -> Option<u64> {
+    let value = get(v, key)?;
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    let string = value.as_str()?.trim();
+    let (radix, digits) = string
+        .strip_prefix("0x")
+        .map_or((10, string), |digits| (16, digits));
+    u64::from_str_radix(digits, radix).ok()
+}
+
+fn string_property<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| get(v, key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+}
+
+fn children(v: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    get(v, "IORegistryEntryChildren")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn subtree_has_bsd_name(v: &serde_json::Value, name: &str) -> bool {
+    string_property(v, &["BSD Name"]) == Some(name)
+        || children(v).any(|child| subtree_has_bsd_name(child, name))
+}
+
+fn local_scsi_properties(v: &serde_json::Value) -> Option<(String, String, String)> {
+    if let Some(map) = v.as_object() {
+        let vendor = string_property(
+            v,
+            &[
+                "Vendor Identification",
+                "Vendor Name",
+                "SCSI Vendor Identification",
+            ],
+        );
+        let product = string_property(
+            v,
+            &[
+                "Product Identification",
+                "Product Name",
+                "SCSI Product Identification",
+            ],
+        );
+        let revision = string_property(
+            v,
+            &[
+                "Product Revision Level",
+                "Product Revision",
+                "SCSI Product Revision Level",
+            ],
+        );
+        // Generic USB dictionaries also contain product/vendor names. A
+        // revision field is required so those descriptor strings can never
+        // be mistaken for an INQUIRY tuple.
+        if revision.is_some() && (vendor.is_some() || product.is_some()) {
+            return Some((
+                vendor.unwrap_or("").to_string(),
+                product.unwrap_or("").to_string(),
+                revision.unwrap_or("").to_string(),
+            ));
+        }
+        for (key, value) in map {
+            // Provider children are searched separately along the exact BSD
+            // device path. Skipping them here prevents a sibling LUN from
+            // supplying the SCSI bootstrap tuple.
+            if key == "IORegistryEntryChildren" {
+                continue;
+            }
+            if let Some(found) = local_scsi_properties(value) {
+                return Some(found);
+            }
+        }
+    } else if let Some(array) = v.as_array() {
+        for value in array {
+            if let Some(found) = local_scsi_properties(value) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn scsi_properties_for_bsd(v: &serde_json::Value, name: &str) -> Option<(String, String, String)> {
+    // Search from the target media node towards its providers. This binds a
+    // multi-LUN USB device to the requested BSD disk instead of accepting the
+    // first SCSI dictionary anywhere below the USB controller.
+    for child in children(v).filter(|child| subtree_has_bsd_name(child, name)) {
+        if let Some(found) = scsi_properties_for_bsd(child, name) {
+            return Some(found);
+        }
+    }
+    local_scsi_properties(v)
+}
+
+#[derive(Debug)]
+struct IokitUsbIdentity {
+    usb: UsbInfo,
+    scsi: Option<ScsiInfo>,
+    location_id: u64,
+}
+
+fn collect_usb_candidates(
+    v: &serde_json::Value,
+    name: &str,
+    depth: usize,
+    out: &mut Vec<(usize, IokitUsbIdentity)>,
+) {
+    if subtree_has_bsd_name(v, name) {
+        if let (Some(vid), Some(pid)) = (
+            numeric_property(v, "idVendor"),
+            numeric_property(v, "idProduct"),
+        ) {
+            if let (Ok(vid), Ok(pid)) = (u16::try_from(vid), u16::try_from(pid)) {
+                let bcd_device = numeric_property(v, "bcdDevice")
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(0);
+                let location_id = numeric_property(v, "locationID").unwrap_or(0);
+                let scsi = scsi_properties_for_bsd(v, name).map(|(vendor, model, rev)| ScsiInfo {
+                    vendor,
+                    model,
+                    rev,
+                    sg_path: String::new(),
+                });
+                out.push((
+                    depth,
+                    IokitUsbIdentity {
+                        usb: UsbInfo {
+                            vid: format!("{vid:04x}"),
+                            pid: format!("{pid:04x}"),
+                            bcd_device: format!("{bcd_device:04x}"),
+                            serial: string_property(
+                                v,
+                                &["USB Serial Number", "kUSBSerialNumberString"],
+                            )
+                            .unwrap_or("")
+                            .to_string(),
+                            manufacturer: string_property(
+                                v,
+                                &["USB Vendor Name", "kUSBVendorString"],
+                            )
+                            .unwrap_or("")
+                            .to_string(),
+                            product: string_property(v, &["USB Product Name", "kUSBProductString"])
+                                .unwrap_or("")
+                                .to_string(),
+                            port_chain: if location_id == 0 {
+                                String::new()
+                            } else {
+                                format!("location-id:{location_id:08x}")
+                            },
+                        },
+                        scsi,
+                        location_id,
+                    },
+                ));
+            }
+        }
+    }
+    for child in children(v) {
+        collect_usb_candidates(child, name, depth + 1, out);
+    }
+}
+
+/// Resolve the exact USB descriptor and SCSI bootstrap tuple for one whole
+/// disk. The deepest matching USB provider is the physical device rather
+/// than a host controller higher in the IOService path.
+fn iokit_usb_identity(name: &str) -> Result<IokitUsbIdentity> {
+    let registry = ioreg_bsd_paths()?;
+    let mut candidates = Vec::new();
+    match &registry {
+        serde_json::Value::Array(roots) => {
+            for root in roots {
+                collect_usb_candidates(root, name, 0, &mut candidates);
+            }
+        }
+        root => collect_usb_candidates(root, name, 0, &mut candidates),
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, identity)| identity)
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "IOKit did not link {name} to a USB device with idVendor/idProduct"
+            ))
+        })
+}
+
 /// Whole disk list from `diskutil list -plist`.
 pub fn whole_disks() -> Result<Vec<String>> {
     let list = diskutil(&["list", "-plist"])?;
@@ -93,7 +323,7 @@ pub fn whole_disks() -> Result<Vec<String>> {
 /// the mount table must propagate: an unknown mount state must never be
 /// reported as "unmounted" (that would authorize destructive runs).
 fn mount_table() -> Result<Vec<(String, String)>> {
-    let out = Command::new("mount")
+    let out = Command::new("/sbin/mount")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| Error::io("cannot run mount", Some(e)))?
@@ -159,27 +389,60 @@ fn identify_diskutil(name: &str) -> Result<DeviceIdentity> {
     })?;
     let parent = str_field(&info, "ParentWholeDisk");
 
-    // SD via a USB card reader is not distinguishable from USB MSD via
-    // diskutil; keep the generic USB label (SD pass-through is a Phase 5 item).
-    let transport = TRANSPORT_USB_MSD;
+    let protocol_is_usb = protocol.eq_ignore_ascii_case("USB");
+    let protocol_is_sd = protocol.eq_ignore_ascii_case("SD")
+        || protocol.to_ascii_lowercase().contains("secure digital");
+    // SD behind a USB reader remains USB mass storage because macOS does not
+    // expose the underlying card transport. A native Apple SD host is marked
+    // MMC, but the macOS execution backend remains LBA-only.
+    let transport = if protocol_is_sd {
+        TRANSPORT_MMC
+    } else {
+        TRANSPORT_USB_MSD
+    };
+
+    // diskutil omits USB VID/PID and often omits the SCSI revision. These
+    // fields are mandatory research inputs for exact controller bootstrap
+    // selection, so a USB target fails identification if IOKit cannot link
+    // the BSD disk to its physical USB provider.
+    let iokit_usb = if protocol_is_usb {
+        Some(iokit_usb_identity(name)?)
+    } else {
+        None
+    };
 
     let mac = MacInfo {
         protocol,
-        serial,
+        serial: if serial.is_empty() {
+            iokit_usb
+                .as_ref()
+                .map(|identity| identity.usb.serial.clone())
+                .unwrap_or_default()
+        } else {
+            serial
+        },
         media_name,
         uuid,
         media_type,
         parent_whole_disk: parent.clone(),
     };
 
-    let physical_path = format!(
-        "macos:{}",
-        if parent.is_empty() {
-            name.to_string()
-        } else {
-            parent
-        }
-    );
+    let physical_path = iokit_usb
+        .as_ref()
+        .filter(|identity| identity.location_id != 0)
+        .map_or_else(
+            || {
+                format!(
+                    "macos:{}",
+                    if parent.is_empty() {
+                        name.to_string()
+                    } else {
+                        parent
+                    }
+                )
+            },
+            |identity| format!("macos-usb:{:08x}", identity.location_id),
+        );
 
     let mut identity = DeviceIdentity::new(transport, &dev, &physical_path);
     if size == 0 {
@@ -197,6 +460,10 @@ fn identify_diskutil(name: &str) -> Result<DeviceIdentity> {
     identity.removable = removable;
     identity.read_only =
         bool_field(&info, "ReadOnlyMedia") || optional_bool_field(&info, "Writable") == Some(false);
+    if let Some(iokit_usb) = iokit_usb {
+        identity.usb = Some(iokit_usb.usb);
+        identity.scsi = iokit_usb.scsi;
+    }
     identity.mac = Some(mac);
     identity.mounted = false;
 

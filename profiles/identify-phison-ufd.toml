@@ -1,0 +1,7 @@
+# Read-only controller identification profile: Phison UFD families.
+# The compiled response parser covers PS2251. Later U17/U18 devices remain
+# recipe-only and cannot gain destructive capability from this VID hint.
+schema = 1
+id = "phison-ufd"
+family = "phison-ufd"
+usb_vid_hints = [0x13FE]

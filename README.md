@@ -53,8 +53,9 @@ Physical Scope, Phase 5 hardware-free pieces, and Phase 6 Lab tooling.
    (health) independently, and only reports what the evidence supports.
    UNMAP/discard alone never grants C2. A documented capacity reduction
    (weak-block isolation) is reported, not treated as a failure.
-8. Creates no partitions and no filesystems. `final_state` is always
-   `raw-uninitialized`.
+8. Creates no partitions and no filesystems. `final_state` is
+   `raw-uninitialized` only after the selected postcheck passes; otherwise it
+   is `undetermined`.
 
 The separate read-only salvage workflow uses the same physical addressing
 and raw page reader without issuing erase or program commands:
@@ -68,9 +69,17 @@ sudo nclr salvage /dev/sdb \
 Both destinations must be new files. The image order is flat block, page,
 then data + OOB. The mandatory NDJSON map gives the geometry and one record
 per page; an unreadable page is represented by a fixed-size zero-filled hole
-whose record is explicitly `read-error`, so a hole cannot be mistaken for
-recovered media data. Exit 0 means every address was readable and
-correctable; exit 1 retains a usable partial image and map.
+whose `read_status` is explicitly `read-error`. Every page record separates
+`data_length` and `oob_length`, carries the channel/chip/LUN/plane/block/page
+coordinate, and reports `ecc_status`, so a hole cannot be mistaken for
+recovered media data. Exit 0 means every address was readable and correctable;
+exit 1 retains a usable partial image and map.
+
+An interrupted salvage is resumed with its journal. `resume` reopens only the
+original canonical image and map inodes, rejects symlinks, hard links,
+replacement files or relaxed permissions, truncates both outputs, and safely
+restarts the read-only sweep from page zero. This keeps one image, one map and
+one ordered digest in the same acquisition epoch.
 
 ## Architecture
 
@@ -126,14 +135,15 @@ The core finds backends via `NCLR_BACKEND_DIR`, `--backend-dir`,
 `<prefix>/libexec/nclr` next to it (install layout). Profiles are resolved
 from `NCLR_PROFILE_DIR`, `/usr/share/nclr/profiles`, backend-adjacent
 `profiles/` dirs, and `<prefix>/share/nclr/profiles`. A backend manifest
-(`<backend-dir>/<id>.toml` with `sha256`) is validated when present; digests
+(`<backend-dir>/<id>.toml`) is validated when present; schema 1, known fields,
+API 1, operations and the mandatory executable `sha256` must all match. Digests
 are always recorded in reports. Real destructive controller profiles are
 accepted only from package-managed `/usr/share` or `<prefix>/share`
 locations; a user-controlled `NCLR_PROFILE_DIR` cannot self-assert
 production trust. The sim backend additionally accepts only the exact
 digest of its compiled-in certified profile. Custom backends require a
 production manifest (api 1, trust "production") and a verified executable
-digest when the manifest declares one; only bundled backend IDs in trusted
+digest; only bundled backend IDs in trusted
 install locations may omit the manifest.
 
 ## Backend selection
@@ -141,8 +151,8 @@ install locations may omit the manifest.
 | Device | Linux | macOS / other |
 |--------|-------|---------------|
 | USB mass storage (`/dev/sdX`) | `nclr-scsi` (SANITIZE, C2) | `nclr-lba` (C1) |
-| Native SD (`/dev/mmcblkN`) | `nclr-sd-native` (SD full-range ERASE, C2) | `nclr-lba` (C1) |
-| controller device (matched profile) | `nclr-controller` (C3) | — |
+| Native SD (`/dev/mmcblkN`) | `nclr-sd-native` (SD full-range ERASE, C2; SDSC byte addressing included) | `nclr-lba` (C1) |
+| controller device (matched profile) | `nclr-controller` (C3, or independently certified C4) | — |
 | plain file (pseudo-device) | `nclr-lba` (C1) | `nclr-lba` (C1) |
 | sim image (`NCLRSIM1`) | `nclr-sim` (C4 when certified, else C3/C2) | `nclr-sim` |
 
@@ -154,7 +164,11 @@ certified physical-scope path; per-block records land in
 
 A controller profile (TOML, `profiles/`) declares the identification
 conditions, coverage, rebuilds, preserves, capacity policy, ECC thresholds
-and recovery method for a controller/firmware/NAND combination.
+and recovery method for a controller/firmware/NAND combination. A real
+production profile must also state `protected_area_bytes` explicitly,
+including zero, so D5 is never inferred from an absent field, and pin
+`logical_blank_value` to `0` or `255` for the post-power-cycle full-LBA
+verification.
 Destructive execution requires:
 
 - an **exact match**: `controller_id` identical, firmware and NAND id within
@@ -165,24 +179,29 @@ Destructive execution requires:
   qualification metadata accounting for D1-D4 and power-cut recovery.
 
 The sim controller family (`sim-controller-1`, trust = production) is the
-bundled certified reference. The real-device backend contains the bounded
+bundled certified reference. The real-device backend contains one bounded
 physical-block, FBB/RBB, qualification, BBT/FTL atomic-commit, capacity,
-service re-enumeration and recovery engine for Phison, SMI, Alcor and SanDisk
-Cruzer proprietary controllers. Vendor CDBs and response layouts are supplied
-as an authenticated runtime protocol recipe tied to one exact
-controller/firmware/NAND tuple; unknown commands are never inferred. Built-in
-read-only identification is implemented for Phison PS2251, Alcor AU698x,
-the publicly documented SMI SM32X identity page and the USBest UT163 INQUIRY
-marker. SanDisk Cruzer, later
-controller generations without a public fixed probe, and explicitly profiled
-OEM VID products first select the required recipe by an exact USB/SCSI tuple,
-then verify recipe-owned controller and NAND identity responses before
-execution. The tuple never authorizes destructive commands by itself. No real tuple is
-bundled as `production`, so D1-D4/C3 remains unavailable until that tuple's
-recipe and independent HIL qualification are installed. Planning pins the
-required runtime artifact digests; execution verifies those bytes before
-enabling destructive commands. The boundary
-is documented in
+service re-enumeration, salvage and recovery engine connected to 28 USB flash
+controller family adapters. The registry covers Phison, Alcor, Silicon Motion,
+SanDisk Cruzer, USBest, ChipsBank, Innostor, FirstChip, SSS, Skymedi, AppoTech,
+SiliconGo, iCreate, OTi, Prolific, Ameco, Netac, eFortune, ITE, Hyperstone,
+Yeestor, Ramos, Trek 2000, Moai, RealWay, HuaYi, KTC and SMSC lines. Vendor CDBs
+and response layouts are supplied as an authenticated runtime protocol recipe
+tied to one exact controller/firmware/NAND tuple; unknown commands are never
+inferred.
+
+Built-in read-only probes are deliberately narrower than that catalog:
+Phison PS2251-compatible version pages, Alcor AU698x-compatible configuration
+pages, the public SMI SM32X identity page, and the USBest UT163-compatible
+INQUIRY marker. Other families and generations first select the required
+recipe by an exact USB descriptor plus SCSI tuple, then verify recipe-owned
+controller and NAND identity responses before execution. A VID hint is only a
+candidate and exposes no capability. The tuple never authorizes destructive
+commands by itself. No real tuple is bundled as `production`, so D1-D4/C3
+remains unavailable until that tuple's recipe and independent HIL
+qualification are installed. Planning pins the required runtime artifact
+digests; execution verifies those bytes before enabling destructive commands.
+The boundary is documented in
 [`docs/controller-vendor-support.md`](docs/controller-vendor-support.md).
 Without a trusted exact certified profile, `-l controller` fails at plan time
 with exit 2. A matching profile permits only a read-only plan that pins all
@@ -194,13 +213,14 @@ artifact digests; missing or invalid bytes stop `run` before confirmation.
 # List removable candidates (read-only)
 nclr ls
 
-# Identify a device (read-only); USB devices also get the vendor/model
-# names from the OS usb.ids database and a read-only controller-family
-# probe (controller ID, firmware, NAND ID when an identification profile
-# selects a supported family or a standard INQUIRY carries a controller
-# marker, e.g. USBest UT163)
-nclr info /dev/sdb
-nclr info -j /dev/sdb
+# Identify a device (read-only). JSON includes exact USB/SCSI bootstrap
+# fields, family candidates, every media command actually sent and the
+# remaining evidence required to add an unsupported controller. Native SD
+# adds an sd_research bundle with all available CID/CSD/SCR/card fields and
+# the distinct internal-controller evidence still missing. On macOS, OS
+# identity collection itself sends no media command.
+nclr info /dev/diskN
+nclr info -j /dev/diskN
 
 # Generate a plan (read-only); the plan pins fingerprint + plan hash
 nclr plan -l best /dev/sdb > card.plan.json
@@ -348,7 +368,8 @@ Evidence is graded independently:
   falling back to `TMPDIR` (elsewhere).
 - Journal hash chain rejects tampered state files; `resume` re-verifies the
   device fingerprint, queries backend status, and rebuilds evidence from the
-  journal before continuing.
+  journal before continuing. A state file contains exactly one initial locked
+  plan; a new run cannot append a second plan to an existing journal.
 - C2 plans embed their L1 fallback; switching plans is journaled
   (`fallback-plan` record) so a later resume continues in the right context.
 
@@ -420,7 +441,17 @@ write test: the range is saved, PRBS-written, flushed, verified and restored
   Protected Area (D5) handling and a profile-gated read-only SD vendor
   health query (CMD56-equivalent) are modeled and tested; real SD CMD56
   vendor profiles, reader pass-through and SD controller LLF require
-  hardware and certified vendor documentation.
+  hardware and certified vendor documentation. `nclr info -j` still emits a
+  command-free `sd_research` handoff: complete/partial CID, CSD and SCR state,
+  stable card/host identity, and every missing controller-service input are
+  kept separate from any C3/C4 readiness claim.
+- Legacy SDSC is no longer forced to LBA solely because it is byte-addressed.
+  The native backend parses the complete 128-bit CSD, requires erase command
+  class 5 and a valid kernel-reported erase group, checks whole-user-range
+  alignment, and converts the inclusive CMD32/CMD33 arguments to byte
+  addresses with overflow checks. CSD v2/v3 cards remain block-addressed;
+  an undefined structure or an unrepresentable full range disables C2
+  explicitly.
 - `nclr-lab` (research tooling: artifact/cap/controller/decode/diff/infer/
   profile/recipe/replay/trace) is separated from destructive handlers. Artifact
   acquisition pins HTTPS source, terms, size, SHA-256, format and exact
@@ -438,13 +469,14 @@ write test: the range is saved, PRBS-written, flushed, verified and restored
   validation guide (`docs/hardware-validation.md`).
 - C4 applies to the certified sim family; real-vendor physical backends
   need their own certified profiles + HIL.
-- Real vendor controller execution (Phison, SMI, Alcor, SanDisk Cruzer) requires a certified
-  production profile and hardware-in-the-loop qualification. The compiled
-  recipe engine implements the erase/rebuild primitives, but capability is
-  exposed only when exact geometry, metadata layout, authenticated protocol
-  recipe/trace, qualification report and clean-room/runtime provenance all
-  match. Without the trusted exact profile, `-l controller` fails at plan time
-  (exit 2); without its pinned artifact bytes, `run` fails before confirmation.
+- Real vendor controller execution for every registered family requires a
+  certified production profile and hardware-in-the-loop qualification. The
+  compiled recipe engine implements the erase/rebuild primitives for all 28
+  adapters, but capability is exposed only when exact geometry, metadata
+  layout, authenticated protocol recipe/trace, qualification report and
+  clean-room/runtime provenance all match. Without the trusted exact profile,
+  `-l controller` fails at plan time (exit 2); without its pinned artifact
+  bytes, `run` fails before confirmation.
 - LBA processing cannot prove that OP/spare blocks, retired blocks or
   controller metadata were reached: D1-D4 are reported as `unreachable` and
   the reach ceiling is C1.

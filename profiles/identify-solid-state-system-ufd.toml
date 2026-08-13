@@ -1,0 +1,7 @@
+# Candidate-only identification profile: Solid State System SSS66xx.
+# The vendor-owned VID selects no command: exact controller and NAND
+# identities must come from an authenticated bootstrap recipe.
+schema = 1
+id = "solid-state-system-ufd"
+family = "solid-state-system-ufd"
+usb_vid_hints = [0x0C76]

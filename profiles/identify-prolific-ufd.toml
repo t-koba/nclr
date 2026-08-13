@@ -1,0 +1,7 @@
+# Candidate-only identification profile: Prolific PL-25xx UFD.
+# Prolific also makes non-UFD USB devices. This hint is informational on a
+# mass-storage target and sends no command; the recipe identity is decisive.
+schema = 1
+id = "prolific-ufd"
+family = "prolific-ufd"
+usb_vid_hints = [0x067B]

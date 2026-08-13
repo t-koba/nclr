@@ -2,20 +2,25 @@
 
 ## 目的
 
-`protocol-recipe` は、Phison、Alcor、Silicon Motion、SanDisk Cruzer proprietary controller の非公開 service protocol を実行 code から分離する、署名付き・完全一致の command 契約である。nclr は未知の opcode、offset、endianness、NAND geometry を推測しない。正規 tool の capture または clean-room 実装から確定した値だけを JSON / TOML artifact に記録し、production profile が size と SHA-256 を固定する。
+`protocol-recipe` は、USB flash controller の非公開 service protocol を実行 code から分離する、署名付き・完全一致の command 契約である。nclr は未知の opcode、offset、endianness、NAND geometry を推測しない。正規 tool の capture または clean-room 実装から確定した値だけを JSON / TOML artifact に記録し、production profile が size と SHA-256 を固定する。
 
 recipe は汎用 script ではない。loop、分岐、任意 path、shell command は表現できず、次の固定 command と bounded field binding だけを許可する。
 
 ## Hardware binding
 
-top-level の `controller_id`、`firmware`、`nand_id` は production profile の exact `min = max` と byte 単位で一致しなければならない。`family` は次のいずれか、`transport` は `scsi-sg` に限定される。
+top-level の `controller_id`、`firmware`、`nand_id` は production profile の exact `min = max` と byte 単位で一致しなければならない。`transport` は `scsi-sg` に限定される。`family` は code の単一 registry が管理する次の 28 名に限定される。
 
-- `phison-ps2251`
-- `alcor-au698x`
-- `smi-sm32x`
-- `sandisk-cruzer`
+- `phison-ufd`、`alcor-ufd`、`silicon-motion-ufd`、`sandisk-cruzer`
+- `usbest-ufd`、`chipsbank-ufd`、`innostor-ufd`、`firstchip-ufd`
+- `solid-state-system-ufd`、`skymedi-ufd`、`appotech-ufd`、`silicongo-ufd`
+- `icreate-ufd`、`oti-ufd`、`prolific-ufd`、`ameco-ufd`
+- `netac-ufd`、`efortune-ufd`、`ite-ufd`、`hyperstone-ufd`
+- `yeestor-ufd`、`ramos-ufd`、`trek2000-ufd`、`moai-ufd`
+- `realway-ufd`、`huayi-ufd`、`ktc-ufd`、`smsc-ufd`
 
-公開済みの固定 read-only identity CDB がない family、後期世代、または OEM VID の製品では、profile の `controller_bootstrap` に family、USB VID、PID、bcdDevice と SCSI INQUIRY vendor、product、revision の完全一致 tuple を持てる。この tuple は必要 recipe artifact を選ぶだけで、破壊処理を許可しない。runtime recipe は stable な controller-owned response payload を `controller_identity_hex` に固定し、後述の `read-controller-id` で byte 単位に再確認する。同じ bootstrap tuple に複数の production profile が一致した場合は曖昧性 error とし、NAND を推測しない。SanDisk Cruzer はこの経路を必須とする。Phison、Alcor、SMI も exact profile が明示した場合に限ってこの経路を使え、組み込み probe 失敗から暗黙に family を推測しない。
+family 名が受理されることは、controller line や実媒体が C3/C4 対応済みであることを意味しない。全 family が同じ bounded recipe grammar を利用できる一方、repository に同梱する production tuple は 0 件である。固定 read-only probe の実装範囲も Phison PS2251-compatible version page、Alcor AU698x-compatible config page、Silicon Motion SM32X-compatible identity page、USBest UT163-compatible INQUIRY marker に限られる。
+
+公開済みの固定 read-only identity CDB がない family、後期世代、または OEM VID の製品では、profile の `controller_bootstrap` に family、USB VID、PID、bcdDevice、manufacturer、product、serial と SCSI INQUIRY vendor、product、revision の完全一致 tuple を持つ。空の USB descriptor string は wildcard ではなく「descriptor が存在しない」という exact 値である。この tuple は必要 recipe artifact を選ぶだけで、破壊処理を許可しない。runtime recipe は stable な controller-owned response payload を `controller_identity_hex` に固定し、後述の `read-controller-id` で byte 単位に再確認する。同じ bootstrap tuple に複数の production profile が一致した場合は曖昧性 error とし、NAND を推測しない。固定 probe を持たない全 family ではこの経路を必須とする。固定 probe を持つ family も exact profile が明示した場合に限ってこの経路を使え、組み込み probe 失敗から暗黙に family を推測しない。
 
 recipe artifact 自体も profile の `kind = "protocol-recipe"`、`role = "runtime"`、`format = "json"` または `toml`、exact size / SHA-256 で認証される。
 
@@ -53,7 +58,7 @@ page read のように status header と NAND data が同じ response に入る 
 
 ## BBT と FTL
 
-`bbt` は旧 BBT response の count、entry stride、block address、state byte を定義する。block address は global `flat` integer、独立した channel / chip / LUN / block field、または channel / chip / LUN / plane / block-in-plane field で表現できる。FBB、RBB、system の state value は非空・相互排他で、table は全 physical block を表現できなければならない。未知 state、duplicate block、範囲外 coordinate は hard error である。新 BBT の entry address も同じ方式を選択できる。
+`bbt` は旧 BBT response が集約する全 copy の exact `copies`、count、entry stride、block address、state byte を定義する。集約 table は全 copy の FBB / RBB / system entry の和集合でなければならず、raw response 全体を digest 化する。`copies` は 1〜16 の固定値とし、省略できない。block address は global `flat` integer、独立した channel / chip / LUN / block field、または channel / chip / LUN / plane / block-in-plane field で表現できる。FBB、RBB、system の state value は非空・相互排他で、table は全 physical block を表現できなければならない。未知 state、duplicate block、範囲外 coordinate は hard error である。新 BBT の entry address も同じ方式を選択できる。
 
 `bbt_output` は新 BBT の固定長 staging image を定義する。header、generation、count、entry、checksum、commit byte の領域は境界検査され、管理 field と entry field の overlap は拒否される。BBT、FTL、capacity の未使用 byte は各 layout の必須 `fill_byte` で埋め、entry 数にかかわらず command の固定 transfer length と常に一致させる。controller 固有の `00` / `ff` padding を実装側で推測しない。
 
@@ -66,7 +71,7 @@ BBT / FTL の `prepare_value` と `commit_value` は異なる必要がある。c
 real C3/C4 action は次の順序で動く。
 
 1. signed commit state と inventory を取得する。
-2. 旧 BBT を読み、FBB / historical RBB / system block を block map へ固定する。
+2. 旧 BBT の全 copy と generation を読み、完全 payload の SHA-256、FBB / historical RBB / system block を block map へ固定する。
 3. service mode へ入り、全 CE / LUN / block の marker page + OOB を列挙する。
 4. 旧 RBB と data block を個別 erase し、status と erased page を確認する。
 5. 各候補 block を pattern ごとに erase、複数 page program/read/compare し、ECC corrected bits、read retry、latency threshold で weak block を隔離する。
@@ -76,9 +81,13 @@ real C3/C4 action は次の順序で動く。
 9. BBT の block/state 全件と signed commit generation を再読して一致を確認する。
 10. service mode を終了し、power cycle、再列挙、postcheck を行う。
 
+`postcheck-c3` / `postcheck-c4` は、再列挙後の block FD を改めて開き、profile の `logical_blank_value` と照合しながら全 LBA を読出す。既知署名がないことを確認して flush を実行し、`all_reads_ok`、`blank_verified`、`signature_free`、`flush_ok` が揃わない限り P2/P1 と H2 は成立しない。
+
 旧 RBB は erase を試行しても data pool に戻さない。FBB marker block と `policy = "preserve"` の system block は erase / program target にしない。erase / program failure と ECC margin 不足は block を quarantine し、暗黙の再利用を行わない。
 
-`nclr salvage` は同じ列挙と `read-page` を read-only recipe として利用し、erase / program / metadata activation を一切送らない。raw image は flat block、page、data + OOB の固定順で作る。page map は全 page の offset、disposition、ECC / retry / latency、digest を保持し、読取不能 page は固定長の zero hole と `read-error` を必ず対にする。出力 path は backend へ渡さず、core が新規作成した継承 FD のみを渡す。
+旧 RBB は取得時の総数と `erased + failed` が完全一致しなければ C3/C4 証拠にしない。qualification は qualified / weak / failed の全件数を返し、weak と failed を user / spare pool から隔離したことを明示する。後続の最終 erase が成功しても、旧 RBB の初回失敗証拠を上書きしない。
+
+`nclr salvage` は同じ列挙と `read-page` を read-only recipe として利用し、erase / program / metadata activation を一切送らない。raw image は flat block、page、data + OOB の固定順で作る。page map は全 page の channel / chip / LUN / plane / block / page 座標、offset、data / OOB length、disposition、read / ECC status、retry / latency、digest を保持し、読取不能 page は固定長の zero hole と `read-error` を必ず対にする。出力 path は backend へ渡さず、core が新規作成した継承 FD のみを渡す。
 
 ## 電源断と再開
 

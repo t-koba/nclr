@@ -4,15 +4,40 @@
 
 ## 結論
 
-2026-08-11 時点の実装と、repository に同梱していない実測 tuple を分ける。
+2026-08-13 時点の実装と、repository に同梱していない実測 tuple を分ける。ここで「recipe 対応」は bounded command grammar と artifact 検証へ接続済みという意味であり、controller line 全体の service command が判明したという意味ではない。
 
-| ファミリー | 厳密な読み取り専用識別 | service entry | 共通 recipe engine | 同梱 production tuple | nclr の扱い |
-|---|---:|---:|---:|---:|---|
-| Phison PS2251 family | version + NAND ID 実装済み | BootROM / 旧・後期 BtPram container 実装済み | 物理 erase、FBB/RBB、qualification、BBT/FTL/capacity、atomic commit、resume 実装済み | なし | exact recipe + loader + HIL が揃うまで C3 を拒否 |
-| Alcor AU698x | config + flash ID 実装済み | runtime recipe | 同上 | なし | exact recipe + HIL が揃うまで C3 を拒否 |
-| Silicon Motion SM32X | `F0 04 ... 02` identity page 実装済み | runtime recipe | 同上 | なし | exact erase/NAND/metadata recipe + HIL が揃うまで C3 を拒否 |
-| SanDisk Cruzer proprietary (`82-00263-1` を含む) | exact USB/SCSI bootstrap + runtime `read-controller-id` / `read-nand-id` | runtime recipe | 同上 | なし | controller-owned 2 段 identity と exact recipe + HIL が揃うまで C3 を拒否 |
-| USBest UT163 | 標準 INQUIRY の vendor-specific 領域の `U163` マーカー (追加 CDB なし) | 公開資料なし | なし | なし | 読み取り専用の識別のみ。service CDB が公開されていないため C3 を拒否 |
+| canonical family | 調査対象 controller line | 組み込み固定 probe の範囲 | recipe adapter | production tuple |
+|---|---|---|---:|---:|
+| `phison-ufd` | PS2251-01〜85、PS2318/2319、U17/U18 | PS2251 version-page-compatible response + NAND ID | あり | 0 |
+| `alcor-ufd` | AU698x、AU6989SN、AU6990/AU6998 | AU698x `99 07` config-compatible response + flash ID | あり | 0 |
+| `silicon-motion-ufd` | SM32X、SM3255/57、SM3265/67、SM3271/81、SM2320/21/22 | SM32X `F0 04` identity-page-compatible response | あり | 0 |
+| `sandisk-cruzer` | Cruzer proprietary、`82-00263-1` | なし | あり | 0 |
+| `usbest-ufd` | UT163、UT165/166/167、UT190/192 | UT163-compatible standard INQUIRY marker | あり | 0 |
+| `chipsbank-ufd` | CBM2098/99、CBM2198/99 family | なし | あり | 0 |
+| `innostor-ufd` | IS916/917/917CP、IS918/918M、IS818 | なし | あり | 0 |
+| `firstchip-ufd` | FC1178/79、FC2279、FC3379、ZC3281、YB/YC2019 | なし | あり | 0 |
+| `solid-state-system-ufd` | SSS6677/79、6688/89、6690/91/92 | なし | あり | 0 |
+| `skymedi-ufd` | SK6211、SK62xx、SK66xx | なし | あり | 0 |
+| `appotech-ufd` | DM8216/31/35、DM8261/A、YS8231 | なし | あり | 0 |
+| `silicongo-ufd` | SG1580/81、KS6808、UD6809 | なし | あり | 0 |
+| `icreate-ufd` | i5060/62、i5122/27/28/29、i5188 | なし | あり | 0 |
+| `oti-ufd` | OTi2165〜2169、2189、6128、6228、6828 | なし | あり | 0 |
+| `prolific-ufd` | PL-2515/PRO、PL-2518、PL-2528 | なし | あり | 0 |
+| `ameco-ufd` | MXT6208、MXT8208、MW8209/8289/8690 | なし | あり | 0 |
+| `netac-ufd` | NT2033/39、NT2060 | なし | あり | 0 |
+| `efortune-ufd` | eU201 variants、eU202 | なし | あり | 0 |
+| `ite-ufd` | IT1165/67、IT1171/72/76/77、IT1181/99 | なし | あり | 0 |
+| `hyperstone-ufd` | U8/U8B、U9 | なし | あり | 0 |
+| `yeestor-ufd` | YS USB 2.0、YS5083/85、YS5283HP | なし | あり | 0 |
+| `ramos-ufd` | UR22/24/25/26、UR28/30/31 | なし | あり | 0 |
+| `trek2000-ufd` | TD2SMG9/TD2SM9、legacy ThumbDrive | なし | あり | 0 |
+| `moai-ufd` | MA8100/02/03、MA8125 | なし | あり | 0 |
+| `realway-ufd` | RW8021、CION AR192/AP192 | なし | あり | 0 |
+| `huayi-ufd` | HY6919 | なし | あり | 0 |
+| `ktc-ufd` | FC1325N | なし | あり | 0 |
+| `smsc-ufd` | USB97C242 | なし | あり | 0 |
+
+全 28 family は controller/NAND identity、page + OOB read、physical erase/status、BBT、FTL、capacity metadata、service transition、resume/salvage の同じ検証済み役割へ接続される。固定 probe のない 24 family と、固定 probe の対象外世代は、exact USB descriptor + SCSI bootstrap と recipe-owned 2 段 identity を必須とする。したがって上表の adapter 数を C3/C4 対応媒体数として数えてはならない。
 
 「MPTool で初期化できる」「コマンドが GOOD status を返す」「ファームウェアを書き換えられる」は、D1–D4 の処理証拠ではない。C3 を有効にするには、少なくとも全非 FBB ブロックの列挙、D1/D2 の物理消去、旧 RBB の個別消去結果、旧・新 BBT 差分、旧 FTL 世代の無効化、新 FTL の commit、電源再投入後の独立確認が必要である。
 
@@ -20,11 +45,11 @@
 
 - USB VID は送信してよい読み取り専用プローブを 1 ファミリーへ限定するヒントとしてだけ使う。OEM VID を推測して総当たりしない。OEM VID は trusted production profile の exact USB / SCSI bootstrap が明示した family と runtime identity recipe でのみ扱う。
 - VID からベンダー名・モデル名を表示するときは、ツール固有の表を持たず OS の usb.ids (linux-usb.org、udev hwdb の生成元) を読み、無い場合はデバイスの iManufacturer 文字列にフォールバックする。ベンダー名はブランド情報であり、コントローラ family の断定には使わない (例: Imation ブランドの UT163)。
-- 読み取り専用の controller family 識別パラメータ (VID ヒント、INQUIRY マーカー、報告名) は `profiles/identify-*.toml` に置き、コードへ埋め込まない。ファミリ名は既知の enum と照合して検証する。
+- 読み取り専用の controller family 識別パラメータ (VID ヒント、INQUIRY マーカー、報告名) は `profiles/identify-*.toml` に置き、コードへ埋め込まない。現在 18 profile を source package と installer の両方へ含める。ファミリ名は単一 registry と照合して検証する。vendor-owned VID を安全に特定できない 10 family は、誤推定を避けるため VID profile を同梱しない。
 - Phison は vendor version page の `VR` シグネチャ、big-endian chip type、firmware bytes、run mode を検証する。続いて 6-byte NAND ID を取得し、全 `00` / 全 `FF` を拒否する。
 - Alcor は 512-byte config の `99 07` シグネチャ、little-endian VID/PID/bcdDevice、USB string descriptor の型・偶数長・境界を検証する。シグネチャ確認後だけ flash ID を取得する。
 - SCSI INQUIRY の vendor/product/revision 文字列を単独の controller 推定には使わない。署名済み production profile が USB VID/PID/bcdDevice と SCSI 3 文字列を全て固定した exact bootstrap tuple に限り、runtime recipe の候補選択へ使用する。
-- 安全に送れる固定 identity CDB が公開されていない SanDisk Cruzer、後期 controller、OEM VID 製品では、exact USB VID / PID / bcdDevice と SCSI INQUIRY tuple を recipe artifact 選択に限って使う。この bootstrap は capability を有効化せず、runtime recipe の signed `read-controller-id` と `read-nand-id` が一致した後だけ実行可能にする。SanDisk では必須、Phison / Alcor / SMI では profile が明示した場合だけ使用する。
+- 安全に送れる固定 identity CDB が公開されていない family、後期 controller、OEM VID 製品では、exact USB VID / PID / bcdDevice / manufacturer / product / serial と SCSI INQUIRY tuple を recipe artifact 選択に限って使う。空文字も wildcard ではなく exact absence である。この bootstrap は capability を有効化せず、runtime recipe の signed `read-controller-id` と `read-nand-id` が一致した後だけ実行可能にする。
 - production TOML だけでは実行 capability を公開しない。読み取り専用 plan probe は必要 runtime artifact を plan へ固定するだけである。run の再 probe で exact tuple に固定された runtime protocol recipe と必要な loader が認証され、controller response の exact identity が一致しなければならない。protocol trace と qualification report は profile の認定根拠として SHA-256 を固定する。
 - コンパイル済み support は USB VID ではなく、署名検証済み controller response へ結び付ける。probe 失敗時や `unidentified` を名乗る profile は実行可能にならない。
 - controller backend は core が同一 SCSI object から解決した `/dev/sgN` を必須とし、block fd と sysfs `device` が一致しなければ拒否する。
@@ -33,9 +58,9 @@
 - BBT / FTL は inactive 固定長 image、exact checksum algorithm / coverage、prepare / commit marker、generation を recipe で明示し、activate 後に BBT state と commit generation を再読する。host response 消失時は commit state を先に照会する。
 - service mode の USB reset は同一 physical USB path 上の唯一の whole device だけを再 bind し、2-slot SHA-256 controller state と fsync journal から再開する。
 
-ヒントに使う `13fe`、`058f`、`090c`、`0781` は [USB-IF Company Vendor ID List](https://www.usb.org/sites/default/files/vendor_ids032322.pdf_1.pdf) の Phison Electronics Corp. `5118`、Alcor Micro Corp. `1423`、Silicon Motion Taiwan `2316`、SanDisk Corporation `1921` を 16 進表記した値である。VID は USB descriptor の申告値であり、chip identity や真正性の証明ではない。
+ヒントに使う値は [USB-IF Company Vendor ID List](https://www.usb.org/sites/default/files/vendor_ids07072026_0.pdf) と vendor 資料を照合する。例えば `13fe`、`058f`、`090c`、`0781` は Phison Electronics Corp. `5118`、Alcor Micro Corp. `1423`、Silicon Motion Taiwan `2316`、SanDisk Corporation `1921` を 16 進表記した値である。VID は USB descriptor の申告値であり、chip identity や真正性の証明ではない。
 
-実装は `crates/nclr-core/src/controller_protocol.rs` と `crates/nclr-backends/src/bin/nclr-controller.rs` にある。macOS では次の hardware-free 確認ができる。
+実装は `crates/nclr-core/src/controller_protocol.rs` と `crates/nclr-backends/src/bin/nclr-controller.rs` にある。macOS では `diskutil` と IOKit registry を対象 BSD disk の provider chain で結合し、未知 command を送らず exact USB descriptor、SCSI tuple、location ID を `nclr info -j /dev/diskN` に収集する。native SD は取得可能な CID/CSD/SCR と card / host identity を `sd_research` に保存し、標準 SD host interface が公開しない内部 controller identity と C3/C4 service 情報を不足項目として分離する。次の hardware-free 確認もできる。
 
 ```sh
 cargo test --workspace
@@ -61,8 +86,30 @@ Wireshark/TShark で USB BOT capture を厳密に変換する手順は
 | Silicon Motion | [Dyna SM3281 series U0204](https://flashboot.ru/files/file/689/) | 9,903,461 | `ff2143c5bf17ee91b5536c8d32953e73de0c36b92ff3455ddf5f46b02ea75153` | vendor MP package の二次 RAR。署名なし |
 | Alcor | [ALCOR MP v13.10.28.01.C](https://flashboot.ru/files/file/408/) | 6,637,920 | `9b39018528d03465ad9a404d863a5b15cbf3955cd11ed30302c8d0fa0fdfc05a` | 掲載者が Alcor site 取得物と説明する二次 archive。署名なし |
 | Alcor | [ALCOR U2 MP v20.09.16.00](https://flashboot.ru/files/file/683/) | 7,096,430 | `9a2e57e380d5cbee33d6c3b00a521337d97c0f11ff712f2d516bce1540aa10ea` | vendor MP package の二次 7z。署名なし |
+| FirstChip | FirstChip MPTools 20200430 FC1178/FC1179 | 6,975,361 | `02dee6595b7632090f676606d65592f5ce004b9436bcd800bb31b30391b708ee` | [二次 archive catalog](https://flashboot.ru/files/)。external code、scan code、seed、NAND parser を分離 |
+| ChipsBank | APTool V7200 CBM2099/2199 | 7,650,649 | `deefbb11950790099c30a37467a9466301e24a2bf34cf85dde2d9bc3418226b3` | [二次 archive catalog](https://flashboot.ru/files/)。controller/NAND code と `.cbm` payload を分離 |
+| Innostor | IS917 MP Package 917106M75-6_ST | 2,703,195 | `1fb840c575870d639ee788cb4ef5e14d392be8df27bddf8d9f920bd274711ff5` | [二次 archive catalog](https://flashboot.ru/files/)。flash database、controller descriptor、sorting module を分離 |
+| Solid State System | SSS MP Utility v2.162 | 1,530,494 | `329c74878f5598fcd49b29d07b86fa59b2405fc5bc15de395a35d8e82b2bdc3e` | [二次 archive catalog](https://flashboot.ru/files/)。一部 CRC error のため破損 file は根拠に不採用 |
+| iCreate | i5188 AllNewChinaPD v1.5 | 306,857 | `3c67e6768d01f2e6d3891adaaab3ccaefdf9ec7acb3524d7dc2bcfa54042afff` | [二次 archive catalog](https://flashboot.ru/files/)。RAM、timing、LLF、page-scan、two-plane payload を分離。一部 CRC error |
+| OTi | OTI 216X PT Multi-Device 2.9.0.23 | 799,261 | `feca686840a546c2054f2cb9b037b870635c3ccc9e195e4da768d992b67806a2` | [二次 archive catalog](https://flashboot.ru/files/)。archive は完全展開、PE は署名なし |
+| Prolific | UFD Utility v21400 | 2,204,066 | `ffc5eb1af7306f38c713a6aa3bd160ca412d028d15f72076b4020b4d7eebd479` | [二次 archive catalog](https://flashboot.ru/files/)。実行 file に CRC error |
+| AppoTech | DM8261 Partition V1.8 | 502,519 | `29884162f89f7a1d47e4dfc15887b093f491d2dfca21aa0692a0ad26b3ba8d25` | [二次 archive catalog](https://flashboot.ru/files/)。solid RAR を完全展開できず、listing だけを根拠に使用 |
+| Ameco | MW6208E/8208 1.2.0.1 | 573,767 | `6fbf6227c34f3570c41e9ae075ae1f9d94dbef4719882488d5a3e277cbce949b` | [二次 archive catalog](https://flashboot.ru/files/)。solid RAR を完全展開できず、listing だけを根拠に使用 |
+| Netac | Netac RepairTool | 425,497 | `27d9a7315ef6e576c4b779a2ae2e945be1ff6cb11ca669744ee6585a388cb444` | [二次 archive catalog](https://flashboot.ru/files/)。solid RAR を完全展開できず、listing だけを根拠に使用 |
+| eFortune | eU202 MP 10.05.18 A.00.00 | 4,331,150 | `4921da6d3ea5df0ffdd402ace97326b4a156504c04ae20d13f0517e1a017e934` | [二次 archive catalog](https://flashboot.ru/files/)。preformat、run/read、die-sort、NAND organization payload を分離。一部 extraction error |
 
-SanDisk U3 tool だけは後述する SanDisk 正規 URL の保存 response と Authenticode を確認できた。Phison、SMI、Alcor は内部 version、vendor 文書、controller 固有 loader、NAND table が相互整合する実 MP package だが、現在の配布元は vendor 自身ではなく PE signature もない。このため「vendor 製 tool の内容を解析した」という技術的根拠には使うが、archive byte 列の供給 chain を正規署名済みと表現しない。
+SanDisk U3 tool だけは後述する SanDisk 正規 URL の保存 response と Authenticode を確認できた。それ以外は内部 version、vendor 文書、controller 固有 loader、NAND table が相互整合する実 MP package でも、現在の配布元は vendor 自身ではなく、多くの PE に signature がない。このため「vendor 製 tool package の内容を静的解析した」という技術的根拠には使うが、archive byte 列の supply chain を正規署名済みと表現しない。CRC error、solid archive 非対応、展開失敗を生じた byte 列は production artifact や command 根拠へ採用しない。
+
+### 追加 family の根拠と限界
+
+- Phison の現行 [U17/U18 製品情報](https://www.phison.com/u17-u18/) は native USB 3.2 controller と 3D NAND 対応を示すが、PS2251 の version CDB 互換性は示さない。このため U17/U18 は `phison-ufd` の catalog line には含めるが、固定 PS2251 probe の対象外とする。
+- ChipsBank の [CBM2199S 製品情報](https://www.chipsbank.com/product/info.aspx?itemid=10&lcid=6) と [CBM219X UMPTool manual](https://f-hauri.ch/vrac/SSD-16Tb/CB/219x/CBM219X%20UMPToolV7200%282022-04-28%29/ChipsBank%20UMPTool%20UserManual.pdf) は controller generation と量産 tool の存在を確認できるが、host service protocol は定義しない。
+- Innostor の [IS917 datasheet](https://datasheet4u.com/pdf-down/I/S/9/IS917-Innostor.pdf) と [IS918M datasheet](https://www.chinaflashmarket.com/Uploads/file/2018/05/21/IS918M.pdf) は NAND channel、ECC、USB interface を確認できるが、factory command と metadata layout は公開しない。
+- Hyperstone の [USB controller 製品群](https://www.hyperstone.com/en/USB-Controllers-Flash-Memory-Controllers-2124%2C%2C%2C%2Chynet.html) と [U9](https://www.hyperstone.com/en/USB-31-Controller-Flash-Memory-Controller-2129%2C%2C%2Cdetail.html) は hyMap FTL と application-specific firmware を明示する。製造 kit は [permission-controlled download](https://www.hyperstone.com/en/Download-Center-Hyperstone-1054.html) であり、公開 CDB を推測しない。
+- Yeestor の [製品一覧](https://www.yeestor.com/products) は USB/SD controller を分け、YS5083/5085/5283 世代を掲載する。USB family adapter と native SD command path を混同しない。
+- Trek 2000 の [ThumbDrive storage solution](https://www.trek2000.com.sg/pages/thumbdrive%C2%AE-storage-solutions) と SMSC USB97C242 の [manufacturer datasheet](https://www.mouser.com/catalog/specsheets/97c242.pdf) は legacy direct-NAND controller の存在を裏付けるが、raw NAND host command contract ではない。
+
+AppoTech、SiliconGo、iCreate、OTi、Prolific、Ameco、Netac、eFortune、ITE、Ramos、Moai、RealWay、HuaYi、KTC などの legacy line は、二次 catalog と実 package inventory を controller namespace の根拠にした recipe-only adapter である。vendor-owned VID を一次資料で一意に確定できた family だけ candidate profile を同梱し、それ以外は接続媒体の exact OS identity と trace から production bootstrap を作る。二次 catalog の型番だけで固定 probe、service loader、NAND geometry を共有しない。
 
 ## Phison PS2251 family
 
@@ -133,6 +180,7 @@ ALCOR U2 MP v20.09.16.00 も追加取得し、2013 年版の分離構造が 3D N
 - [SM3282 product brief](https://www.siliconmotion.com/download/p/a/SM3282_PB_EN_201910.pdf) は UASP、NAND channel、ECC、turnkey firmware を説明するが、物理消去・BBT/FTL 再構築のホストプロトコルは公開しない。
 - [公開調査記録](https://sstahlman.blogspot.com/2021/) は `sg_raw -r 1024 ... f0 04 00 00 00 00 00 00 00 00 00 02` と、offset `0x20` の `2013-02-26  SM3257ENLTBA   SMI32X` response を掲載している。nclr は transfer 1024 byte、printable ASCII、日付、`SM3...` part、`SMI32X` signature を全て検査し、identity にだけ利用する。
 - SD controller については [SM2707EN product brief](https://www.siliconmotion.com/download/3PN/a/SM2707EN_PB_EN.pdf) が標準 SD full-user-area logical erase を記載する。しかし、これは D0 の標準論理範囲であり、D1–D4 の vendor service protocol ではない。
+- native SD の標準経路は旧 SDSC も扱う。[Linux MMC core の `mmc_do_erase`](https://github.com/torvalds/linux/blob/master/drivers/mmc/core/core.c) と [SD CSD parser](https://github.com/torvalds/linux/blob/master/drivers/mmc/core/sd.c) に合わせ、CSD structure 0 は CMD32/CMD33 の sector start を 512 倍した byte address、structure 1/2 は block address とする。CSD の erase command class 5、kernel が公開する erase group、全 user range の group alignment と 32-bit argument 境界を probe と run の両方で再確認する。これは D0 の standard erase 対応であり、SD 内部 controller の C3/C4 対応数には含めない。
 
 `F0 04` 以外の bounded destructive command、response signature、失敗時復旧は公開資料から確定できない。特に `0x2a` parameter への言及だけから CDB layout を作らない。メーカー資料、再配布可能な SDK、または所有する犠牲媒体と正規 MPTool の USB trace から確定した command は、SMI recipe engine へそのまま投入できる。
 
@@ -221,7 +269,7 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 - [UT163/UT165 USB Flash Disk Utility の user manual](https://archive.org/details/manualzilla-id-5806917) はパーティション、boot disk、secret area の使い方を説明する Windows ツールの説明であり、ホスト protocol 定義ではない。
 - usb.ids は `4146` を "USBest Technology" に、`1307` を "Transcend Information, Inc." に登録するが、USB-IF の registry 議論は `1307` を USBest Technology Inc. の割り当てとする。いずれも識別のヒントに過ぎない。
 
-実測 (Imation Flash Drive Mini、VID `0718`、UT163 搭載): 標準 INQUIRY を 96 バイト要求すると、36 バイトの標準データを超える vendor-specific 領域に `UtffU163A1BM` のマーカーが返る。`profiles/identify-usbest-ut163.toml` が VID ヒント (`4146`、`1307`) と INQUIRY マーカー (`U163`) を宣言し、nclr はこの領域のパターンを検証して `usbest-ut163` と識別する。この識別は標準 INQUIRY だけを使い、未知の vendor CDB を送信しない。識別は読み取り専用の情報提供であり、destructive capability は公開 service CDB が存在しないため一切公開しない。
+実測 (Imation Flash Drive Mini、VID `0718`、UT163 搭載): 標準 INQUIRY を 96 バイト要求すると、36 バイトの標準データを超える vendor-specific 領域に `UtffU163A1BM` のマーカーが返る。`profiles/identify-usbest-ufd.toml` が vendor-owned VID ヒント (`4146`、`1307`) と INQUIRY マーカー (`U163`) を宣言し、nclr はこの領域のパターンを検証して controller ID `usbest-ut163` を返す。この識別は標準 INQUIRY だけを使い、未知の vendor CDB を送信しない。UT165 以降はこの marker probe の対象ではない。全 USBest line は common recipe adapter を利用できるが、exact service CDB、NAND identity、metadata format と HIL がない状態では destructive capability を公開しない。
 
 ## C3 / C4 へ昇格する認定条件
 
@@ -238,4 +286,4 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 
 1 組でも不明なら、その領域は `unreachable` または `unknown` のままにする。成功 status だけを根拠に trust を `production` へ変更しない。
 
-プロファイル検証もこの境界を強制する。実媒体で `trust = "production"` を指定する場合、firmware / NAND 範囲は `min = max` の完全一致、D1–D4 の全 accounting、BBT / FTL / spare rebuild、独立 HIL report の SHA-256、reader 名、sample 数、power-cut case 数が必須である。さらに clean-room / runtime artifact の provenance、protocol trace、exact NAND geometry、FBB marker、randomizer / read-retry / ECC layout、BBT / FTL / spare format、atomic commit protocol、明示 policy 付き system block range、exact runtime recipe を必須とする。recipe schema と crash/re-enumeration 契約は [`controller-protocol-recipe.md`](controller-protocol-recipe.md) に記載する。`simulated = true` は組み込み `sim-controller-1` 以外では拒否される。
+プロファイル検証もこの境界を強制する。実媒体で `trust = "production"` を指定する場合、firmware / NAND 範囲は `min = max` の完全一致、D1–D4 の全 accounting、BBT / FTL / spare rebuild、独立 HIL report の SHA-256、reader 名、sample 数、power-cut case 数が必須である。さらに `protected_area_bytes` の明示値、事後の全 LBA 検証で使う `logical_blank_value` (`0` または `255`)、clean-room / runtime artifact の provenance、protocol trace、exact NAND geometry、FBB marker、randomizer / read-retry / ECC layout、BBT / FTL / spare format、atomic commit protocol、明示 policy 付き system block range、exact runtime recipe を必須とする。recipe schema と crash/re-enumeration 契約は [`controller-protocol-recipe.md`](controller-protocol-recipe.md) に記載する。`simulated = true` は組み込み `sim-controller-1` 以外では拒否される。

@@ -190,6 +190,8 @@ mod tests {
             date: "2026/01".into(),
             host: "mmc0".into(),
             kind: "SD".into(),
+            erase_size_bytes: 512,
+            preferred_erase_size_bytes: 4 * 1024 * 1024,
         });
         let a = compute(&d);
         d.mmc.as_mut().unwrap().cid = "DIFF".into();

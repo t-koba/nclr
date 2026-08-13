@@ -203,6 +203,13 @@ pub fn preflight_soft(identity: &DeviceIdentity) -> Vec<String> {
     warnings
 }
 
+/// Gate vendor-specific read-only probes. `info` may still report ordinary
+/// identity and standard transport capabilities for a system disk, but it
+/// must not send unnecessary controller-family commands to that disk.
+pub fn deep_probe(identity: &DeviceIdentity) -> Result<()> {
+    check_system_disk(identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

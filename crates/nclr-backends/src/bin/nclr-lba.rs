@@ -91,6 +91,7 @@ fn main() {
             "api": PROTOCOL_API,
             "ok": true,
             "backend": "lba",
+            "version": VERSION,
             "state": "ready",
             "recovery": {
                 "automated": false,

@@ -126,6 +126,10 @@ fn core_06_info_reports_controller_identify_field() {
     assert_eq!(v["identity"]["schema"], "nclr.device.v1");
     assert!(v["identity"].is_object(), "identity object missing");
     assert!(v["backend_probe"].is_object(), "backend_probe missing");
+    assert!(v["backend_probe"]["capabilities"].is_array());
+    assert!(v["backend_probe"]["erase_coverage"].is_array());
+    assert!(v["backend_probe"]["rebuilds"].is_array());
+    assert_eq!(v["backend_probe"]["destructive_ready"], true);
     // A regular file is not a USB device: no controller family can be
     // selected, so the field is present and null.
     assert!(
@@ -317,12 +321,19 @@ fn core_09_grades_are_independent() {
     // evidence (unit-level demonstration).
     let e = ControllerReinitEvidence {
         old_bbt_captured: true,
+        old_bbt_sha256: Some("0".repeat(64)),
+        old_bbt_copies: Some(2),
         old_rbb_erase_attempted: true,
         old_rbb_erase_failed: 1, // residual erase-failed
         fbb_preserved: true,
         new_bbt_committed: true,
         ftl_rebuilt: true,
+        old_mapping_invalidated: true,
         capacity_stable: true,
+        logical_reads_ok: true,
+        logical_blank_verified: true,
+        signature_free: true,
+        flush_ok: true,
         spare_ok: true,
         weak_isolated: true,
         isolated_blocks: 0,
@@ -335,7 +346,7 @@ fn core_09_grades_are_independent() {
         new_ftl_generation: Some(2),
         fbb_count: Some(2),
         rbb_count: Some(3),
-        old_rbb_erased: 3,
+        old_rbb_erased: 2,
         throughput_mbps: None,
         flush_latency_ms: None,
     };
@@ -451,6 +462,9 @@ fn standard_discard_never_c2() {
         signature_free: true,
         power_cycled: true,
         capacity_stable: true,
+        postcheck_reads_ok: true,
+        postcheck_signature_free: true,
+        postcheck_flush_ok: true,
         discard_only: true,
         io_errors: 0,
     };

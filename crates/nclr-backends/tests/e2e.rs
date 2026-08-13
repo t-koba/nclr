@@ -77,6 +77,22 @@ fn make_sim(path: &Path, extra: &[&str]) {
     assert!(st.success(), "sim init failed");
 }
 
+fn write_backend_manifest(dir: &Path, id: &str, operations: &[&str]) {
+    let binary = dir.join(format!("nclr-{id}"));
+    let bytes = std::fs::read(&binary).unwrap();
+    let digest = nclr::digest(&bytes);
+    let operations = operations
+        .iter()
+        .map(|operation| format!("\"{operation}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let manifest = format!(
+        "schema = 1\nid = \"{id}\"\nexec = \"nclr-{id}\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [{operations}]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
+    std::fs::write(dir.join(format!("{id}.toml")), manifest).unwrap();
+}
+
 fn json_of(stdout: &str) -> Value {
     serde_json::from_str(stdout).expect("expected JSON on stdout")
 }
@@ -335,11 +351,54 @@ fn resume_after_interruption() {
 
     // Resume must complete the remaining actions and reach ok/C1.
     let (rc, report, err) = run_nclr(&["resume", state.to_str().unwrap(), "--yes", "-j"], &[]);
-    assert_eq!(rc, 0, "resume failed: {err}");
+    assert_eq!(rc, 0, "resume failed: {err}\nreport: {report}");
     let r: Value = json_of(&report);
     assert_eq!(r["result"], "ok");
     assert_eq!(r["achieved_grade"], "C1");
     assert_eq!(r["grade_qualified"], true);
+    let resumed_journal = nclr::journal::summarize(&state).unwrap();
+    assert_eq!(
+        resumed_journal.last_completed_action.as_deref(),
+        Some("postcheck-l1"),
+        "resume must append to the journal supplied on the command line"
+    );
+}
+
+#[test]
+fn resume_after_second_power_cycle_uses_the_action_sequence() {
+    let dir = tmpdir("resume-sequence");
+    let img = dir.join("sim.img");
+    let state = dir.join("sim.state");
+    make_sim(&img, &["--id", "e2e-resume-sequence"]);
+    let (rc, _, _) = run_nclr(
+        &[
+            "run",
+            "-l",
+            "lba",
+            img.to_str().unwrap(),
+            "--yes",
+            "--state",
+            state.to_str().unwrap(),
+        ],
+        &[("NCLR_TEST_HOOKS", "1"), ("NCLR_TEST_STOP_AFTER_SEQ", "8")],
+    );
+    assert_eq!(rc, 75, "expected interruption after the second power cycle");
+
+    let (rc, report, err) = run_nclr(&["resume", state.to_str().unwrap(), "--yes", "-j"], &[]);
+    assert_eq!(rc, 0, "resume failed: {err}\nreport: {report}");
+    assert_eq!(json_of(&report)["result"], "ok");
+
+    let journal = nclr::journal::summarize(&state).unwrap();
+    for action in ["lba-prbs-verify", "lba-zero-write"] {
+        let completions = journal
+            .records
+            .iter()
+            .filter(|record| {
+                record.value["state"] == "action-completed" && record.value["action"] == action
+            })
+            .count();
+        assert_eq!(completions, 1, "resume repeated completed action {action}");
+    }
 }
 
 #[test]
@@ -436,6 +495,8 @@ fn plain_file_without_power_control_is_documented_exclusion() {
     let r: Value = json_of(&report);
     assert_eq!(r["result"], "degraded");
     assert_eq!(r["residual"], "documented-exclusion");
+    assert_eq!(r["health_grade"], "H1");
+    assert_eq!(r["final_state"], "undetermined");
     assert_eq!(r["postcheck"]["power_cycle_performed"], false);
 }
 
@@ -561,8 +622,27 @@ fn check_is_read_only_and_ok() {
     assert_eq!(rc, 0);
     let v: Value = json_of(&out);
     assert_eq!(v["identity"]["transport"], "file");
+    assert!(v["backend"]["capabilities"].is_array());
+    assert!(v["backend"]["erase_coverage"].is_array());
+    assert!(v["backend"]["rebuilds"].is_array());
+    assert!(v["backend"]["protected_area_bytes"].is_u64());
     let after = std::fs::read(&img).unwrap();
     assert_eq!(before, after, "check must not modify the media");
+}
+
+#[test]
+fn check_reports_sample_read_errors() {
+    let dir = tmpdir("check-read-error");
+    let img = dir.join("sim.img");
+    make_sim(&img, &["--id", "e2e-check-read-error", "--fail-read", "0"]);
+    let (rc, out, _) = run_nclr(&["check", "-j", img.to_str().unwrap()], &[]);
+    assert_eq!(rc, 74);
+    let result: Value = json_of(&out);
+    assert!(result["errors"].as_array().is_some_and(|errors| {
+        errors
+            .iter()
+            .any(|error| error["action"] == "sample-read" && error["status"] == "error")
+    }));
 }
 
 #[test]
@@ -607,6 +687,14 @@ fn events_fd_is_ndjson() {
     );
     let first: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(first["phase"], "action");
+    for (expected, line) in lines.iter().enumerate() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            event["seq"].as_u64(),
+            Some(expected as u64),
+            "event sequence is not globally monotonic at line {expected}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +803,17 @@ fn sim_controller_rbb_erase_failure_is_residual() {
     assert_eq!(r["residual"], "erase-failed");
     assert_eq!(r["postcheck"]["details"]["old_rbb_erase_failed"], 1);
     assert_eq!(r["grade_qualified"], true);
+    let d3 = r["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["domain"] == "D3")
+        .unwrap();
+    assert_eq!(d3["final"], "erase-failed");
+    assert_eq!(d3["count"], 3);
+    assert_eq!(d3["attempted"], 3);
+    assert_eq!(d3["erased"], 2);
+    assert_eq!(d3["failed"], 1);
 }
 
 #[test]
@@ -1117,6 +1216,7 @@ fn sim_physical_salvage_reads_every_raw_page() {
     let per_block = result["physical_read"]["per_block"].as_array().unwrap();
     assert_eq!(per_block.len(), 64, "one record per physical block");
     for rec in per_block {
+        assert!(rec["physical_coordinate"].is_object());
         assert!(rec["disposition"].is_string());
         assert!(rec["unreadable_pages"].is_u64());
         assert!(rec["uncorrectable_pages"].is_u64());
@@ -1139,6 +1239,76 @@ fn sim_physical_salvage_reads_every_raw_page() {
     assert_eq!(header["schema"], "nclr.physical-map.v1");
     assert_eq!(header["record"], "header");
     assert_eq!(header["image_bytes"], expected_bytes as u64);
+    let first_page: Value = serde_json::from_str(lines.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(first_page["data_length"], spec.page_bytes);
+    assert_eq!(first_page["oob_length"], 0);
+    assert_eq!(first_page["geometry"]["channel"], 0);
+    assert_eq!(first_page["geometry"]["chip"], 0);
+    assert_eq!(first_page["geometry"]["lun"], 0);
+    assert_eq!(first_page["geometry"]["plane"], 0);
+    assert_eq!(first_page["geometry"]["block"], 0);
+    assert_eq!(first_page["geometry"]["page"], 0);
+    assert_eq!(first_page["read_status"], "ok");
+    assert_eq!(first_page["ecc_status"], "correctable");
+}
+
+#[test]
+fn sim_physical_salvage_resumes_into_the_bound_outputs() {
+    let dir = tmpdir("salvage-resume");
+    let img = dir.join("sim.img");
+    let output = dir.join("physical.img");
+    let map = dir.join("physical.ndjson");
+    let state = dir.join("salvage.state");
+    let spec = nclr::sim::SimSpec::default();
+    make_sim(&img, &["--id", "e2e-salvage-resume"]);
+
+    let (rc, interrupted, err) = run_nclr(
+        &[
+            "salvage",
+            img.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--map",
+            map.to_str().unwrap(),
+            "--state",
+            state.to_str().unwrap(),
+            "--backend",
+            "sim",
+            "--yes",
+            "-j",
+        ],
+        &[
+            ("NCLR_TEST_HOOKS", "1"),
+            ("NCLR_TEST_STOP_AFTER", "enter-service-mode"),
+        ],
+    );
+    assert_eq!(rc, 75, "salvage interruption failed: {err}");
+    assert_eq!(json_of(&interrupted)["result"], "interrupted");
+
+    let (rc, resumed, err) = run_nclr(&["resume", state.to_str().unwrap(), "--yes", "-j"], &[]);
+    assert_eq!(rc, 0, "salvage resume failed: {err}");
+    let result = json_of(&resumed);
+    assert_eq!(result["schema"], "nclr.salvage.v1");
+    assert_eq!(result["result"], "complete");
+    assert_eq!(
+        result["image"]["path"],
+        std::fs::canonicalize(&output).unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        result["page_map"]["path"],
+        std::fs::canonicalize(&map).unwrap().to_str().unwrap()
+    );
+    let expected_bytes = spec.blocks as u64 * spec.pages_per_block as u64 * spec.page_bytes as u64;
+    assert_eq!(result["image"]["bytes"], expected_bytes);
+    assert_eq!(
+        std::fs::read_to_string(&map).unwrap().lines().count(),
+        1 + spec.blocks as usize * spec.pages_per_block as usize
+    );
+
+    let journal = nclr::journal::read_records(&state).unwrap();
+    assert!(journal.iter().any(|record| {
+        record.value.get("state").and_then(Value::as_str) == Some("outputs-restarted")
+    }));
 }
 
 #[test]
@@ -1188,7 +1358,7 @@ fn sim_physical_salvage_keeps_holes_and_page_errors_explicit() {
         .lines()
         .skip(1)
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|page| page["status"] == "read-error")
+        .filter(|page| page["read_status"] == "read-error" && page["ecc_status"] == "unknown")
         .count();
     assert_eq!(read_errors, 8);
 }
@@ -1814,7 +1984,7 @@ fn backend_timeout_kills_and_interrupts() {
     // exits.
     let back = dir.join("back");
     std::fs::create_dir_all(&back).unwrap();
-    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true}'\n    ;;\n  *)\n    exec sleep 30\n    ;;\nesac\n";
+    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"capabilities\":[\"LBA_PRBS_WRITE\"],\"grade_ceiling\":\"C1\",\"erase_coverage\":[],\"erase_method\":null,\"rebuilds\":[],\"controller_profile\":null,\"profile_sha256\":null,\"capacity_policy\":null,\"protected_area_bytes\":0,\"certification\":null,\"artifacts\":[]}'\n    ;;\n  *)\n    exec sleep 30\n    ;;\nesac\n";
     std::fs::write(back.join("nclr-lba"), script).unwrap();
     let mut perms = std::fs::metadata(back.join("nclr-lba"))
         .unwrap()
@@ -1822,11 +1992,7 @@ fn backend_timeout_kills_and_interrupts() {
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(back.join("nclr-lba"), perms).unwrap();
-    std::fs::write(
-        back.join("lba.toml"),
-        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
-    )
-    .unwrap();
+    write_backend_manifest(&back, "lba", &["probe", "plan", "run", "status", "recover"]);
 
     let (rc, _, err) = run_nclr(
         &[
@@ -1862,7 +2028,7 @@ fn backend_interrupted_status_exits_75() {
     std::fs::write(&img, vec![0u8; 65536]).unwrap();
     let back = dir.join("back");
     std::fs::create_dir_all(&back).unwrap();
-    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"match\":\"exact\",\"capabilities\":[\"LBA_PRBS_WRITE\",\"ERASE_USER_AREA\"],\"grade_ceiling\":\"C2\",\"erase_coverage\":[\"D0\"],\"erase_method\":\"fake-erase\"}'\n    ;;\n  *)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0\",\"action\":\"device-user-area-erase\",\"action_results\":[{\"status\":\"interrupted\",\"message\":\"busy timeout; card may still be erasing\"}]}'\n    ;;\nesac\n";
+    let script = "#!/bin/sh\nreq=$(cat <&4)\ncase \"$req\" in\n  *'\"op\":\"probe\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"match\":\"exact\",\"capabilities\":[\"LBA_PRBS_WRITE\",\"ERASE_USER_AREA\"],\"grade_ceiling\":\"C2\",\"erase_coverage\":[\"D0\"],\"erase_method\":\"fake-erase\",\"rebuilds\":[],\"controller_profile\":null,\"profile_sha256\":null,\"capacity_policy\":null,\"protected_area_bytes\":0,\"certification\":null,\"artifacts\":[]}'\n    ;;\n  *'\"action\":\"inventory\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"action\":\"inventory\",\"action_results\":[{\"status\":\"ok\"}]}'\n    ;;\n  *'\"action\":\"device-user-area-erase\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"action\":\"device-user-area-erase\",\"action_results\":[{\"status\":\"interrupted\",\"message\":\"busy timeout; card may still be erasing\"}]}'\n    ;;\n  *'\"op\":\"status\"'*)\n    echo '{\"api\":1,\"ok\":true,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"state\":\"in-progress\",\"sanitize\":{\"started\":true,\"completed\":false,\"failed\":false,\"progress\":0}}'\n    ;;\n  *)\n    echo '{\"api\":1,\"ok\":false,\"backend\":\"lba\",\"version\":\"0.0.0-test\",\"error\":\"unexpected test request\"}'\n    ;;\nesac\n";
     std::fs::write(back.join("nclr-lba"), script).unwrap();
     let mut perms = std::fs::metadata(back.join("nclr-lba"))
         .unwrap()
@@ -1870,11 +2036,7 @@ fn backend_interrupted_status_exits_75() {
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(back.join("nclr-lba"), perms).unwrap();
-    std::fs::write(
-        back.join("lba.toml"),
-        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n",
-    )
-    .unwrap();
+    write_backend_manifest(&back, "lba", &["probe", "plan", "run", "status", "recover"]);
 
     let (rc, report, err) = run_nclr(
         &["run", "-l", "device", img.to_str().unwrap(), "--yes", "-j"],
@@ -2215,13 +2377,13 @@ fn check_reports_vendor_health_failure_as_warning() {
 req=$(cat <&4)
 case "$req" in
   *'"op":"probe"'*)
-    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0","capabilities":["SD_VENDOR_HEALTH","SAMPLE_READ"],"grade_ceiling":"L1","trust":"production"}'
+    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0-test","capabilities":["SD_VENDOR_HEALTH","SAMPLE_READ"],"grade_ceiling":"C1","erase_coverage":[],"erase_method":null,"rebuilds":[],"controller_profile":null,"profile_sha256":null,"capacity_policy":null,"protected_area_bytes":0,"certification":null,"artifacts":[],"trust":"production"}'
     ;;
   *'"action":"vendor-health"'*)
-    echo '{"api":1,"ok":false,"backend":"lba","version":"0.0.0","action_results":[{"status":"error","message":"vendor health probe denied"}]}'
+    echo '{"api":1,"ok":false,"backend":"lba","version":"0.0.0-test","action_results":[{"status":"error","message":"vendor health probe denied"}]}'
     ;;
   *)
-    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0","action_results":[{"status":"ok","action":"sample-read","value":{}}]}'
+    echo '{"api":1,"ok":true,"backend":"lba","version":"0.0.0-test","action":"sample-read","action_results":[{"status":"ok","samples":[{"lba":0,"sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"lba":64,"sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},{"lba":127,"sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}]}]}'
     ;;
 esac
 "#,
@@ -2231,11 +2393,7 @@ esac
     let mut perms = std::fs::metadata(&be).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&be, perms).unwrap();
-    std::fs::write(
-        dir.join("lba.toml"),
-        "schema = 1\nid = \"lba\"\nexec = \"nclr-lba\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"run\"]\n",
-    )
-    .unwrap();
+    write_backend_manifest(&dir, "lba", &["probe", "run"]);
     let (rc, out, _) = run_nclr(
         &["check", "-j", img.to_str().unwrap()],
         &[("NCLR_BACKEND_DIR", dir.to_str().unwrap())],

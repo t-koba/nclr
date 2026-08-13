@@ -31,7 +31,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use nclr::backend::{FD_DEVICE, PROTOCOL_API};
+    use nclr::backend::{BackendEvents, FD_DEVICE, PROTOCOL_API};
     use nclr::backend_common;
     use nclr::controller::{self, ServiceModeState};
     use nclr::controller_protocol::{self as vendor, ControllerIdentity, Family};
@@ -40,6 +40,7 @@ mod linux {
         TransferDirection,
     };
     use nclr::errors::{Error, Result};
+    use nclr::lba::LbaDevice;
     use nclr::profile::{self, Profile};
     use nclr::scsi;
     use nclr::VERSION;
@@ -51,14 +52,14 @@ mod linux {
 
     /// SCSI INQUIRY is reported for diagnostics only. It is not sufficiently
     /// controller-specific to authorize a vendor profile.
-    fn scsi_identity(file: &std::fs::File) -> Result<nclr::scsi::Inquiry> {
+    fn scsi_identity(file: &std::fs::File) -> Result<(nclr::scsi::Inquiry, Vec<u8>)> {
         let inq_raw = scsi_command(
             file,
             &scsi::cdb_inquiry(false, 0, 96),
             scsi::SG_DXFER_FROM_DEV,
             96,
         )?;
-        scsi::parse_inquiry(&inq_raw)
+        Ok((scsi::parse_inquiry(&inq_raw)?, inq_raw))
     }
 
     fn scsi_command(
@@ -68,7 +69,14 @@ mod linux {
         len: usize,
     ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        scsi::sg::exec(file, cdb, direction, &mut buf, 60_000)?;
+        let transferred = scsi::sg::exec_len(file, cdb, direction, &mut buf, 60_000)?;
+        if direction == scsi::SG_DXFER_FROM_DEV {
+            buf.truncate(transferred);
+        } else if transferred != len {
+            return Err(Error::Invalid(format!(
+                "SCSI command transferred {transferred} of {len} bytes"
+            )));
+        }
         Ok(buf)
     }
 
@@ -272,7 +280,9 @@ mod linux {
 
     fn result(action: &str, mut fields: serde_json::Map<String, Value>) -> Value {
         fields.insert("action".to_string(), json!(action));
-        fields.insert("status".to_string(), json!("ok"));
+        fields
+            .entry("status".to_string())
+            .or_insert_with(|| json!("ok"));
         json!({
             "api": PROTOCOL_API,
             "ok": true,
@@ -345,6 +355,8 @@ mod linux {
         geometry: &nclr::profile::NandGeometryPolicy,
         image: Option<&mut std::fs::File>,
         map: Option<&mut std::fs::File>,
+        events: &mut BackendEvents,
+        action: &str,
     ) -> Result<nclr::physical::SweepSummary> {
         let dispositions = state
             .blocks
@@ -353,6 +365,11 @@ mod linux {
             .collect::<Vec<_>>();
         let sweep_geometry = nclr::physical::SweepGeometry {
             blocks: recipe::total_blocks(geometry)?,
+            channels: geometry.channels,
+            chips_per_channel: geometry.chips_per_channel,
+            luns_per_chip: geometry.luns_per_chip,
+            planes_per_lun: geometry.planes_per_lun,
+            blocks_per_lun: geometry.blocks_per_lun,
             pages_per_block: geometry.pages_per_block,
             page_bytes: geometry.page_bytes,
             oob_bytes: geometry.oob_bytes,
@@ -386,6 +403,7 @@ mod linux {
                     },
                 })
             },
+            |done, total| events.progress(action, done, total, "page"),
         )
     }
 
@@ -424,9 +442,13 @@ mod linux {
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         context: CommandContext,
+        events: &mut BackendEvents,
+        phase: &str,
     ) -> Result<BTreeMap<String, u64>> {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(controller_recipe.policy.operation_timeout_ms);
+        let mut polls = 0u64;
+        let mut last_heartbeat = std::time::Instant::now();
         loop {
             let (_, status) = execute_named(
                 file,
@@ -443,6 +465,11 @@ mod linux {
             }
             if response_value(&status, "busy")? == 0 {
                 return Ok(status);
+            }
+            polls = polls.saturating_add(1);
+            if last_heartbeat.elapsed() >= std::time::Duration::from_secs(5) {
+                events.heartbeat(phase, polls, "status-poll")?;
+                last_heartbeat = std::time::Instant::now();
             }
             if std::time::Instant::now() >= deadline {
                 return Err(Error::Interrupted(
@@ -573,6 +600,7 @@ mod linux {
         geometry: &nclr::profile::NandGeometryPolicy,
         flat: u64,
         phase: &str,
+        events: &mut BackendEvents,
     ) -> Result<bool> {
         let context = recipe::coordinate(flat, geometry)?;
         if state
@@ -581,7 +609,7 @@ mod linux {
             .is_some_and(|flight| flight.flat_block == flat && flight.operation == "erase-block")
         {
             if let Err(error) = ambiguous_transport(
-                wait_controller_idle(file, controller_recipe, artifacts, context),
+                wait_controller_idle(file, controller_recipe, artifacts, context, events, phase),
                 &format!("erase-block status for block {flat}"),
             ) {
                 if matches!(&error, Error::Backend(_)) {
@@ -610,7 +638,7 @@ mod linux {
                 &format!("erase-block command for block {flat}"),
             )?;
             if let Err(error) = ambiguous_transport(
-                wait_controller_idle(file, controller_recipe, artifacts, context),
+                wait_controller_idle(file, controller_recipe, artifacts, context, events, phase),
                 &format!("erase-block status for block {flat}"),
             ) {
                 if matches!(&error, Error::Backend(_)) {
@@ -683,6 +711,7 @@ mod linux {
         plan_hash: &str,
         reenumeration_nonce: Option<&str>,
         file: &std::fs::File,
+        block_file: &std::fs::File,
         profile: &Profile,
         controller_recipe: &ControllerRecipe,
         recipe_sha256: &str,
@@ -690,6 +719,7 @@ mod linux {
         state_file: &mut std::fs::File,
         mut physical_image: Option<&mut std::fs::File>,
         mut physical_map: Option<&mut std::fs::File>,
+        events: &mut BackendEvents,
     ) -> Result<Value> {
         let geometry = required_geometry(profile)?;
         let metadata = required_metadata(profile)?;
@@ -756,6 +786,7 @@ mod linux {
                 save_state(state_file, &mut state)?;
                 fields.extend(block_counts(&state));
                 fields.insert("old_bbt_digest".into(), json!(state.old_bbt_sha256));
+                fields.insert("old_bbt_copies".into(), json!(controller_recipe.bbt.copies));
                 let fbb_count = state
                     .blocks
                     .iter()
@@ -781,6 +812,11 @@ mod linux {
                         state.blocks[flat as usize].disposition,
                         BlockDisposition::SystemPreserved | BlockDisposition::SystemRebuild
                     ) {
+                        if (flat + 1) % u64::from(controller_recipe.policy.block_batch_size) == 0
+                            || flat + 1 == total
+                        {
+                            events.progress(action, flat + 1, total, "block")?;
+                        }
                         continue;
                     }
                     let old_bbt_factory_bad =
@@ -832,10 +868,17 @@ mod linux {
                         );
                         save_state(state_file, &mut state)?;
                     }
+                    if (flat + 1) % u64::from(controller_recipe.policy.block_batch_size) == 0
+                        || flat + 1 == total
+                    {
+                        events.progress(action, flat + 1, total, "block")?;
+                    }
                 }
                 state.phase = "physical-enumeration-complete".into();
                 save_state(state_file, &mut state)?;
-                fields.extend(block_counts(&state));
+                let categories = block_counts(&state);
+                fields.extend(categories.clone());
+                fields.insert("categories".into(), Value::Object(categories));
                 fields.insert("total".into(), json!(total));
                 let fbb_count = state
                     .blocks
@@ -847,15 +890,38 @@ mod linux {
                     json!(state
                         .blocks
                         .iter()
-                        .filter(|block| block.disposition != BlockDisposition::FactoryBad)
+                        .filter(|block| matches!(
+                            block.disposition,
+                            BlockDisposition::HistoricalRuntimeBad
+                                | BlockDisposition::SystemRebuild
+                                | BlockDisposition::Data
+                                | BlockDisposition::Erased
+                                | BlockDisposition::Qualified
+                                | BlockDisposition::Quarantined
+                        ))
                         .count()),
                 );
                 fields.insert("fbb_count".into(), json!(fbb_count));
-                fields.insert("unknown".into(), json!(0));
+                fields.insert(
+                    "unknown".into(),
+                    json!(state
+                        .blocks
+                        .iter()
+                        .filter(|block| block.disposition == BlockDisposition::Unknown)
+                        .count()),
+                );
                 fields.insert("block_map_sha256".into(), json!(state_digest(&state)?));
                 fields.insert(
                     "per_block_format".into(),
-                    json!(["flat", "disposition_code"]),
+                    json!([
+                        "flat",
+                        "channel",
+                        "chip",
+                        "lun",
+                        "plane",
+                        "block",
+                        "disposition_code"
+                    ]),
                 );
                 fields.insert(
                     "per_block".into(),
@@ -863,8 +929,19 @@ mod linux {
                         state
                             .blocks
                             .iter()
-                            .map(|block| json!([block.flat, disposition_code(block.disposition)]))
-                            .collect(),
+                            .map(|block| {
+                                let coordinate = recipe::coordinate(block.flat, geometry)?;
+                                Ok(json!([
+                                    block.flat,
+                                    coordinate.channel,
+                                    coordinate.chip,
+                                    coordinate.lun,
+                                    coordinate.plane,
+                                    coordinate.block,
+                                    disposition_code(block.disposition)
+                                ]))
+                            })
+                            .collect::<Result<Vec<_>>>()?,
                     ),
                 );
             }
@@ -892,7 +969,7 @@ mod linux {
                     "normal" | "entry-command-pending"
                 ) {
                     if state.service_mode == "entry-command-pending" {
-                        let already_entered = if controller_recipe.family == "phison-ps2251"
+                        let already_entered = if controller_recipe.family == "phison-ufd"
                             && controller_recipe
                                 .policy
                                 .service_loader_artifact_id
@@ -1037,6 +1114,8 @@ mod linux {
                     controller_recipe,
                     artifacts,
                     CommandContext::default(),
+                    events,
+                    action,
                 )?;
                 if response_value(&status, "service_mode")? != 1 {
                     return Err(Error::Invalid(
@@ -1094,6 +1173,7 @@ mod linux {
                         geometry,
                         flat,
                         action,
+                        events,
                     ) {
                         Ok(true) => {
                             succeeded += 1;
@@ -1149,8 +1229,14 @@ mod linux {
                         Err(error) => return Err(error),
                     }
                     let block = &state.blocks[flat as usize];
+                    let coordinate = recipe::coordinate(flat, geometry)?;
                     per_block.push(json!([
                         flat,
+                        coordinate.channel,
+                        coordinate.chip,
+                        coordinate.lun,
+                        coordinate.plane,
+                        coordinate.block,
                         disposition_code(block.disposition),
                         block.erase_attempts,
                         block.failure.clone()
@@ -1161,6 +1247,16 @@ mod linux {
                             index / controller_recipe.policy.block_batch_size as usize
                         );
                         save_state(state_file, &mut state)?;
+                    }
+                    if (index + 1) % controller_recipe.policy.block_batch_size as usize == 0
+                        || index + 1 == targets.len()
+                    {
+                        events.progress(
+                            action,
+                            (index + 1) as u64,
+                            targets.len() as u64,
+                            "block",
+                        )?;
                     }
                 }
                 state.phase = format!("{action}-complete");
@@ -1178,10 +1274,24 @@ mod linux {
                 fields.insert("old_rbb_failed".into(), json!(historical_failed));
                 fields.insert("failed".into(), json!(failed));
                 fields.insert("errors".into(), json!(failed));
+                fields.insert(
+                    "status".into(),
+                    json!(if failed == 0 { "ok" } else { "partial" }),
+                );
                 fields.insert("block_map_sha256".into(), json!(state_digest(&state)?));
                 fields.insert(
                     "per_block_format".into(),
-                    json!(["flat", "disposition_code", "erase_attempts", "failure"]),
+                    json!([
+                        "flat",
+                        "channel",
+                        "chip",
+                        "lun",
+                        "plane",
+                        "block",
+                        "disposition_code",
+                        "erase_attempts",
+                        "failure"
+                    ]),
                 );
                 fields.insert("per_block".into(), Value::Array(per_block));
                 if action == "final-erase" {
@@ -1216,7 +1326,14 @@ mod linux {
                     }
                     let context = recipe::coordinate(flight.flat_block, geometry)?;
                     match ambiguous_transport(
-                        wait_controller_idle(file, controller_recipe, artifacts, context),
+                        wait_controller_idle(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            context,
+                            events,
+                            action,
+                        ),
                         "in-flight program-page status",
                     ) {
                         Ok(_) => {}
@@ -1261,6 +1378,7 @@ mod linux {
                             geometry,
                             flat,
                             "qualification-pattern-erase",
+                            events,
                         ) {
                             Ok(true) => {}
                             Ok(false) => {
@@ -1310,6 +1428,8 @@ mod linux {
                                         controller_recipe,
                                         artifacts,
                                         context,
+                                        events,
+                                        action,
                                     ),
                                     "program-page status",
                                 )
@@ -1394,6 +1514,16 @@ mod linux {
                         );
                         save_state(state_file, &mut state)?;
                     }
+                    if (index + 1) % controller_recipe.policy.block_batch_size as usize == 0
+                        || index + 1 == targets.len()
+                    {
+                        events.progress(
+                            action,
+                            (index + 1) as u64,
+                            targets.len() as u64,
+                            "block",
+                        )?;
+                    }
                 }
                 state.phase = "qualification-complete".into();
                 save_state(state_file, &mut state)?;
@@ -1428,6 +1558,11 @@ mod linux {
                     "per_block_format".into(),
                     json!([
                         "flat",
+                        "channel",
+                        "chip",
+                        "lun",
+                        "plane",
+                        "block",
                         "disposition_code",
                         "erase_attempts",
                         "corrected_bits",
@@ -1449,17 +1584,23 @@ mod linux {
                                 )
                             })
                             .map(|block| {
-                                json!([
+                                let coordinate = recipe::coordinate(block.flat, geometry)?;
+                                Ok(json!([
                                     block.flat,
+                                    coordinate.channel,
+                                    coordinate.chip,
+                                    coordinate.lun,
+                                    coordinate.plane,
+                                    coordinate.block,
                                     disposition_code(block.disposition),
                                     block.erase_attempts,
                                     block.corrected_bits,
                                     block.read_retries,
                                     block.read_latency_ms,
                                     block.failure.clone()
-                                ])
+                                ]))
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                     ),
                 );
             }
@@ -1490,6 +1631,8 @@ mod linux {
                     geometry,
                     physical_image.as_deref_mut(),
                     physical_map.as_deref_mut(),
+                    events,
+                    action,
                 )?;
                 if let Some(output) = physical_image.as_mut() {
                     output
@@ -1554,6 +1697,10 @@ mod linux {
                 fields.insert(
                     "target_uncorrectable_pages".into(),
                     json!(summary.target_uncorrectable_pages),
+                );
+                fields.insert(
+                    "excluded_unreadable_pages".into(),
+                    json!(summary.excluded_unreadable_pages),
                 );
                 fields.insert(
                     "target_non_erased_pages".into(),
@@ -1747,7 +1894,14 @@ mod linux {
                         "prepare-bbt command",
                     )?;
                     ambiguous_transport(
-                        wait_controller_idle(file, controller_recipe, artifacts, context),
+                        wait_controller_idle(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            context,
+                            events,
+                            action,
+                        ),
                         "prepare-bbt status",
                     )?;
                     state.phase = "bbt-prepared".into();
@@ -1772,7 +1926,14 @@ mod linux {
                         "prepare-ftl command",
                     )?;
                     ambiguous_transport(
-                        wait_controller_idle(file, controller_recipe, artifacts, context),
+                        wait_controller_idle(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            context,
+                            events,
+                            action,
+                        ),
                         "prepare-ftl status",
                     )?;
                     state.phase = "ftl-prepared".into();
@@ -1799,7 +1960,14 @@ mod linux {
                         "set-capacity command",
                     )?;
                     ambiguous_transport(
-                        wait_controller_idle(file, controller_recipe, artifacts, context),
+                        wait_controller_idle(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            context,
+                            events,
+                            action,
+                        ),
                         "set-capacity status",
                     )?;
                     state.phase = "capacity-set".into();
@@ -1813,7 +1981,14 @@ mod linux {
                     // the host lost its response. Query the signed generation
                     // before retrying the commit marker command.
                     ambiguous_transport(
-                        wait_controller_idle(file, controller_recipe, artifacts, context),
+                        wait_controller_idle(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            context,
+                            events,
+                            action,
+                        ),
                         "metadata pre-activation status",
                     )?;
                     let (_, current_commit) = execute_named(
@@ -1841,7 +2016,14 @@ mod linux {
                             "activate-metadata command",
                         )?;
                         ambiguous_transport(
-                            wait_controller_idle(file, controller_recipe, artifacts, context),
+                            wait_controller_idle(
+                                file,
+                                controller_recipe,
+                                artifacts,
+                                context,
+                                events,
+                                action,
+                            ),
                             "activate-metadata status",
                         )?;
                     }
@@ -1965,6 +2147,8 @@ mod linux {
                     controller_recipe,
                     artifacts,
                     CommandContext::default(),
+                    events,
+                    action,
                 )?;
                 if response_value(&status, "service_mode")? != 0 {
                     return Err(Error::Invalid(
@@ -1999,7 +2183,23 @@ mod linux {
                     None,
                 )?;
                 command_idle(&status)?;
-                fields.insert("capacity_stable".into(), json!(true));
+                let block_clone = block_file
+                    .try_clone()
+                    .map_err(|error| Error::io("clone controller block fd", Some(error)))?;
+                let mut logical = LbaDevice::from_fd(block_clone.into(), false)?;
+                let expected_blank = profile.logical_blank_value.ok_or_else(|| {
+                    Error::Invalid("controller profile has no logical blank value".into())
+                })?;
+                let logical_result = backend_common::postcheck_p2(
+                    &mut logical,
+                    events,
+                    "nclr-controller",
+                    Some(expected_blank),
+                )?;
+                let logical_fields = logical_result.as_object().ok_or_else(|| {
+                    Error::Invalid("controller logical postcheck result must be an object".into())
+                })?;
+                fields.extend(logical_fields.clone());
                 fields.insert(
                     "spare_ok".into(),
                     json!(state.spare_blocks >= u64::from(profile.capacity.minimum_spare_blocks)),
@@ -2157,42 +2357,66 @@ mod linux {
     fn vendor_identity(
         file: &std::fs::File,
         hint: Option<Family>,
+        standard_inquiry: &[u8],
+        attempted: &mut Vec<Value>,
     ) -> Result<Option<ControllerIdentity>> {
         let profiles = profile::load_identify_profiles(&[]);
-        let marker = match hint {
-            Some(family) => profiles
-                .iter()
-                .find(|p| p.family == family.as_str())
-                .and_then(|p| p.inquiry_marker.clone()),
-            None => profiles
-                .iter()
-                .find(|p| p.inquiry_marker.is_some())
-                .and_then(|p| p.inquiry_marker.clone()),
-        };
+        let mut marker = None;
+        for candidate in profiles.iter().filter(|profile| {
+            hint.is_none_or(|family| profile.family == family.as_str())
+                && profile.inquiry_marker.is_some()
+        }) {
+            let candidate = candidate
+                .inquiry_marker
+                .as_ref()
+                .expect("filtered marker exists");
+            if marker
+                .as_ref()
+                .is_some_and(|existing| existing != candidate)
+            {
+                return Err(Error::Invalid(
+                    "conflicting standard-INQUIRY marker profiles are installed".into(),
+                ));
+            }
+            marker = Some(candidate.clone());
+        }
         match hint {
+            Some(Family::UsbestUfd) => {
+                let marker = marker.ok_or_else(|| {
+                    Error::Invalid("USBest UT163 identification requires an inquiry marker".into())
+                })?;
+                Ok(Some(vendor::parse_inquiry_marker(
+                    standard_inquiry,
+                    &marker,
+                )?))
+            }
             Some(family) => vendor::identify_with(family, marker.as_ref(), |cdb, len| {
+                attempted.push(json!({
+                    "transport": "scsi",
+                    "cdb_hex": hex::encode(cdb),
+                    "direction": "from-device",
+                    "transfer_bytes": len,
+                    "source": "compiled-read-only-probe",
+                }));
                 scsi_command(file, cdb, scsi::SG_DXFER_FROM_DEV, len)
             }),
-            // No vendor-owned VID hint: fall back to controller signatures
-            // carried in the standard INQUIRY response. Only INQUIRY is
-            // issued (never an unknown vendor CDB), so a device that does
-            // not match simply answers harmlessly.
+            // No vendor-owned VID hint: inspect the controller signature in
+            // the standard INQUIRY response already obtained above. No
+            // additional command is sent.
             None => {
                 let Some(marker) = marker else {
                     return Ok(None);
                 };
-                let inquiry = scsi_command(
-                    file,
-                    &vendor::inquiry_cdb(marker.alloc_len),
-                    scsi::SG_DXFER_FROM_DEV,
-                    marker.alloc_len as usize,
-                )?;
-                match vendor::parse_inquiry_marker(&inquiry, &marker) {
+                match vendor::parse_inquiry_marker(standard_inquiry, &marker) {
                     Ok(identity) => Ok(Some(identity)),
                     Err(_) => Ok(None),
                 }
             }
         }
+    }
+
+    fn same_loaded_profile(left: &Profile, right: &Profile) -> bool {
+        left.id == right.id && left.sha256.is_some() && left.sha256 == right.sha256
     }
 
     /// Find the first production-trust profile that matches the device.
@@ -2233,6 +2457,9 @@ mod linux {
                 );
                 if p.destructive_allowed() && identity_matches {
                     if let Some(existing) = &found {
+                        if same_loaded_profile(existing, &p) {
+                            continue;
+                        }
                         return Err(Error::Invalid(format!(
                             "multiple production profiles match controller {controller_id} fw {firmware} NAND {}: {} and {}",
                             nand_id.unwrap_or("(any)"),
@@ -2270,6 +2497,15 @@ mod linux {
             .map_err(|_| Error::Invalid(format!("USB {field} is out of range")))
     }
 
+    fn usb_string_value<'a>(request: &'a Value, field: &str) -> Result<&'a str> {
+        request
+            .get("device")
+            .and_then(|device| device.get("usb"))
+            .and_then(|usb| usb.get(field))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid(format!("USB {field} is absent")))
+    }
+
     /// Select only the artifact set needed for a recipe-owned identity
     /// command. USB and INQUIRY data are not authorization; destructive use
     /// remains disabled until the recipe response is verified.
@@ -2281,6 +2517,9 @@ mod linux {
         let usb_vid = usb_hex_value(request, "vid", false)?;
         let usb_pid = usb_hex_value(request, "pid", false)?;
         let usb_bcd_device = usb_hex_value(request, "bcd_device", true)?;
+        let usb_manufacturer = usb_string_value(request, "manufacturer")?;
+        let usb_product = usb_string_value(request, "product")?;
+        let usb_serial = usb_string_value(request, "serial")?;
         let mut found: Option<Profile> = None;
         for dir in dirs {
             let entries = match std::fs::read_dir(dir) {
@@ -2311,6 +2550,9 @@ mod linux {
                         bootstrap.usb_vid == usb_vid
                             && bootstrap.usb_pid == usb_pid
                             && bootstrap.usb_bcd_device == usb_bcd_device
+                            && bootstrap.usb_manufacturer == usb_manufacturer
+                            && bootstrap.usb_product == usb_product
+                            && bootstrap.usb_serial == usb_serial
                             && bootstrap.scsi_vendor == inquiry.vendor_id
                             && bootstrap.scsi_product == inquiry.product_id
                             && bootstrap.scsi_revision == inquiry.product_rev
@@ -2319,8 +2561,11 @@ mod linux {
                     continue;
                 }
                 if let Some(existing) = &found {
+                    if same_loaded_profile(existing, &candidate) {
+                        continue;
+                    }
                     return Err(Error::Invalid(format!(
-                        "multiple production profiles match controller bootstrap tuple {:04x}:{:04x}:{:04x} {}/{}/{}: {} and {}",
+                        "multiple production profiles match the exact USB descriptor and SCSI bootstrap tuple {:04x}:{:04x}:{:04x} {}/{}/{}: {} and {}",
                         usb_vid,
                         usb_pid,
                         usb_bcd_device,
@@ -2408,6 +2653,9 @@ mod linux {
                     continue;
                 }
                 if let Some(existing) = &found {
+                    if same_loaded_profile(existing, &candidate) {
+                        continue;
+                    }
                     return Err(Error::Invalid(format!(
                         "runtime artifact roles match multiple production profiles: {} and {}",
                         existing.id, candidate.id
@@ -2419,29 +2667,6 @@ mod linux {
         Ok(found)
     }
 
-    fn recipe_family(family: Family) -> &'static str {
-        match family {
-            Family::PhisonPs2251 => "phison-ps2251",
-            Family::AlcorAu698x => "alcor-au698x",
-            Family::SiliconMotionUfd => "smi-sm32x",
-            Family::SandiskCruzer => "sandisk-cruzer",
-            // No recipe is documented for the USBest UT163 family; the
-            // string exists only to keep the mapping total and explicit.
-            Family::UsbestUt163 => "usbest-ut163",
-        }
-    }
-
-    fn family_from_recipe(value: &str) -> Option<Family> {
-        match value {
-            "phison-ps2251" => Some(Family::PhisonPs2251),
-            "alcor-au698x" => Some(Family::AlcorAu698x),
-            "smi-sm32x" => Some(Family::SiliconMotionUfd),
-            "sandisk-cruzer" => Some(Family::SandiskCruzer),
-            "usbest-ut163" => Some(Family::UsbestUt163),
-            _ => None,
-        }
-    }
-
     fn verify_recipe_hardware_identity(
         file: &std::fs::File,
         controller_recipe: &ControllerRecipe,
@@ -2449,7 +2674,7 @@ mod linux {
         profile: &Profile,
         detected: &ControllerIdentity,
     ) -> Result<String> {
-        if controller_recipe.family != recipe_family(detected.family)
+        if controller_recipe.family != detected.family.recipe_str()
             || detected.controller_id != profile.controller_id
             || profile.firmware.min.as_deref() != Some(detected.firmware.as_str())
         {
@@ -2497,7 +2722,7 @@ mod linux {
                 "runtime recipe family does not match the controller bootstrap profile".into(),
             ));
         }
-        let family = family_from_recipe(&bootstrap.family).ok_or_else(|| {
+        let family = vendor::family_from_recipe_str(&bootstrap.family).ok_or_else(|| {
             Error::Invalid("controller bootstrap family is not implemented".into())
         })?;
         let expected_controller = recipe::exact_controller_identity_bytes(controller_recipe)?;
@@ -2606,6 +2831,7 @@ mod linux {
             }
         };
         let op = invocation.op.as_str();
+        let mut events = BackendEvents::open(invocation.events_fd);
 
         let block_fd = unsafe { std::fs::File::from_raw_fd(FD_DEVICE) };
         // An sg fd (protocol fd 6) is only present when the core handed one
@@ -2690,7 +2916,7 @@ mod linux {
         let command_file = &sg_file;
 
         // Base identity via SCSI INQUIRY.
-        let scsi_inquiry = match scsi_identity(command_file) {
+        let (scsi_inquiry, standard_inquiry) = match scsi_identity(command_file) {
             Ok(v) => v,
             Err(e) => {
                 backend_common::respond_err("controller", &e);
@@ -2698,7 +2924,19 @@ mod linux {
         };
 
         let family_hint = usb_family_hint(&request);
-        let (detected, probe_error) = match vendor_identity(command_file, family_hint) {
+        let mut media_commands_sent = vec![json!({
+            "transport": "scsi",
+            "cdb_hex": hex::encode(scsi::cdb_inquiry(false, 0, 96)),
+            "direction": "from-device",
+            "transfer_bytes": 96,
+            "source": "standard-inquiry",
+        })];
+        let (detected, probe_error) = match vendor_identity(
+            command_file,
+            family_hint,
+            &standard_inquiry,
+            &mut media_commands_sent,
+        ) {
             Ok(v) => (v, None),
             Err(e) => (None, Some(e.to_string())),
         };
@@ -2779,7 +3017,7 @@ mod linux {
         let bootstrap_family = matched_by_bootstrap
             .as_ref()
             .and_then(|profile| profile.controller_bootstrap.as_ref())
-            .and_then(|bootstrap| family_from_recipe(&bootstrap.family));
+            .and_then(|bootstrap| vendor::family_from_recipe_str(&bootstrap.family));
         if detected
             .as_ref()
             .zip(bootstrap_family)
@@ -2803,7 +3041,8 @@ mod linux {
         let support = detected
             .as_ref()
             .map(|identity| vendor::support(identity.family))
-            .or_else(|| bootstrap_family.map(vendor::support));
+            .or_else(|| bootstrap_family.map(vendor::support))
+            .or_else(|| family_hint.map(vendor::support));
         let profile_id = matched.as_ref().map(|p| p.id.clone());
         let rebuilds = matched
             .as_ref()
@@ -2866,12 +3105,18 @@ mod linux {
                 .find(|artifact| artifact.kind == nclr::artifact::ArtifactKind::ProtocolRecipe)
                 .map(|artifact| (profile, artifact))
         });
+        // Profile validation already requires exactly one runtime recipe for
+        // every real production tuple. Keep the execution boundary explicit
+        // here as well: a future profile-format regression must not turn a
+        // tuple with no executable protocol description into a C3/C4 plan.
+        let runtime_recipe_declared = recipe_spec.is_some();
         let recipe_sha256 = recipe_spec.as_ref().map(|(_, spec)| {
             spec.sha256
                 .trim_start_matches("sha256:")
                 .to_ascii_lowercase()
         });
         let mut loaded_recipe: Option<ControllerRecipe> = None;
+        let mut recipe_artifact_error = None;
         if let Some((profile, spec)) = recipe_spec {
             let role = format!("artifact:{}", spec.id);
             let file = artifact_files
@@ -2892,11 +3137,11 @@ mod linux {
                     Ok(value) => loaded_recipe = Some(value),
                     Err(e) => backend_common::respond_err("controller", &e),
                 },
-                // A recipe file is optional at probe/plan time: its absence
-                // or unreadability only degrades the plan hints, never the
-                // probe identity, so the error is intentionally dropped.
+                // A recipe file is optional at probe/plan time. Its absence
+                // is reported explicitly while the immutable requirement is
+                // still advertised for a later run.
                 Err(e) if matches!(op, "probe" | "plan") => {
-                    let _ = e;
+                    recipe_artifact_error = Some(e.to_string());
                 }
                 Err(e) => backend_common::respond_err("controller", &e),
             }
@@ -3030,7 +3275,38 @@ mod linux {
         // required runtime artifact inherited and verified; destructive
         // operations still use `executable_profile` exclusively.
         let advertised_profile = executable_profile
-            || (op == "probe" && matched.is_some() && (detected.is_some() || bootstrap_selected));
+            || (op == "probe"
+                && runtime_recipe_declared
+                && matched.is_some()
+                && (detected.is_some() || bootstrap_selected));
+        let recipe_family_candidates = family_hint.map_or_else(
+            || {
+                Family::ALL
+                    .iter()
+                    .copied()
+                    .filter(|family| vendor::support(*family).recipe_engine)
+                    .map(Family::recipe_str)
+                    .collect::<Vec<_>>()
+            },
+            |family| vec![family.recipe_str()],
+        );
+        let missing_for_production = if executable_profile {
+            Vec::<&str>::new()
+        } else if matched.is_some() {
+            vec![
+                "authenticated runtime artifacts",
+                "recipe-owned identity response",
+            ]
+        } else {
+            vec![
+                "exact controller identity response",
+                "exact NAND identity and geometry",
+                "successful and failing factory-tool protocol traces",
+                "service transition and runtime loader artifacts",
+                "BBT, FTL, spare and commit metadata layouts",
+                "independent HIL qualification and power-cut evidence",
+            ]
+        };
 
         if op != "probe" && artifact_files.len() != runtime_artifacts.len() {
             backend_common::respond_err(
@@ -3051,18 +3327,21 @@ mod linux {
                     // advertising them would create an executable plan that
                     // fails only after confirmation.
                     let mut caps: Vec<String> = Vec::new();
-                    if support.as_ref().is_some_and(|s| s.identify) {
+                    if detected.is_some() && support.as_ref().is_some_and(|s| s.identify) {
                         caps.push("CONTROLLER_IDENTIFY".into());
                     }
-                    if support.as_ref().is_some_and(|s| s.nand_identify) {
+                    if detected.is_some() && support.as_ref().is_some_and(|s| s.nand_identify) {
                         caps.push("NAND_IDENTIFY".into());
                     }
-                    if support.as_ref().is_some_and(|s| s.service_entry_documented) {
+                    if detected.is_some()
+                        && support.as_ref().is_some_and(|s| s.service_entry_documented)
+                    {
                         caps.push("DOCUMENTED_SERVICE_MODE_ENTRY".into());
                     }
-                    if support
-                        .as_ref()
-                        .is_some_and(|s| s.volatile_loader_documented)
+                    if detected.is_some()
+                        && support
+                            .as_ref()
+                            .is_some_and(|s| s.volatile_loader_documented)
                     {
                         caps.push("DOCUMENTED_VOLATILE_SERVICE_LOADER".into());
                     }
@@ -3074,13 +3353,47 @@ mod linux {
                         "version": VERSION,
                         "capabilities": caps,
                         "grade_ceiling": if advertised_profile { matched.as_ref().and_then(|profile| profile.certification.as_deref()).unwrap_or("C3") } else { "C0" },
+                        "erase_coverage": [],
+                        "erase_method": Value::Null,
+                        "rebuilds": [],
+                        "controller_profile": Value::Null,
+                        "profile_sha256": Value::Null,
+                        "capacity_policy": Value::Null,
+                        "protected_area_bytes": matched
+                            .as_ref()
+                            .and_then(|profile| profile.protected_area_bytes)
+                            .unwrap_or(0),
+                        "certification": Value::Null,
+                        "artifacts": [],
                         "family_hint": family_hint.map(Family::as_str),
                         "family_support": support,
                         "probe_error": probe_error,
+                        "recipe_artifact_error": recipe_artifact_error,
                         "scsi": {
                             "vendor": scsi_inquiry.vendor_id,
                             "product": scsi_inquiry.product_id,
                             "revision": scsi_inquiry.product_rev,
+                        },
+                        "controller_research": {
+                            "schema": 1,
+                            "selection": if bootstrap_selected { "exact-bootstrap" } else if detected.is_some() { "signed-built-in-identity" } else if family_hint.is_some() { "vendor-id-candidate-only" } else { "undetermined" },
+                            "recipe_family_candidates": recipe_family_candidates,
+                            "exact_bootstrap_observed": {
+                                "family": family_hint.map(Family::recipe_str),
+                                "usb_vid": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("vid")).cloned().unwrap_or(Value::Null),
+                                "usb_pid": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("pid")).cloned().unwrap_or(Value::Null),
+                                "usb_bcd_device": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("bcd_device")).cloned().unwrap_or(Value::Null),
+                                "usb_manufacturer": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("manufacturer")).cloned().unwrap_or(Value::Null),
+                                "usb_product": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("product")).cloned().unwrap_or(Value::Null),
+                                "usb_serial": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("serial")).cloned().unwrap_or(Value::Null),
+                                "scsi_vendor": scsi_inquiry.vendor_id,
+                                "scsi_product": scsi_inquiry.product_id,
+                                "scsi_revision": scsi_inquiry.product_rev,
+                            },
+                            "identity_source": "scsi-sg-io",
+                            "media_commands_sent": media_commands_sent,
+                            "unknown_vendor_commands_sent": false,
+                            "missing_for_production": missing_for_production,
                         },
                         "device": {
                             "controller_id": controller_id,
@@ -3134,8 +3447,14 @@ mod linux {
                             .as_ref()
                             .and_then(|profile| profile.certification.as_deref())
                             .unwrap_or("C3");
+                        if certification == "C4" {
+                            caps.push("PHYSICAL_SCOPE".into());
+                            v["capabilities"] = json!(caps);
+                        }
                         v["grade_ceiling"] = json!(certification);
+                        v["certification"] = json!(certification);
                         v["physical_certified"] = json!(certification == "C4");
+                        v["erase_method"] = json!("controller-physical-block-erase-and-rebuild");
                         v["erase_coverage"] =
                             json!(matched.as_ref().map(|profile| &profile.coverage));
                     }
@@ -3164,6 +3483,18 @@ mod linux {
                             "controller action plan_hash is invalid".into(),
                         ));
                     }
+                    let profile = matched.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller profile disappeared".into())
+                    })?;
+                    let controller_recipe = loaded_recipe.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller recipe disappeared".into())
+                    })?;
+                    let recipe_digest = recipe_sha256.as_deref().ok_or_else(|| {
+                        Error::Invalid("executable controller recipe digest disappeared".into())
+                    })?;
+                    let controller_state = state_file.as_mut().ok_or_else(|| {
+                        Error::Invalid("executable controller state fd disappeared".into())
+                    })?;
                     execute_action(
                         action,
                         plan_hash,
@@ -3172,22 +3503,35 @@ mod linux {
                             .and_then(|value| value.get("nonce"))
                             .and_then(|value| value.as_str()),
                         command_file,
-                        matched.as_ref().expect("executable profile"),
-                        loaded_recipe.as_ref().expect("executable recipe"),
-                        recipe_sha256.as_deref().expect("recipe digest"),
+                        &block_fd,
+                        profile,
+                        controller_recipe,
+                        recipe_digest,
                         &mut artifact_files,
-                        state_file.as_mut().expect("controller state fd"),
+                        controller_state,
                         physical_image.as_mut(),
                         physical_map.as_mut(),
+                        &mut events,
                     )
                 }
-                "status" if executable_profile => controller_status(
-                    command_file,
-                    matched.as_ref().expect("executable profile"),
-                    loaded_recipe.as_ref().expect("executable recipe"),
-                    &mut artifact_files,
-                    state_file.as_mut().expect("controller state fd"),
-                ),
+                "status" if executable_profile => {
+                    let profile = matched.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller profile disappeared".into())
+                    })?;
+                    let controller_recipe = loaded_recipe.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller recipe disappeared".into())
+                    })?;
+                    let controller_state = state_file.as_mut().ok_or_else(|| {
+                        Error::Invalid("executable controller state fd disappeared".into())
+                    })?;
+                    controller_status(
+                        command_file,
+                        profile,
+                        controller_recipe,
+                        &mut artifact_files,
+                        controller_state,
+                    )
+                }
                 "status" => Ok(json!({
                     "api": PROTOCOL_API,
                     "ok": true,
@@ -3202,12 +3546,21 @@ mod linux {
                             "controller recovery requires an executable production profile".into(),
                         ));
                     }
+                    let profile = matched.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller profile disappeared".into())
+                    })?;
+                    let controller_recipe = loaded_recipe.as_ref().ok_or_else(|| {
+                        Error::Invalid("executable controller recipe disappeared".into())
+                    })?;
+                    let controller_state = state_file.as_mut().ok_or_else(|| {
+                        Error::Invalid("executable controller state fd disappeared".into())
+                    })?;
                     recover_controller(
                         command_file,
-                        matched.as_ref().expect("executable profile"),
-                        loaded_recipe.as_ref().expect("executable recipe"),
+                        profile,
+                        controller_recipe,
                         &mut artifact_files,
-                        state_file.as_mut().expect("controller state fd"),
+                        controller_state,
                     )
                 }
                 other => Err(Error::Usage(format!("unknown controller op: {other}"))),

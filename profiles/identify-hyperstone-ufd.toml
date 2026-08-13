@@ -1,0 +1,7 @@
+# Candidate-only profile: Hyperstone U8/U9 industrial UFD controllers.
+# Exact controller firmware and NAND organization must come from a signed
+# recipe; the vendor-owned VID sends no implicit command.
+schema = 1
+id = "hyperstone-ufd"
+family = "hyperstone-ufd"
+usb_vid_hints = [0x1951]

@@ -264,7 +264,106 @@ fn sample_read(dev: &mut SimDevice, events: &mut BackendEvents) -> Result<serde_
         }
         events.note("sample-read", &format!("lba {start} of {sectors}"))?;
     }
-    Ok(json!({ "samples": samples, "sectors": sectors }))
+    let status = if samples.iter().any(|sample| sample.get("error").is_some()) {
+        "error"
+    } else {
+        "ok"
+    };
+    Ok(json!({ "status": status, "samples": samples, "sectors": sectors }))
+}
+
+/// Full logical blank sweep used both before and after the power cycle.
+fn blank_verify(dev: &mut SimDevice, events: &mut BackendEvents) -> Result<serde_json::Value> {
+    let capacity = dev.capacity_bytes();
+    let mut errors = 0u64;
+    let mut read_errors = 0u64;
+    let mut uniform = true;
+    let mut value: Option<u8> = None;
+    let total = capacity.div_ceil(SECTOR);
+    let mut done = 0u64;
+    let mut buf = vec![0u8; SECTOR as usize];
+    let mut off = 0u64;
+    while off < capacity {
+        if let Err(e) = sim_read(dev, off, SECTOR as usize, &mut buf) {
+            errors += 1;
+            read_errors += 1;
+            eprintln!("nclr-sim: blank read at LBA {}: {e}", off / SECTOR);
+        } else {
+            let current = buf[0];
+            if !(current == 0x00 || current == nclr::sim::BLANK_VALUE) {
+                uniform = false;
+            }
+            if let Some(previous) = value {
+                if previous != current {
+                    uniform = false;
+                    errors += 1;
+                }
+            } else {
+                value = Some(current);
+            }
+            if buf.iter().any(|byte| *byte != current) {
+                uniform = false;
+                errors += 1;
+            }
+        }
+        off += SECTOR;
+        done += 1;
+        if done.is_multiple_of(256) || off >= capacity {
+            events.progress("blank-verify", done, total, "sector")?;
+        }
+    }
+    Ok(json!({
+        "status": if errors == 0 && uniform { "ok" } else { "error" },
+        "errors": errors,
+        "read_errors": read_errors,
+        "uniform": uniform,
+        "value": value.map(|value| format!("0x{value:02x}")),
+    }))
+}
+
+/// Full P2 logical postcheck after the simulated power cycle.
+fn postcheck_p2(
+    dev: &mut SimDevice,
+    events: &mut BackendEvents,
+    expected_blank: u8,
+) -> Result<serde_json::Value> {
+    dev.refresh_capacity()?;
+    let sweep = blank_verify(dev, events)?;
+    let errors = sweep.get("errors").and_then(Value::as_u64).unwrap_or(1);
+    let read_errors = sweep
+        .get("read_errors")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let uniform = sweep
+        .get("uniform")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let value = sweep.get("value").and_then(Value::as_str);
+    let expected = format!("0x{expected_blank:02x}");
+    let blank_verified = errors == 0 && uniform && value == Some(expected.as_str());
+    let found = signature_check(dev)?;
+    let signature_free = found.is_empty();
+    let flush_started = std::time::Instant::now();
+    dev.flush()?;
+    let flush_latency_ms = flush_started.elapsed().as_millis() as u64;
+    let ok = read_errors == 0 && blank_verified && signature_free;
+    Ok(json!({
+        "status": if ok { "ok" } else { "error" },
+        "errors": errors + u64::from(!signature_free),
+        "read_errors": read_errors,
+        "all_reads_ok": read_errors == 0,
+        "blank_verified": blank_verified,
+        "blank_value": value,
+        "expected_blank_value": expected,
+        "signature_free": signature_free,
+        "found": found,
+        "flush_ok": true,
+        "flush_latency_ms": flush_latency_ms,
+        "capacity_bytes": dev.capacity_bytes(),
+        "logical_block_size": nclr::lba::SECTOR,
+        "capacity_stable": true,
+        "power_cycles": dev.power_cycles(),
+    }))
 }
 
 /// Block-level evidence record (spec §1331): physical coordinates,
@@ -394,56 +493,9 @@ fn dispatch(
                 "sanitize_state": dev.sanitize_state(),
             }))
         }
-        "blank-verify" => {
-            // Full LBA sweep must read as a single uniform value in {0x00, 0xFF}.
-            let capacity = dev.capacity_bytes();
-            let mut errors = 0u64;
-            let mut uniform = true;
-            let mut value: Option<u8> = None;
-            let total = capacity.div_ceil(SECTOR);
-            let mut done = 0u64;
-            let mut buf = vec![0u8; SECTOR as usize];
-            let mut off = 0u64;
-            while off < capacity {
-                if let Err(e) = sim_read(dev, off, SECTOR as usize, &mut buf) {
-                    errors += 1;
-                    eprintln!("nclr-sim: blank read at LBA {}: {e}", off / SECTOR);
-                } else {
-                    let v = buf[0];
-                    if !(v == 0x00 || v == nclr::sim::BLANK_VALUE) {
-                        uniform = false;
-                    }
-                    // A single uniform value must hold across the whole
-                    // logical space (mirrors backend_common::blank_verify).
-                    if let Some(prev) = value {
-                        if prev != v {
-                            uniform = false;
-                            errors += 1;
-                        }
-                    } else {
-                        value = Some(v);
-                    }
-                    if buf.iter().any(|b| *b != v) {
-                        uniform = false;
-                        errors += 1;
-                    }
-                }
-                off += SECTOR;
-                done += 1;
-                if done.is_multiple_of(256) || off >= capacity {
-                    events.progress("blank-verify", done, total, "sector")?;
-                }
-            }
-            Ok(json!({
-                "status": if errors == 0 && uniform { "ok" } else { "error" },
-                "errors": errors,
-                "uniform": uniform,
-                "value": value.map(|v| format!("0x{v:02x}")),
-            }))
-        }
+        "blank-verify" => blank_verify(dev, events),
         "postcheck-p2" => {
-            dev.refresh_capacity()?;
-            let sample = sample_read(dev, events)?;
+            let mut result = postcheck_p2(dev, events, nclr::sim::BLANK_VALUE)?;
             // Physical sample outside the LBA window (OP/D2 region) must be
             // blank after a device erase.
             let mut phys = [0u8; 512];
@@ -461,16 +513,17 @@ fn dispatch(
             } else {
                 false
             };
-            Ok(json!({
-                "status": "ok",
-                "capacity_bytes": dev.capacity_bytes(),
-                "logical_block_size": nclr::lba::SECTOR,
-                "capacity_stable": true,
-                "power_cycles": dev.power_cycles(),
-                "sanitize_state": dev.sanitize_state(),
-                "d2_blank": d2_blank,
-                "sample": sample,
-            }))
+            let object = result
+                .as_object_mut()
+                .ok_or_else(|| Error::Invalid("sim postcheck result must be an object".into()))?;
+            object.insert("sanitize_state".into(), json!(dev.sanitize_state()));
+            object.insert("d2_blank".into(), json!(d2_blank));
+            if !d2_blank {
+                object.insert("status".into(), json!("error"));
+                let errors = object.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                object.insert("errors".into(), json!(errors.saturating_add(1)));
+            }
+            Ok(result)
         }
         "sample-read" => sample_read(dev, events),
         "vendor-health" => {
@@ -498,9 +551,13 @@ fn dispatch(
         // --- Controller reinitialization (C3) -------------------------------
         "capture-old-bbt" => {
             let (generation, fbb, rbb) = dev.old_bbt();
+            let old_bbt = serde_json::to_vec(&(generation, &fbb, &rbb))
+                .map_err(|error| Error::Invalid(format!("serialize old BBT: {error}")))?;
             Ok(json!({
                 "status": "ok",
                 "generation": generation,
+                "old_bbt_digest": hex::encode(sha2::Sha256::digest(&old_bbt)),
+                "old_bbt_copies": 1,
                 "fbb": fbb,
                 "old_rbb": rbb,
                 "old_rbb_count": rbb.len(),
@@ -592,6 +649,7 @@ fn dispatch(
                 "status": "ok",
                 "bbt_generation": dev.bbt_generation(),
                 "ftl_generation": dev.ftl_generation(),
+                "old_mapping_invalidated": true,
                 "user_blocks": user,
                 "spare_blocks": spare,
                 "capacity_reduced": reduced,
@@ -622,19 +680,26 @@ fn dispatch(
             }))
         }
         "postcheck-c3" => {
-            let sample = sample_read(dev, events)?;
+            let expected_blank = sim_profile(dev).logical_blank_value.ok_or_else(|| {
+                Error::Invalid("sim controller profile has no logical blank value".into())
+            })?;
+            let mut result = postcheck_p2(dev, events, expected_blank)?;
             let (_, _, rbb) = dev.old_bbt();
             let in_service = dev.service_mode();
-            Ok(json!({
-                "status": if in_service { "error" } else { "ok" },
-                "capacity_stable": true,
-                "spare_ok": dev.capacity_bytes() > 0,
-                "service_mode": in_service,
-                "bbt_generation": dev.bbt_generation(),
-                "ftl_generation": dev.ftl_generation(),
-                "old_rbb_quarantined": rbb.len(),
-                "sample": sample,
-            }))
+            let object = result
+                .as_object_mut()
+                .ok_or_else(|| Error::Invalid("sim postcheck result must be an object".into()))?;
+            object.insert("spare_ok".into(), json!(dev.capacity_bytes() > 0));
+            object.insert("service_mode".into(), json!(in_service));
+            object.insert("bbt_generation".into(), json!(dev.bbt_generation()));
+            object.insert("ftl_generation".into(), json!(dev.ftl_generation()));
+            object.insert("old_rbb_quarantined".into(), json!(rbb.len()));
+            if in_service {
+                object.insert("status".into(), json!("error"));
+                let errors = object.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                object.insert("errors".into(), json!(errors.saturating_add(1)));
+            }
+            Ok(result)
         }
         // --- Certified physical scope (C4) ---------------------------------
         "enumerate-blocks" => {
@@ -712,6 +777,11 @@ fn dispatch(
             let summary = nclr::physical::sweep_physical_pages(
                 nclr::physical::SweepGeometry {
                     blocks: u64::from(info.blocks),
+                    channels: 1,
+                    chips_per_channel: 1,
+                    luns_per_chip: 1,
+                    planes_per_lun: 1,
+                    blocks_per_lun: info.blocks,
                     pages_per_block: info.pages_per_block,
                     page_bytes: info.page_bytes,
                     oob_bytes: 0,
@@ -732,6 +802,7 @@ fn dispatch(
                         metrics: nclr::physical::PageMetrics::default(),
                     })
                 },
+                |done, total| events.progress(action, done, total, "page"),
             )?;
             if let Some(output) = physical_image.as_mut() {
                 output
@@ -792,6 +863,7 @@ fn dispatch(
                "target_readable_pages": summary.target_readable_pages,
                "target_unreadable_pages": summary.target_unreadable_pages,
                "target_uncorrectable_pages": summary.target_uncorrectable_pages,
+               "excluded_unreadable_pages": summary.excluded_unreadable_pages,
                "target_non_erased_pages": summary.target_non_erased_pages,
                "target_non_erased_bytes": summary.target_non_erased_bytes,
                "excluded_non_erased_pages": summary.excluded_non_erased_pages,
@@ -812,6 +884,13 @@ fn dispatch(
                         // Per-block page/OOB sweep summary (spec §1331).
                         json!({
                             "block": block.flat_block,
+                            "physical_coordinate": {
+                                "channel": block.channel,
+                                "chip": block.chip,
+                                "lun": block.lun,
+                                "plane": block.plane,
+                                "block": block.block,
+                            },
                             "disposition": block.disposition,
                             "pages": block.pages,
                             "readable_pages": block.readable_pages,
@@ -828,20 +907,27 @@ fn dispatch(
             }))
         }
         "postcheck-c4" => {
-            let sample = sample_read(dev, events)?;
+            let expected_blank = sim_profile(dev).logical_blank_value.ok_or_else(|| {
+                Error::Invalid("sim controller profile has no logical blank value".into())
+            })?;
+            let mut result = postcheck_p2(dev, events, expected_blank)?;
             let entries = dev.enumerate_blocks();
             let unknown = entries.iter().filter(|(_, c)| *c == "unknown").count() as u64;
             let in_service = dev.service_mode();
-            Ok(json!({
-                "status": if in_service { "error" } else { "ok" },
-                "capacity_stable": true,
-                "spare_ok": dev.capacity_bytes() > 0,
-                "service_mode": in_service,
-                "unknown_reservation": unknown,
-                "bbt_generation": dev.bbt_generation(),
-                "ftl_generation": dev.ftl_generation(),
-                "sample": sample,
-            }))
+            let object = result
+                .as_object_mut()
+                .ok_or_else(|| Error::Invalid("sim postcheck result must be an object".into()))?;
+            object.insert("spare_ok".into(), json!(dev.capacity_bytes() > 0));
+            object.insert("service_mode".into(), json!(in_service));
+            object.insert("unknown_reservation".into(), json!(unknown));
+            object.insert("bbt_generation".into(), json!(dev.bbt_generation()));
+            object.insert("ftl_generation".into(), json!(dev.ftl_generation()));
+            if in_service {
+                object.insert("status".into(), json!("error"));
+                let errors = object.get("errors").and_then(Value::as_u64).unwrap_or(0);
+                object.insert("errors".into(), json!(errors.saturating_add(1)));
+            }
+            Ok(result)
         }
         "scratch-test" => {
             let params = params
@@ -953,6 +1039,13 @@ fn op_status(dev: &mut SimDevice, events: &mut BackendEvents) -> Result<serde_js
     });
     if dev.sanitize_available() {
         let state = dev.sanitize_state();
+        v["state"] = json!(if state == nclr::sim::SANITIZE_IN_PROGRESS {
+            "in-progress"
+        } else if state == nclr::sim::SANITIZE_FAILED {
+            "failed"
+        } else {
+            "ready"
+        });
         v["sanitize"] = json!({
             "state": state,
             "started": state != nclr::sim::SANITIZE_IDLE,
@@ -1044,7 +1137,15 @@ fn main() {
                 "profile": format!("sim-{}", dev.info().id),
                 "capabilities": capabilities,
                 "grade_ceiling": ceiling,
+                "erase_coverage": [],
+                "erase_method": Value::Null,
+                "rebuilds": [],
+                "controller_profile": Value::Null,
+                "profile_sha256": Value::Null,
+                "capacity_policy": Value::Null,
                 "protected_area_bytes": protected_area_bytes,
+                "certification": Value::Null,
+                "artifacts": [],
                 "pe_cycles": pe_cycles,
                 "device": {
                     "sim": dev.info(),
@@ -1155,6 +1256,7 @@ fn main() {
                     "api": PROTOCOL_API,
                     "ok": true,
                     "backend": "sim",
+                    "version": VERSION,
                     "state": "ready",
                     "recovery": recovery,
                     "automated": true,

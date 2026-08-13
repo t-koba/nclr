@@ -1,0 +1,7 @@
+# Candidate-only identification profile: AppoTech DM82xx UFD.
+# This vendor-owned VID selects no command; many OEM devices use unrelated
+# VIDs and therefore remain undetermined until an exact production bootstrap.
+schema = 1
+id = "appotech-ufd"
+family = "appotech-ufd"
+usb_vid_hints = [0x1908]

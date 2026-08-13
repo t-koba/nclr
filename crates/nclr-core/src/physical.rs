@@ -59,6 +59,11 @@ impl PhysicalDisposition {
 #[serde(deny_unknown_fields)]
 pub struct SweepGeometry {
     pub blocks: u64,
+    pub channels: u32,
+    pub chips_per_channel: u32,
+    pub luns_per_chip: u32,
+    pub planes_per_lun: u32,
+    pub blocks_per_lun: u32,
     pub pages_per_block: u32,
     pub page_bytes: u32,
     pub oob_bytes: u32,
@@ -85,11 +90,47 @@ impl SweepGeometry {
             .ok_or_else(|| Error::Invalid("physical image size overflow".into()))
     }
 
+    fn page_geometry(self, flat_block: u64, page: u32) -> Result<PhysicalPageGeometry> {
+        if flat_block >= self.blocks || page >= self.pages_per_block {
+            return Err(Error::Invalid(
+                "physical page coordinate is outside sweep geometry".into(),
+            ));
+        }
+        let blocks_per_lun = u64::from(self.blocks_per_lun);
+        let luns_per_chip = u64::from(self.luns_per_chip);
+        let chips_per_channel = u64::from(self.chips_per_channel);
+        let block = flat_block % blocks_per_lun;
+        let mut upper = flat_block / blocks_per_lun;
+        let lun = upper % luns_per_chip;
+        upper /= luns_per_chip;
+        let chip = upper % chips_per_channel;
+        let channel = upper / chips_per_channel;
+        Ok(PhysicalPageGeometry {
+            channel,
+            chip,
+            lun,
+            plane: block % u64::from(self.planes_per_lun),
+            block,
+            page,
+        })
+    }
+
     fn validate(self, dispositions: &[PhysicalDisposition]) -> Result<()> {
+        let topology_blocks = u64::from(self.channels)
+            .checked_mul(u64::from(self.chips_per_channel))
+            .and_then(|value| value.checked_mul(u64::from(self.luns_per_chip)))
+            .and_then(|value| value.checked_mul(u64::from(self.blocks_per_lun)));
         if self.blocks == 0
+            || self.channels == 0
+            || self.chips_per_channel == 0
+            || self.luns_per_chip == 0
+            || self.planes_per_lun == 0
+            || self.blocks_per_lun == 0
+            || !self.blocks_per_lun.is_multiple_of(self.planes_per_lun)
             || self.pages_per_block == 0
             || self.page_bytes == 0
             || self.blocks != dispositions.len() as u64
+            || topology_blocks != Some(self.blocks)
         {
             return Err(Error::Invalid(
                 "physical sweep geometry or disposition count is invalid".into(),
@@ -99,6 +140,17 @@ impl SweepGeometry {
         self.image_bytes()?;
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalPageGeometry {
+    pub channel: u64,
+    pub chip: u64,
+    pub lun: u64,
+    pub plane: u64,
+    pub block: u64,
+    pub page: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,6 +171,11 @@ pub struct PageRead {
 #[serde(deny_unknown_fields)]
 pub struct BlockSweepSummary {
     pub flat_block: u64,
+    pub channel: u64,
+    pub chip: u64,
+    pub lun: u64,
+    pub plane: u64,
+    pub block: u64,
     pub disposition: PhysicalDisposition,
     pub pages: u64,
     pub readable_pages: u64,
@@ -143,6 +200,7 @@ pub struct SweepSummary {
     pub target_readable_pages: u64,
     pub target_unreadable_pages: u64,
     pub target_uncorrectable_pages: u64,
+    pub excluded_unreadable_pages: u64,
     pub target_non_erased_pages: u64,
     pub target_non_erased_bytes: u64,
     pub excluded_non_erased_pages: u64,
@@ -173,11 +231,14 @@ struct MapPage<'a> {
     record: &'static str,
     flat_block: u64,
     page: u32,
+    geometry: PhysicalPageGeometry,
     disposition: PhysicalDisposition,
     expected_erased: bool,
     image_offset: u64,
-    length: usize,
-    status: &'static str,
+    data_length: u32,
+    oob_length: u32,
+    read_status: &'static str,
+    ecc_status: &'static str,
     sha256: Option<String>,
     non_erased_bytes: Option<u64>,
     corrected_bits: Option<u64>,
@@ -222,6 +283,7 @@ pub fn sweep_physical_pages(
     mut image: Option<&mut dyn WriteSeek>,
     mut map: Option<&mut dyn Write>,
     mut read_page: impl FnMut(u64, u32) -> Result<PageRead>,
+    mut progress: impl FnMut(u64, u64) -> Result<()>,
 ) -> Result<SweepSummary> {
     geometry.validate(dispositions)?;
     if image.is_some() != map.is_some() {
@@ -230,6 +292,7 @@ pub fn sweep_physical_pages(
         ));
     }
     let page_stride = geometry.page_stride()?;
+    let total_pages = geometry.total_pages()?;
     let image_bytes = geometry.image_bytes()?;
     if let Some(writer) = image.as_mut() {
         if writer
@@ -270,17 +333,26 @@ pub fn sweep_physical_pages(
     let mut target_readable_pages = 0u64;
     let mut target_unreadable_pages = 0u64;
     let mut target_uncorrectable_pages = 0u64;
+    let mut excluded_unreadable_pages = 0u64;
     let mut target_non_erased_pages = 0u64;
     let mut target_non_erased_bytes = 0u64;
     let mut excluded_non_erased_pages = 0u64;
     let zero_fill = vec![0u8; page_stride];
     let mut blocks = Vec::with_capacity(dispositions.len());
+    let mut completed_pages = 0u64;
+    let mut last_progress = std::time::Instant::now();
 
     for (flat_index, disposition) in dispositions.iter().copied().enumerate() {
         let flat = flat_index as u64;
         let expected_erased = disposition.expected_erased();
+        let block_geometry = geometry.page_geometry(flat, 0)?;
         let mut block = BlockSweepSummary {
             flat_block: flat,
+            channel: block_geometry.channel,
+            chip: block_geometry.chip,
+            lun: block_geometry.lun,
+            plane: block_geometry.plane,
+            block: block_geometry.block,
             disposition,
             pages: u64::from(geometry.pages_per_block),
             ..BlockSweepSummary::default()
@@ -289,6 +361,7 @@ pub fn sweep_physical_pages(
             target_pages = target_pages.saturating_add(u64::from(geometry.pages_per_block));
         }
         for page in 0..geometry.pages_per_block {
+            let page_geometry = geometry.page_geometry(flat, page)?;
             if crate::signal::requested() {
                 return Err(Error::Interrupted(
                     "physical page sweep was interrupted".into(),
@@ -370,14 +443,17 @@ pub fn sweep_physical_pages(
                                 record: "page",
                                 flat_block: flat,
                                 page,
+                                geometry: page_geometry,
                                 disposition,
                                 expected_erased,
                                 image_offset: offset,
-                                length: page_stride,
-                                status: if read.metrics.uncorrectable {
+                                data_length: geometry.page_bytes,
+                                oob_length: geometry.oob_bytes,
+                                read_status: "ok",
+                                ecc_status: if read.metrics.uncorrectable {
                                     "uncorrectable"
                                 } else {
-                                    "ok"
+                                    "correctable"
                                 },
                                 sha256: Some(digest),
                                 non_erased_bytes: Some(non_erased),
@@ -396,6 +472,8 @@ pub fn sweep_physical_pages(
                     block.unreadable_pages = block.unreadable_pages.saturating_add(1);
                     if expected_erased {
                         target_unreadable_pages = target_unreadable_pages.saturating_add(1);
+                    } else {
+                        excluded_unreadable_pages = excluded_unreadable_pages.saturating_add(1);
                     }
                     sweep_hash.update([0]);
                     sweep_hash.update(Sha256::digest(message.as_bytes()));
@@ -415,11 +493,14 @@ pub fn sweep_physical_pages(
                                 record: "page",
                                 flat_block: flat,
                                 page,
+                                geometry: page_geometry,
                                 disposition,
                                 expected_erased,
                                 image_offset: offset,
-                                length: page_stride,
-                                status: "read-error",
+                                data_length: geometry.page_bytes,
+                                oob_length: geometry.oob_bytes,
+                                read_status: "read-error",
+                                ecc_status: "unknown",
                                 sha256: None,
                                 non_erased_bytes: None,
                                 corrected_bits: None,
@@ -431,6 +512,15 @@ pub fn sweep_physical_pages(
                         )?;
                     }
                 }
+            }
+            completed_pages = completed_pages.saturating_add(1);
+            if completed_pages == 1
+                || completed_pages == total_pages
+                || completed_pages.is_multiple_of(256)
+                || last_progress.elapsed() >= std::time::Duration::from_secs(5)
+            {
+                progress(completed_pages, total_pages)?;
+                last_progress = std::time::Instant::now();
             }
         }
         blocks.push(block);
@@ -446,7 +536,6 @@ pub fn sweep_physical_pages(
             .flush()
             .map_err(|error| Error::io("flush physical page map", Some(error)))?;
     }
-    let total_pages = geometry.total_pages()?;
     Ok(SweepSummary {
         total_blocks: geometry.blocks,
         total_pages,
@@ -457,6 +546,7 @@ pub fn sweep_physical_pages(
         target_readable_pages,
         target_unreadable_pages,
         target_uncorrectable_pages,
+        excluded_unreadable_pages,
         target_non_erased_pages,
         target_non_erased_bytes,
         excluded_non_erased_pages,
@@ -482,14 +572,24 @@ mod tests {
     fn complete_sweep_verifies_every_target_page() {
         let geometry = SweepGeometry {
             blocks: 2,
+            channels: 1,
+            chips_per_channel: 1,
+            luns_per_chip: 1,
+            planes_per_lun: 1,
+            blocks_per_lun: 2,
             pages_per_block: 2,
             page_bytes: 4,
             oob_bytes: 2,
         };
         let dispositions = [PhysicalDisposition::Data, PhysicalDisposition::FactoryBad];
         let mut visited = Vec::new();
-        let summary =
-            sweep_physical_pages(geometry, &dispositions, 0xff, None, None, |flat, page| {
+        let summary = sweep_physical_pages(
+            geometry,
+            &dispositions,
+            0xff,
+            None,
+            None,
+            |flat, page| {
                 visited.push((flat, page));
                 let raw = if flat == 0 {
                     vec![0xff; 6]
@@ -500,8 +600,10 @@ mod tests {
                     raw,
                     metrics: PageMetrics::default(),
                 })
-            })
-            .unwrap();
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(visited, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
         assert!(summary.all_addresses_readable);
         assert!(summary.erased_scope_verified);
@@ -512,6 +614,11 @@ mod tests {
     fn salvage_image_marks_unreadable_holes_in_map() {
         let geometry = SweepGeometry {
             blocks: 1,
+            channels: 1,
+            chips_per_channel: 1,
+            luns_per_chip: 1,
+            planes_per_lun: 1,
+            blocks_per_lun: 1,
             pages_per_block: 2,
             page_bytes: 4,
             oob_bytes: 2,
@@ -534,6 +641,7 @@ mod tests {
                     Err(Error::Io("injected read error".into(), None))
                 }
             },
+            |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(image.into_inner(), vec![1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0]);
@@ -542,13 +650,24 @@ mod tests {
         assert!(!summary.erased_scope_verified);
         let text = String::from_utf8(map).unwrap();
         assert!(text.contains("\"record\":\"header\""));
-        assert!(text.contains("\"status\":\"read-error\""));
+        assert!(text.contains("\"data_length\":4"));
+        assert!(text.contains("\"oob_length\":2"));
+        assert!(text.contains(
+            "\"geometry\":{\"channel\":0,\"chip\":0,\"lun\":0,\"plane\":0,\"block\":0,\"page\":0}"
+        ));
+        assert!(text.contains("\"read_status\":\"read-error\""));
+        assert!(text.contains("\"ecc_status\":\"unknown\""));
     }
 
     #[test]
     fn salvage_requires_both_outputs_and_empty_image() {
         let geometry = SweepGeometry {
             blocks: 1,
+            channels: 1,
+            chips_per_channel: 1,
+            luns_per_chip: 1,
+            planes_per_lun: 1,
+            blocks_per_lun: 1,
             pages_per_block: 1,
             page_bytes: 1,
             oob_bytes: 0,
@@ -561,6 +680,7 @@ mod tests {
             Some(&mut image),
             None,
             |_flat, _page| unreachable!(),
+            |_, _| Ok(()),
         )
         .is_err());
     }
@@ -570,6 +690,11 @@ mod tests {
         let summary = sweep_physical_pages(
             SweepGeometry {
                 blocks: 1,
+                channels: 1,
+                chips_per_channel: 1,
+                luns_per_chip: 1,
+                planes_per_lun: 1,
+                blocks_per_lun: 1,
                 pages_per_block: 1,
                 page_bytes: 4,
                 oob_bytes: 0,
@@ -587,6 +712,7 @@ mod tests {
                     },
                 })
             },
+            |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(summary.readable_pages, 1);
@@ -594,5 +720,75 @@ mod tests {
         assert_eq!(summary.target_uncorrectable_pages, 1);
         assert!(!summary.all_pages_correctable);
         assert!(!summary.erased_scope_verified);
+    }
+
+    #[test]
+    fn complete_sweep_reports_bounded_progress_and_excluded_read_errors() {
+        let mut progress = Vec::new();
+        let summary = sweep_physical_pages(
+            SweepGeometry {
+                blocks: 2,
+                channels: 1,
+                chips_per_channel: 1,
+                luns_per_chip: 1,
+                planes_per_lun: 1,
+                blocks_per_lun: 2,
+                pages_per_block: 256,
+                page_bytes: 1,
+                oob_bytes: 0,
+            },
+            &[
+                PhysicalDisposition::Data,
+                PhysicalDisposition::SystemPreserved,
+            ],
+            0xff,
+            None,
+            None,
+            |flat, _page| {
+                if flat == 1 {
+                    Err(Error::Io("excluded read error".into(), None))
+                } else {
+                    Ok(PageRead {
+                        raw: vec![0xff],
+                        metrics: PageMetrics::default(),
+                    })
+                }
+            },
+            |done, total| {
+                progress.push((done, total));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.excluded_unreadable_pages, 256);
+        assert_eq!(summary.target_unreadable_pages, 0);
+        assert_eq!(progress.first(), Some(&(1, 512)));
+        assert_eq!(progress.last(), Some(&(512, 512)));
+        assert!(progress.len() <= 4);
+    }
+
+    #[test]
+    fn sweep_rejects_a_topology_that_does_not_cover_every_flat_block() {
+        let geometry = SweepGeometry {
+            blocks: 2,
+            channels: 1,
+            chips_per_channel: 1,
+            luns_per_chip: 1,
+            planes_per_lun: 1,
+            blocks_per_lun: 1,
+            pages_per_block: 1,
+            page_bytes: 1,
+            oob_bytes: 0,
+        };
+        let result = sweep_physical_pages(
+            geometry,
+            &[PhysicalDisposition::Data, PhysicalDisposition::Data],
+            0xff,
+            None,
+            None,
+            |_flat, _page| unreachable!(),
+            |_, _| Ok(()),
+        );
+        assert!(result.is_err());
     }
 }

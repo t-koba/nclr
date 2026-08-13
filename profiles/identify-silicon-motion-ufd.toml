@@ -2,5 +2,4 @@
 schema = 1
 id = "silicon-motion-ufd"
 family = "silicon-motion-ufd"
-controller_id = "silicon-motion-ufd"
 usb_vid_hints = [0x090C]

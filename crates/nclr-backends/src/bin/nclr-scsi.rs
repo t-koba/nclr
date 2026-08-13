@@ -59,10 +59,27 @@ mod linux {
         timeout_ms: u32,
     ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        scsi::sg::exec(file, cdb, direction, &mut buf, timeout_ms)?;
-        // The resid field is not applied, so a short read leaves the tail
-        // as received.
+        let transferred = scsi::sg::exec_len(file, cdb, direction, &mut buf, timeout_ms)?;
+        if direction == scsi::SG_DXFER_FROM_DEV {
+            buf.truncate(transferred);
+        } else if transferred != len {
+            return Err(Error::Invalid(format!(
+                "SCSI command transferred {transferred} of {len} bytes"
+            )));
+        }
         Ok(buf)
+    }
+
+    fn capacity_bytes(last_lba: u64, block_size: u32) -> Result<u64> {
+        if block_size == 0 {
+            return Err(Error::Invalid(
+                "READ CAPACITY reported a zero logical block size".into(),
+            ));
+        }
+        last_lba
+            .checked_add(1)
+            .and_then(|blocks| blocks.checked_mul(u64::from(block_size)))
+            .ok_or_else(|| Error::Invalid("READ CAPACITY value overflows u64".into()))
     }
 
     /// Device identity and capability summary from a probe.
@@ -113,9 +130,9 @@ mod linux {
                     }
                     let blocks = u64::from_be_bytes(d[0..8].try_into().unwrap());
                     let bsz = u32::from_be_bytes(d[8..12].try_into().unwrap());
-                    ((blocks + 1).saturating_mul(bsz as u64), bsz)
+                    (capacity_bytes(blocks, bsz)?, bsz)
                 } else {
-                    ((blocks as u64 + 1).saturating_mul(bsz as u64), bsz)
+                    (capacity_bytes(u64::from(blocks), bsz)?, bsz)
                 }
             }
             _ => {
@@ -218,7 +235,7 @@ mod linux {
                 inquiry.designators = ds;
             }
         }
-        let mut v = json!({
+        let v = json!({
             "api": PROTOCOL_API,
             "ok": true,
             "backend": "scsi",
@@ -226,6 +243,15 @@ mod linux {
             "version": VERSION,
             "capabilities": caps,
             "grade_ceiling": ceiling,
+            "erase_coverage": coverage,
+            "erase_method": method,
+            "rebuilds": [],
+            "controller_profile": Value::Null,
+            "profile_sha256": Value::Null,
+            "capacity_policy": Value::Null,
+            "protected_area_bytes": 0,
+            "certification": Value::Null,
+            "artifacts": [],
             "device": {
                 "capacity_bytes": pd.capacity_bytes,
                 "logical_block_size": pd.block_size,
@@ -233,10 +259,6 @@ mod linux {
                 "inquiry": inquiry,
             }
         });
-        if !coverage.is_empty() {
-            v["erase_coverage"] = json!(coverage);
-            v["erase_method"] = json!(method);
-        }
         Ok(v)
     }
 
@@ -307,20 +329,7 @@ mod linux {
                 start_device_erase(file, method)
             }
             "blank-verify" => backend_common::blank_verify(dev, events, "nclr-scsi"),
-            "postcheck-p2" => {
-                // Re-query the device geometry: capacity stability must be
-                // measured after the erase/power cycle, not taken from the
-                // values cached at process start.
-                dev.refresh_capacity()?;
-                let sample = backend_common::sample_read(dev, events)?;
-                Ok(json!({
-                    "status": "ok",
-                    "capacity_bytes": dev.capacity_bytes(),
-                    "logical_block_size": dev.block_size(),
-                    "capacity_stable": true,
-                    "sample": sample,
-                }))
-            }
+            "postcheck-p2" => backend_common::postcheck_p2(dev, events, "nclr-scsi", None),
             _ => backend_common::dispatch_lba_action(action, seed, params, dev, events),
         }
     }
@@ -413,11 +422,18 @@ mod linux {
                         "version": VERSION,
                         "state": "ready",
                     });
-                    // Long-running SANITIZE monitoring. The core's monitor
-                    // reads the completed/failed booleans (mirroring the sim
-                    // backend contract); the state string is informational.
+                    // Long-running SANITIZE monitoring. The top-level state
+                    // prevents another workflow from entering while the
+                    // device operation is active.
                     match sanitize_status(&file) {
                         Ok(s) => {
+                            v["state"] = json!(if s.failed {
+                                "failed"
+                            } else if s.completed {
+                                "ready"
+                            } else {
+                                "in-progress"
+                            });
                             v["sanitize"] = json!({
                                 "state": if s.completed { "completed" } else { "in-progress" },
                                 "started": true,
@@ -440,6 +456,7 @@ mod linux {
                             // command) - the safe side is continued
                             // monitoring (a failed status query is not a
                             // failed erase, §1215).
+                            v["state"] = json!("in-progress");
                             v["sanitize"] = json!({
                                 "state": "unknown",
                                 "completed": false,
@@ -458,6 +475,7 @@ mod linux {
                         "api": PROTOCOL_API,
                         "ok": true,
                         "backend": "scsi",
+                        "version": VERSION,
                         "state": "ready",
                         "recovery": {
                             "automated": false,

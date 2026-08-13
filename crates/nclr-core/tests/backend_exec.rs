@@ -13,8 +13,10 @@ fn temp_backend(name: &str, script: &str) -> (BackendHandle, std::path::PathBuf)
     std::fs::set_permissions(&path, perms).unwrap();
     // A manifest declares the trust state; without one a binary outside the
     // shipped set is research-state and refused for destructive runs.
+    let digest = nclr::digest(script.as_bytes());
     let manifest = format!(
-        "schema = 1\nid = \"{name}\"\nexec = \"nclr-{name}\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\n"
+        "schema = 1\nid = \"{name}\"\nexec = \"nclr-{name}\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\", \"plan\", \"run\", \"status\", \"recover\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
     );
     std::fs::write(dir.path().join(format!("{name}.toml")), manifest).unwrap();
     // Do not rely on the NCLR_BACKEND_DIR env var: parallel tests would race.
@@ -27,7 +29,29 @@ fn temp_backend(name: &str, script: &str) -> (BackendHandle, std::path::PathBuf)
 #[test]
 fn echo_backend_receives_request_and_device_fd() {
     let script = r#"#!/bin/sh
-cat <&4
+python3 - <<'PYEOF'
+import json, os
+with os.fdopen(4) as request_fd:
+    request = json.load(request_fd)
+print(json.dumps({
+    "api": 1,
+    "ok": True,
+    "backend": "echo1",
+    "version": "0.0.0-test",
+    "capabilities": [],
+    "grade_ceiling": "C0",
+    "erase_coverage": [],
+    "erase_method": None,
+    "rebuilds": [],
+    "controller_profile": None,
+    "profile_sha256": None,
+    "capacity_policy": None,
+    "protected_area_bytes": 0,
+    "certification": None,
+    "artifacts": [],
+    "request": request,
+}))
+PYEOF
 "#;
     let (handle, _keepalive) = temp_backend("echo1", script);
 
@@ -63,9 +87,9 @@ cat <&4
     .unwrap();
     // The echo backend copies the request JSON back, proving the request fd
     // was received intact.
-    assert_eq!(resp.value["op"], "probe");
+    assert_eq!(resp.value["request"]["op"], "probe");
     assert_eq!(resp.value["api"], 1);
-    assert_eq!(resp.value["device_is_file"], true);
+    assert_eq!(resp.value["request"]["device_is_file"], true);
 }
 
 #[test]
@@ -95,6 +119,36 @@ fn backend_rejects_invalid_json() {
     )
     .expect_err("expected a backend error");
     assert!(err.to_string().contains("invalid JSON"));
+    assert_eq!(err.exit_code(), 74);
+}
+
+#[test]
+fn backend_changed_after_selection_is_not_executed() {
+    let script = "#!/bin/sh\necho '{\"api\":1,\"ok\":true}'\n";
+    let (handle, _keepalive) = temp_backend("changed-after-selection", script);
+    std::fs::write(&handle.path, "#!/bin/sh\necho '{\"api\":1,\"ok\":false}'\n").unwrap();
+    let device_fd = OwnedFd::from(tempfile::tempfile().unwrap());
+    let error = backend::call(
+        &handle,
+        "probe",
+        &device_fd,
+        None,
+        &Request {
+            api: 1,
+            op: "probe".into(),
+            action: None,
+            seed: None,
+            device_is_file: Some(true),
+            limits: None,
+            params: None,
+            device: None,
+            extra_fds: Vec::new(),
+        },
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("changed after it was selected"));
 }
 
 #[test]
@@ -112,6 +166,20 @@ def ok(fd):
         return None
 print(json.dumps({
     "api": 1,
+    "ok": True,
+    "backend": "echoextra",
+    "version": "0.0.0-test",
+    "capabilities": [],
+    "grade_ceiling": "C0",
+    "erase_coverage": [],
+    "erase_method": None,
+    "rebuilds": [],
+    "controller_profile": None,
+    "profile_sha256": None,
+    "capacity_policy": None,
+    "protected_area_bytes": 0,
+    "certification": None,
+    "artifacts": [],
     "device": ok(3),
     "events": ok(5),
     "sg": ok(6),
@@ -150,8 +218,11 @@ PYEOF
     .unwrap();
     assert_eq!(resp.value["device"].as_i64(), Some(0), "device fd 3");
     assert_eq!(resp.value["sg"].as_i64(), Some(777), "extra sg fd 6");
-    // fd 7 may legitimately hold another inherited fd; only the sg role
-    // (fd 6) is asserted.
+    assert!(resp.value["events"].is_null(), "optional event fd 5");
+    assert!(
+        resp.value["usbfs"].is_null(),
+        "undeclared source descriptors must be closed across exec"
+    );
 }
 
 #[test]
@@ -208,7 +279,7 @@ fn manifest_digest_mismatch_rejected() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&bin, perms).unwrap();
     let manifest = format!(
-        "schema = 1\nid = \"m1\"\nexec = \"nclr-m1\"\napi = 1\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
+        "schema = 1\nid = \"m1\"\nexec = \"nclr-m1\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
         "00".repeat(32)
     );
     std::fs::write(dir.path().join("m1.toml"), manifest).unwrap();
@@ -226,7 +297,24 @@ try:
     writable = True
 except OSError:
     writable = False
-print(json.dumps({"api": 1, "writable": writable}))
+print(json.dumps({
+    "api": 1,
+    "ok": True,
+    "backend": "readonly-request",
+    "version": "0.0.0-test",
+    "capabilities": [],
+    "grade_ceiling": "C0",
+    "erase_coverage": [],
+    "erase_method": None,
+    "rebuilds": [],
+    "controller_profile": None,
+    "profile_sha256": None,
+    "capacity_policy": None,
+    "protected_area_bytes": 0,
+    "certification": None,
+    "artifacts": [],
+    "writable": writable,
+}))
 PYEOF
 "#;
     let (handle, _keepalive) = temp_backend("readonly-request", script);
@@ -266,15 +354,58 @@ fn manifest_contract_is_strictly_validated() {
 
     // A manifest declaring a stale api number is rejected (the protocol is
     // version 1; the envelope check lives in backend::call).
-    let manifest = "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 2\ntrust = \"production\"\noperations = [\"probe\"]\n";
+    let digest = nclr::digest(b"#!/bin/sh\necho '{\"api\":2}'\n");
+    let manifest = format!(
+        "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 2\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
     std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
     let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
     assert!(err.to_string().contains("api must be 1"));
 
-    let manifest = "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\ntrust = \"experimental\"\noperations = [\"probe\"]\n";
+    let manifest = format!(
+        "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"experimental\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
     std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
     let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
     assert!(err.to_string().contains("requires production"));
+
+    let manifest = format!(
+        "schema = 2\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
+    std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
+    let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
+    assert!(err.to_string().contains("schema 2 != 1"));
+
+    let manifest = format!(
+        "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\nunknown = true\n",
+        digest.trim_start_matches("sha256:")
+    );
+    std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
+    let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
+
+    let manifest = format!(
+        "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\nversion = \"0.0.0-test\"\ntrust = \"production\"\noperations = [\"probe\", \"probe\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
+    std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
+    let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
+    assert!(err.to_string().contains("duplicate operation"));
+
+    let manifest = format!(
+        "schema = 1\nid = \"contract\"\nexec = \"nclr-contract\"\napi = 1\nversion = \"\"\ntrust = \"production\"\noperations = [\"probe\"]\nsha256 = \"{}\"\n",
+        digest.trim_start_matches("sha256:")
+    );
+    std::fs::write(dir.path().join("contract.toml"), manifest).unwrap();
+    let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
+    assert!(err.to_string().contains("version is invalid"));
+
+    std::fs::write(dir.path().join("contract.toml"), [0xff, 0xfe]).unwrap();
+    let err = backend::find("contract", &[dir.path().to_path_buf()]).unwrap_err();
+    assert!(err.to_string().contains("not UTF-8"));
 }
 
 #[test]
@@ -302,7 +433,138 @@ fn response_api_mismatch_is_rejected() {
         None,
     )
     .unwrap_err();
-    assert!(err.to_string().contains("response api"));
+    assert!(err.to_string().contains("api does not match"));
+    assert_eq!(err.exit_code(), 74);
+}
+
+#[test]
+fn malformed_probe_contract_is_rejected_as_protocol_error() {
+    let script = r#"#!/bin/sh
+echo '{"api":1,"ok":true,"backend":"bad-probe","version":"0.0.0-test","capabilities":17,"grade_ceiling":"C1","erase_coverage":[],"erase_method":null,"rebuilds":[],"controller_profile":null,"profile_sha256":null,"capacity_policy":null,"protected_area_bytes":0,"certification":null,"artifacts":[]}'
+"#;
+    let (handle, _keepalive) = temp_backend("bad-probe", script);
+    let device_fd = OwnedFd::from(tempfile::tempfile().unwrap());
+    let error = backend::call(
+        &handle,
+        "probe",
+        &device_fd,
+        None,
+        &Request {
+            api: 1,
+            op: "probe".into(),
+            action: None,
+            seed: None,
+            device_is_file: Some(true),
+            limits: None,
+            params: None,
+            device: None,
+            extra_fds: Vec::new(),
+        },
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(error.to_string().contains("capabilities must be an array"));
+}
+
+#[test]
+fn run_response_action_must_match_the_request() {
+    let script = r#"#!/bin/sh
+echo '{"api":1,"ok":true,"backend":"wrong-action","version":"0.0.0-test","action":"different-action","action_results":[{"status":"ok"}]}'
+"#;
+    let (handle, _keepalive) = temp_backend("wrong-action", script);
+    let device_fd = OwnedFd::from(tempfile::tempfile().unwrap());
+    let error = backend::call(
+        &handle,
+        "run",
+        &device_fd,
+        None,
+        &Request {
+            api: 1,
+            op: "run".into(),
+            action: Some("expected-action".into()),
+            seed: None,
+            device_is_file: Some(true),
+            limits: None,
+            params: None,
+            device: None,
+            extra_fds: Vec::new(),
+        },
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(error
+        .to_string()
+        .contains("action mismatch: requested expected-action, response reports different-action"));
+}
+
+#[test]
+fn malformed_run_result_fields_are_rejected() {
+    let script = r#"#!/bin/sh
+echo '{"api":1,"ok":true,"backend":"bad-run-fields","version":"0.0.0-test","action":"inventory","action_results":[{"status":"ok","errors":"none","started":"yes"}]}'
+"#;
+    let (handle, _keepalive) = temp_backend("bad-run-fields", script);
+    let device_fd = OwnedFd::from(tempfile::tempfile().unwrap());
+    let error = backend::call(
+        &handle,
+        "run",
+        &device_fd,
+        None,
+        &Request {
+            api: 1,
+            op: "run".into(),
+            action: Some("inventory".into()),
+            seed: None,
+            device_is_file: Some(true),
+            limits: None,
+            params: None,
+            device: None,
+            extra_fds: Vec::new(),
+        },
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(error
+        .to_string()
+        .contains("action result errors must be an unsigned integer"));
+}
+
+#[test]
+fn malformed_status_contract_is_rejected() {
+    let script = r#"#!/bin/sh
+echo '{"api":1,"ok":true,"backend":"bad-status","version":"0.0.0-test","sanitize":{"completed":false,"failed":false,"progress":1001}}'
+"#;
+    let (handle, _keepalive) = temp_backend("bad-status", script);
+    let device_fd = OwnedFd::from(tempfile::tempfile().unwrap());
+    let error = backend::call(
+        &handle,
+        "status",
+        &device_fd,
+        None,
+        &Request {
+            api: 1,
+            op: "status".into(),
+            action: None,
+            seed: None,
+            device_is_file: Some(true),
+            limits: None,
+            params: None,
+            device: None,
+            extra_fds: Vec::new(),
+        },
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 74);
+    assert!(error
+        .to_string()
+        .contains("status response is missing state"));
 }
 
 #[test]

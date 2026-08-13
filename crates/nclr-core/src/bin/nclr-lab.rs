@@ -82,7 +82,7 @@ enum ArtifactCmd {
 
 #[derive(clap::Args)]
 struct ControllerArgs {
-    /// Limit output to phison, alcor, smi, sandisk or usbest
+    /// Limit output to one canonical family or vendor alias
     #[arg(long)]
     family: Option<String>,
 }
@@ -291,26 +291,48 @@ fn cmd_artifact(args: &ArtifactArgs) -> i32 {
 // ---------------------------------------------------------------------------
 
 fn cmd_controller(args: &ControllerArgs) -> i32 {
-    use nclr::controller_protocol::{support, Family};
+    use nclr::controller_protocol::{family_from_str, support, Family};
     let families = match args.family.as_deref() {
-        None => vec![
-            Family::PhisonPs2251,
-            Family::AlcorAu698x,
-            Family::SiliconMotionUfd,
-            Family::SandiskCruzer,
-            Family::UsbestUt163,
-        ],
-        Some("phison") | Some("phison-ps2251") => vec![Family::PhisonPs2251],
-        Some("alcor") | Some("alcor-au698x") => vec![Family::AlcorAu698x],
+        None => Family::ALL.to_vec(),
+        Some("phison") | Some("phison-ufd") => vec![Family::PhisonUfd],
+        Some("alcor") | Some("alcor-ufd") => vec![Family::AlcorUfd],
         Some("smi") | Some("silicon-motion") | Some("silicon-motion-ufd") => {
             vec![Family::SiliconMotionUfd]
         }
         Some("sandisk") | Some("sandisk-cruzer") => vec![Family::SandiskCruzer],
-        Some("usbest") | Some("usbest-ut163") => vec![Family::UsbestUt163],
-        Some(other) => {
-            eprintln!("nclr-lab: unknown controller family: {other}");
-            return 64;
+        Some("usbest") | Some("usbest-ufd") => vec![Family::UsbestUfd],
+        Some("chipsbank") | Some("chipsbank-ufd") => vec![Family::ChipsbankUfd],
+        Some("innostor") | Some("innostor-ufd") => vec![Family::InnostorUfd],
+        Some("firstchip") | Some("firstchip-ufd") => vec![Family::FirstchipUfd],
+        Some("sss") | Some("solid-state-system") | Some("solid-state-system-ufd") => {
+            vec![Family::SolidStateSystemUfd]
         }
+        Some("skymedi") | Some("skymedi-ufd") => vec![Family::SkymediUfd],
+        Some("appotech") | Some("appotech-ufd") => vec![Family::AppotechUfd],
+        Some("silicongo") | Some("silicongo-ufd") => vec![Family::SilicongoUfd],
+        Some("icreate") | Some("icreate-ufd") => vec![Family::IcreateUfd],
+        Some("oti") | Some("ours-technology") | Some("oti-ufd") => vec![Family::OtiUfd],
+        Some("prolific") | Some("prolific-ufd") => vec![Family::ProlificUfd],
+        Some("ameco") | Some("mxtronics") | Some("ameco-ufd") => vec![Family::AmecoUfd],
+        Some("netac") | Some("netac-ufd") => vec![Family::NetacUfd],
+        Some("efortune") | Some("efortune-ufd") => vec![Family::EfortuneUfd],
+        Some("ite") | Some("ite-ufd") => vec![Family::IteUfd],
+        Some("hyperstone") | Some("hyperstone-ufd") => vec![Family::HyperstoneUfd],
+        Some("yeestor") | Some("yeestor-ufd") => vec![Family::YeestorUfd],
+        Some("ramos") | Some("ramos-ufd") => vec![Family::RamosUfd],
+        Some("trek") | Some("trek2000") | Some("trek2000-ufd") => vec![Family::Trek2000Ufd],
+        Some("moai") | Some("moai-ufd") => vec![Family::MoaiUfd],
+        Some("realway") | Some("realway-ufd") => vec![Family::RealwayUfd],
+        Some("huayi") | Some("huayi-ufd") => vec![Family::HuayiUfd],
+        Some("ktc") | Some("ktc-ufd") => vec![Family::KtcUfd],
+        Some("smsc") | Some("smsc-ufd") => vec![Family::SmscUfd],
+        Some(canonical) => match family_from_str(canonical) {
+            Some(family) => vec![family],
+            None => {
+                eprintln!("nclr-lab: unknown controller family: {canonical}");
+                return 64;
+            }
+        },
     };
     let matrix: Vec<_> = families.into_iter().map(support).collect();
     match serde_json::to_string_pretty(&matrix) {
@@ -1083,13 +1105,19 @@ operations = ["probe", "plan", "run", "status", "recover"]
 coverage = ["D0"]
 rebuilds = []
 preserves = ["FBB-marker"]
+protected_area_bytes = 0
 capacity = { bin_bytes = 0, minimum_spare_blocks = 4, spare_ratio = 0.05 }
 ecc = { strength = 40, min_margin = 8, max_read_retry = 4, max_read_latency_ms = 200 }
 recovery = { method = "service-mode-exit+reset", timeout_ms = 30000 }
+logical_blank_value = 255
 sd_vendor = { read_only_health = false, cmd56_arg = 0, block_len = 0 }
 # Real trust = "production" profiles also require exact min=max identity,
 # pinned protocol-trace and qualification-report artifacts, and all fields:
 # implementation = { strategy = "clean-room", protocol_evidence_sha256 = "...", source_reference = "https://...", artifact_ids = ["protocol-recipe"] }
+# For families without a fixed signed probe, copy every exact value from
+# `nclr info -j` -> controller_identify.controller_research.exact_bootstrap_observed.
+# Empty USB descriptor strings are exact empty values, never wildcards.
+# controller_bootstrap = { family = "{family}", usb_vid = 0x0000, usb_pid = 0x0000, usb_bcd_device = 0x0000, usb_manufacturer = "", usb_product = "", usb_serial = "", scsi_vendor = "...", scsi_product = "...", scsi_revision = "..." }
 # geometry = { channels = 1, chips_per_channel = 1, luns_per_chip = 1, planes_per_lun = 2, blocks_per_lun = 1024, pages_per_block = 256, page_bytes = 8192, oob_bytes = 640, address_cycles = 5, bits_per_cell = 2, bad_block_marker_pages = [0, 1], bad_block_marker_offsets = [0], randomizer = "...", read_retry = "...", ecc_layout = "..." }
 # metadata_layout = { bbt_format = "...", ftl_format = "...", spare_format = "...", commit_protocol = "...", system_block_ranges = [{ start = 0, end = 15, purpose = "controller-metadata", policy = "rebuild-controller-metadata" }] }
 # qualification = { report_sha256 = "...", report_artifact_id = "qualification-report", independent_reader = "...", samples = 1, power_cut_cases = 1 }
@@ -1349,8 +1377,8 @@ fn send_read_only(fd: i32, rec: &TraceRecord) -> String {
     // carries none), and classify_replay refuses any record that claims an
     // "out" direction, so the transfer direction is always from the device.
     let direction = nclr::scsi::SG_DXFER_FROM_DEV;
-    match nclr::scsi::sg::exec(&file, &cdb, direction, &mut buf, 60_000) {
-        Ok(()) => "ok".to_string(),
+    match nclr::scsi::sg::exec_len(&file, &cdb, direction, &mut buf, 60_000) {
+        Ok(transferred) => format!("ok ({transferred} bytes)"),
         Err(e) => e.to_string(),
     }
 }

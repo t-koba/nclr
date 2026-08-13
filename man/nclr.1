@@ -26,7 +26,8 @@ a reusable raw-uninitialized block device state. It is a one-shot, one-medium
 CLI: no daemon, no API, no internal database.
 .PP
 When the backend has a documented device-level erase (SCSI SANITIZE BLOCK
-ERASE, native SD full-range ERASE), the strongest plan is C2: the device
+ERASE, native SD full-range ERASE including checked SDSC byte addressing),
+the strongest plan is C2: the device
 erase runs last, followed by a blank sweep, signature check, power cycle and
 re-enumeration check. When a production controller profile matches the device
 exactly, the C3 plan runs the controller reinitialization (BBT capture,
@@ -38,9 +39,11 @@ Otherwise the L1 recipe overwrites the full logical space with a
 plan-seeded PRBS pattern, flushes, power cycles, verifies, overwrites with
 zeros, verifies again, and checks that no partition/filesystem signatures
 remain. Evidence (C grade, residual risk, H grade) is reported
-independently; the final state is always
+independently. The final state is
 .B raw-uninitialized
-and no filesystem is created.
+only after the selected postcheck passes; otherwise it is
+.BR undetermined .
+No filesystem is created.
 .SH DANGER
 Destructive. Verify the device path, fingerprint and capacity before running.
 The run confirmation token is of the form
@@ -54,6 +57,11 @@ List removable whole-disk candidates, one device path per line (\-j: JSON).
 .TP
 .B info [\-j] DEVICE
 Read-only identity, transport, capacity, fingerprint and backend capability.
+The JSON result includes capability names, match state, grade ceiling,
+documented erase method/coverage, rebuild scope, matched profile digest,
+certification and any required runtime artifacts. This distinguishes an
+immediately executable C3/C4 path from an exact profile that still requires
+artifact acquisition.
 For USB-attached devices the vendor and model names are resolved from the
 OS usb.ids database (the lsusb/udev source; the device's own iManufacturer
 claim is the fallback), and the matching controller family is also probed
@@ -63,6 +71,12 @@ mode are reported when an identification profile
 selects a supported family or a standard INQUIRY carries a controller
 marker (e.g. the USBest UT163 "U163" signature), and the reason is reported
 instead when the probe cannot run or fails.
+For native SD, JSON also includes a command-free
+.B sd_research
+handoff with every available CID, CSD, SCR, card and host identity field.
+It explicitly lists the internal controller, NAND geometry, service protocol,
+metadata and qualification evidence still required for C3/C4; card registers
+alone never enable controller-destructive capability.
 .TP
 .B plan [\-l LEVEL] [OPTIONS] DEVICE
 Produce a normalized JSON plan on stdout (read-only).
@@ -75,7 +89,8 @@ Execute a fixed plan file (or stdin). The plan hash, fingerprint, physical
 path and capacity are validated before any destructive action.
 .TP
 .B check [\-j] [\-\-scratch\-range START:SECTORS] [\-\-yes] DEVICE
-Non-destructive assessment: identity, sample reads, warnings. Never writes,
+Non-destructive assessment: identity, complete backend capability data,
+sample reads and warnings. Never writes,
 except for an explicit bounded write test: \-\-scratch\-range START:SECTORS
 (with \-\-yes confirmation) writes a limited range and restores it, e.g.
 \-\-scratch\-range 0:1024. Results are reported in the check JSON
@@ -85,12 +100,18 @@ except for an explicit bounded write test: \-\-scratch\-range START:SECTORS
 Enter the exactly matched controller service mode and read every declared
 physical NAND page, including OOB bytes, without erase or program commands.
 FILE is a new raw image in flat-block-major, page-minor, data-then-OOB order.
-The mandatory NDJSON map records geometry, disposition, offsets, ECC/retry
-metrics and unreadable zero-filled holes. Neither output may already exist.
+The mandatory NDJSON map records channel/chip/LUN/plane/block/page geometry,
+disposition, image offset, separate data/OOB lengths, read status, ECC
+status/retry metrics and unreadable zero-filled holes. Neither output may
+already exist. After interruption, resume reopens only the exact canonical
+output inodes recorded in the journal, rejects replacements, truncates both
+files and restarts the read-only physical sweep from page zero.
 .TP
 .B resume [OPTIONS] STATE
 Continue from an append-only journal state file after an interruption. The
-device is re-identified and the backend queried before continuing.
+device is re-identified and the backend queried before continuing. STATE must
+contain exactly one initial locked plan; salvage journals also bind the image
+and page-map paths and inode identities.
 .TP
 .B help [COMMAND]
 Show help for a subcommand.

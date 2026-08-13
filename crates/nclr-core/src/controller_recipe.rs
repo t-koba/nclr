@@ -5,6 +5,7 @@
 //! bounded CDBs, decodes signed responses, serializes controller metadata and
 //! keeps the destructive state in a two-slot crash-consistent file.
 
+use crate::controller_protocol::{family_from_recipe_str, support, Family};
 use crate::errors::{Error, Result};
 use crate::profile::{MetadataLayoutPolicy, NandGeometryPolicy, Profile, SystemBlockPolicy};
 use serde::{Deserialize, Serialize};
@@ -193,6 +194,9 @@ pub enum BlockAddressLayout {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct BbtLayout {
+    /// Exact number of old BBT copies aggregated by the signed read-bbt
+    /// response. The table must contain the union of every copy.
+    pub copies: u32,
     pub count_offset: u32,
     pub count_width: u8,
     pub count_endian: Endian,
@@ -520,11 +524,13 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
             "controller recipe hardware tuple does not exactly match the profile".into(),
         ));
     }
-    if !matches!(
-        recipe.family.as_str(),
-        "phison-ps2251" | "alcor-au698x" | "smi-sm32x" | "sandisk-cruzer"
-    ) || recipe.transport != "scsi-sg"
-    {
+    let family = family_from_recipe_str(&recipe.family).ok_or_else(|| {
+        Error::Invalid(format!(
+            "controller recipe family {} has no bounded recipe adapter",
+            recipe.family
+        ))
+    })?;
+    if recipe.family != family.recipe_str() || recipe.transport != "scsi-sg" {
         return Err(Error::Invalid(
             "controller recipe family or transport is unsupported".into(),
         ));
@@ -573,9 +579,12 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
             "controller recipe identity fields require an exact profile bootstrap".into(),
         ));
     }
-    if recipe.family == "sandisk-cruzer" && !bootstrap_identified {
+    if !support(family).identify && !bootstrap_identified {
         return Err(Error::Invalid(
-            "SanDisk Cruzer recipe requires an exact profile bootstrap".into(),
+            format!(
+                "{} recipe requires an exact profile bootstrap because no fixed signed probe is available",
+                family.as_str()
+            ),
         ));
     }
     for (name, command) in &recipe.commands {
@@ -588,7 +597,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
                 "command {name} has an unsafe CDB, transfer size or timeout"
             )));
         }
-        if recipe.family == "sandisk-cruzer" {
+        if family == Family::SandiskCruzer {
             validate_sandisk_u3_command_scope(name, &cdb)?;
         }
         match command.direction {
@@ -791,7 +800,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
     }
     match &recipe.policy.service_loader_artifact_id {
         Some(id) => {
-            if recipe.family != "phison-ps2251"
+            if recipe.family != "phison-ufd"
                 || !recipe.policy.enter_reenumerates
                 || !profile.artifacts.iter().any(|artifact| {
                     artifact.id == *id
@@ -1122,7 +1131,8 @@ fn validate_response(name: &str, response: &ResponseRule) -> Result<()> {
 }
 
 fn validate_bbt_layout(layout: &BbtLayout) -> Result<()> {
-    if !width_valid(layout.count_width)
+    if !(1..=16).contains(&layout.copies)
+        || !width_valid(layout.count_width)
         || layout.entry_stride == 0
         || layout.maximum_entries == 0
         || !address_layout_valid(&layout.address, layout.entry_stride)

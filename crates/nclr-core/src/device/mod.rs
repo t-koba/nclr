@@ -39,6 +39,12 @@ pub struct MmcInfo {
     /// "SDIO", "SDcombo"); empty when the attribute is unavailable. Used to
     /// select SD-only commands (CMD32/33) which eMMC does not implement.
     pub kind: String,
+    /// Protocol erase group size reported by the MMC core, in bytes.
+    #[serde(default)]
+    pub erase_size_bytes: u64,
+    /// Preferred erase request size reported by the MMC core, in bytes.
+    #[serde(default)]
+    pub preferred_erase_size_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

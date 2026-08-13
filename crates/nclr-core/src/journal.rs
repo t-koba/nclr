@@ -5,7 +5,7 @@
 //! Destructive phase boundaries are fsync'd by the caller.
 
 use crate::errors::{Error, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -61,7 +61,8 @@ pub fn nix_uid() -> u32 {
 }
 
 /// A single journal record as written to disk.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct Record {
     pub seq: u64,
     pub prev: String,
@@ -205,6 +206,7 @@ impl Journal {
             plan: None,
         };
         fields(&mut rec);
+        validate_record(&rec, self.seq as usize + 1)?;
         let mut line = serde_json::to_vec(&rec)
             .map_err(|e| Error::Invalid(format!("journal record serialization: {e}")))?;
         line.push(b'\n');
@@ -301,21 +303,177 @@ fn parse_records(bytes: &[u8]) -> Result<Vec<ParsedRecord>> {
 
     let mut out = Vec::new();
     let mut prev_hash = String::new();
+    let mut started_actions = std::collections::HashSet::<(String, String)>::new();
     for (i, line) in content.lines().enumerate() {
         let line = line.to_string();
         let value: serde_json::Value = serde_json::from_str(&line)
             .map_err(|e| Error::Invalid(format!("journal line {}: {e}", i + 1)))?;
-        let rec_prev = value.get("prev").and_then(|v| v.as_str()).unwrap_or("");
-        if rec_prev != prev_hash {
+        let record: Record = serde_json::from_value(value.clone())
+            .map_err(|e| Error::Invalid(format!("journal line {} contract: {e}", i + 1)))?;
+        if record.seq != i as u64 {
+            return Err(Error::Invalid(format!(
+                "journal sequence mismatch at line {}: expected {}, got {}",
+                i + 1,
+                i,
+                record.seq
+            )));
+        }
+        if record.prev != prev_hash {
             return Err(Error::Invalid(format!(
                 "journal hash chain broken at line {}",
                 i + 1
             )));
         }
+        validate_record(&record, i + 1)?;
+        if record.state == "action-started" {
+            started_actions.insert((
+                record.plan_hash.clone().expect("validated plan hash"),
+                record.action.clone().expect("validated action"),
+            ));
+        } else if record.state == "action-completed" {
+            let key = (
+                record.plan_hash.clone().expect("validated plan hash"),
+                record.action.clone().expect("validated action"),
+            );
+            if !started_actions.remove(&key) {
+                return Err(Error::Invalid(format!(
+                    "journal line {} completes an action that was not started",
+                    i + 1
+                )));
+            }
+        }
         prev_hash = crate::digest(line.as_bytes());
         out.push(ParsedRecord { raw: line, value });
     }
     Ok(out)
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn validate_record(record: &Record, line: usize) -> Result<()> {
+    if (line == 1 && record.state != "locked") || (line > 1 && record.state == "locked") {
+        return Err(Error::Invalid(format!(
+            "journal line {line} must contain the one and only initial locked plan"
+        )));
+    }
+    if !valid_token(&record.phase) || !valid_token(&record.state) {
+        return Err(Error::Invalid(format!(
+            "journal line {line} has an invalid phase or state"
+        )));
+    }
+    if record.time.is_empty()
+        || record.time.len() > 64
+        || !record.time.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(Error::Invalid(format!(
+            "journal line {line} has an invalid timestamp"
+        )));
+    }
+    if record
+        .plan_hash
+        .as_deref()
+        .is_some_and(|value| !valid_digest(value))
+        || record
+            .device
+            .as_deref()
+            .is_some_and(|value| !valid_digest(value))
+    {
+        return Err(Error::Invalid(format!(
+            "journal line {line} has an invalid digest"
+        )));
+    }
+    if record
+        .action
+        .as_deref()
+        .is_some_and(|value| !valid_token(value))
+    {
+        return Err(Error::Invalid(format!(
+            "journal line {line} has an invalid action"
+        )));
+    }
+    if record
+        .device_path
+        .as_deref()
+        .is_some_and(|value| value.is_empty() || value.len() > 4096 || value.contains('\0'))
+        || record
+            .message
+            .as_deref()
+            .is_some_and(|value| value.len() > 16 * 1024 || value.contains('\0'))
+    {
+        return Err(Error::Invalid(format!(
+            "journal line {line} has an invalid path or message"
+        )));
+    }
+    if record.plan.is_some() && !matches!(record.state.as_str(), "locked" | "fallback-plan") {
+        return Err(Error::Invalid(format!(
+            "journal line {line} embeds a plan outside a plan boundary"
+        )));
+    }
+    match record.state.as_str() {
+        "locked" => {
+            if record.plan.is_none()
+                || record.plan_hash.is_none()
+                || record.device.is_none()
+                || record.device_path.is_none()
+            {
+                return Err(Error::Invalid(format!(
+                    "journal line {line} has an incomplete locked plan record"
+                )));
+            }
+        }
+        "fallback-plan" => {
+            if record.plan.is_none() || record.plan_hash.is_none() {
+                return Err(Error::Invalid(format!(
+                    "journal line {line} has an incomplete fallback plan record"
+                )));
+            }
+        }
+        "action-started" => {
+            if record.action.is_none() || record.plan_hash.is_none() {
+                return Err(Error::Invalid(format!(
+                    "journal line {line} has an incomplete action start"
+                )));
+            }
+        }
+        "action-completed" => {
+            let valid_status = record.action_status.as_deref().is_some_and(|status| {
+                matches!(
+                    status,
+                    "ok" | "error" | "failed" | "partial" | "found" | "skipped" | "fallback"
+                )
+            });
+            if record.action.is_none()
+                || record.plan_hash.is_none()
+                || record.action_errors.is_none()
+                || !valid_status
+            {
+                return Err(Error::Invalid(format!(
+                    "journal line {line} has an incomplete action completion"
+                )));
+            }
+        }
+        "outputs-created" | "outputs-restarted"
+            if record.plan_hash.is_none() || record.action_details.is_none() =>
+        {
+            return Err(Error::Invalid(format!(
+                "journal line {line} has an incomplete salvage output binding"
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Summary of a journal used by `resume`.
@@ -345,8 +503,18 @@ pub fn summarize(path: &Path) -> Result<JournalState> {
     let mut completed_by_plan: Vec<(String, String)> = Vec::new();
 
     for r in &records {
-        if let Some(p) = r.value.get("plan") {
-            plan = Some(p.clone());
+        let state = r.value.get("state").and_then(|value| value.as_str());
+        if state == Some("locked") {
+            let embedded = r
+                .value
+                .get("plan")
+                .cloned()
+                .ok_or_else(|| Error::Invalid("locked journal record has no plan".into()))?;
+            if plan.replace(embedded).is_some() {
+                return Err(Error::Invalid(
+                    "journal contains more than one locked plan".into(),
+                ));
+            }
         }
         if let Some(v) = r.value.get("plan_hash") {
             plan_hash = v.as_str().map(|s| s.to_string());
@@ -407,18 +575,24 @@ mod tests {
     fn journal_chain_and_resume() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.state");
+        let plan_hash = format!("sha256:{}", "a".repeat(64));
+        let device_hash = format!("sha256:{}", "d".repeat(64));
         let mut j = Journal::open(&path).unwrap();
-        j.record("plan", "planning", |r| {
-            r.plan_hash = Some("sha256:abc".into());
+        j.record("plan", "locked", |r| {
+            r.plan_hash = Some(plan_hash.clone());
+            r.device = Some(device_hash.clone());
+            r.device_path = Some("/dev/example".into());
+            r.plan = Some(serde_json::json!({ "id": "example" }));
         })
         .unwrap();
         j.record("inventory", "inventory-complete", |r| {
-            r.device = Some("sha256:dev".into());
+            r.device = Some(device_hash.clone());
             r.action = Some("inventory".into());
         })
         .unwrap();
         j.record("erase", "action-started", |r| {
             r.action = Some("lba-prbs-write".into());
+            r.plan_hash = Some(plan_hash.clone());
         })
         .unwrap();
         // Simulate power loss: no further records.
@@ -426,14 +600,17 @@ mod tests {
 
         let st = summarize(&path).unwrap();
         assert_eq!(st.records.len(), 3);
-        assert_eq!(st.plan_hash.as_deref(), Some("sha256:abc"));
-        assert_eq!(st.device_fingerprint.as_deref(), Some("sha256:dev"));
+        assert_eq!(st.plan_hash.as_deref(), Some(plan_hash.as_str()));
+        assert_eq!(st.device_fingerprint.as_deref(), Some(device_hash.as_str()));
         assert!(st.last_completed_action.is_none());
 
         // Appending continues the chain.
         let mut j = Journal::open(&path).unwrap();
         j.record("erase", "action-completed", |r| {
             r.action = Some("lba-prbs-write".into());
+            r.plan_hash = Some(plan_hash.clone());
+            r.action_status = Some("ok".into());
+            r.action_errors = Some(0);
         })
         .unwrap();
         let st = summarize(&path).unwrap();
@@ -458,7 +635,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t2.state");
         let mut j = Journal::open(&path).unwrap();
-        j.record("a", "s1", |_| {}).unwrap();
+        let plan_hash = format!("sha256:{}", "a".repeat(64));
+        let device_hash = format!("sha256:{}", "d".repeat(64));
+        j.record("plan", "locked", |record| {
+            record.plan_hash = Some(plan_hash);
+            record.device = Some(device_hash);
+            record.device_path = Some("/dev/example".into());
+            record.plan = Some(serde_json::json!({ "id": "example" }));
+        })
+        .unwrap();
         j.record("b", "s2", |_| {}).unwrap();
         drop(j);
         // Corrupt the second line.
@@ -473,11 +658,61 @@ mod tests {
     }
 
     #[test]
+    fn summary_keeps_the_original_plan_across_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.state");
+        let original_hash = format!("sha256:{}", "1".repeat(64));
+        let fallback_hash = format!("sha256:{}", "2".repeat(64));
+        let device_hash = format!("sha256:{}", "3".repeat(64));
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .record("plan", "locked", |record| {
+                record.plan_hash = Some(original_hash);
+                record.device = Some(device_hash);
+                record.device_path = Some("/dev/example".into());
+                record.plan = Some(serde_json::json!({ "id": "original" }));
+            })
+            .unwrap();
+        journal
+            .record("fallback", "fallback-plan", |record| {
+                record.plan_hash = Some(fallback_hash);
+                record.plan = Some(serde_json::json!({ "id": "fallback" }));
+            })
+            .unwrap();
+        drop(journal);
+
+        let summary = summarize(&path).unwrap();
+        assert_eq!(summary.plan.unwrap()["id"], "original");
+        assert_eq!(summary.fallback_plan.unwrap()["id"], "fallback");
+    }
+
+    #[test]
+    fn unknown_record_fields_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unknown.state");
+        std::fs::write(
+            &path,
+            b"{\"seq\":0,\"prev\":\"\",\"time\":\"2026-01-01T00:00:00Z\",\"phase\":\"a\",\"state\":\"ready\",\"unknown\":true}\n",
+        )
+        .unwrap();
+        assert!(read_records(&path).is_err());
+    }
+
+    #[test]
     fn torn_final_record_is_ignored_and_truncated_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("torn.state");
         let mut journal = Journal::open(&path).unwrap();
-        journal.record("a", "committed", |_| {}).unwrap();
+        let plan_hash = format!("sha256:{}", "a".repeat(64));
+        let device_hash = format!("sha256:{}", "d".repeat(64));
+        journal
+            .record("plan", "locked", |record| {
+                record.plan_hash = Some(plan_hash);
+                record.device = Some(device_hash);
+                record.device_path = Some("/dev/example".into());
+                record.plan = Some(serde_json::json!({ "id": "example" }));
+            })
+            .unwrap();
         drop(journal);
 
         let committed_len = std::fs::metadata(&path).unwrap().len();
@@ -493,6 +728,32 @@ mod tests {
         journal.record("b", "committed", |_| {}).unwrap();
         drop(journal);
         assert_eq!(read_records(&path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_new_run_cannot_append_a_second_locked_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reused.state");
+        let plan_hash = format!("sha256:{}", "a".repeat(64));
+        let device_hash = format!("sha256:{}", "d".repeat(64));
+        let mut journal = Journal::open(&path).unwrap();
+        journal
+            .record("plan", "locked", |record| {
+                record.plan_hash = Some(plan_hash.clone());
+                record.device = Some(device_hash.clone());
+                record.device_path = Some("/dev/example".into());
+                record.plan = Some(serde_json::json!({ "id": "original" }));
+            })
+            .unwrap();
+        let error = journal
+            .record("plan", "locked", |record| {
+                record.plan_hash = Some(plan_hash);
+                record.device = Some(device_hash);
+                record.device_path = Some("/dev/example".into());
+                record.plan = Some(serde_json::json!({ "id": "replacement" }));
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("one and only"));
     }
 
     #[test]
