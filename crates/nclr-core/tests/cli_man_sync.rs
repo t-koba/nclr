@@ -37,6 +37,68 @@ fn help_subcommands_match_man_page() {
 }
 
 #[test]
+fn lab_help_subcommands_match_man_page() {
+    let output = Command::new(env!("CARGO_BIN_EXE_nclr-lab"))
+        .arg("--help")
+        .output()
+        .expect("spawn nclr-lab --help");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout).into_owned();
+    let expected = [
+        "artifact",
+        "cap",
+        "controller",
+        "decode",
+        "diff",
+        "infer",
+        "phison-ps2303",
+        "probe",
+        "profile",
+        "recipe",
+        "replay",
+        "tool",
+        "trace",
+    ];
+    for command in expected {
+        assert!(
+            help.contains(command),
+            "--help must mention the {command} subcommand:\n{help}"
+        );
+    }
+
+    let man = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../man/nclr-lab.1"),
+    )
+    .expect("man/nclr-lab.1");
+    for command in expected {
+        assert!(
+            man.contains(&format!(".B nclr-lab {command}"))
+                || man.contains(&format!(".B {command}")),
+            "man/nclr-lab.1 must document the {command} subcommand"
+        );
+    }
+    for contract in [
+        "probe check",
+        "probe new",
+        "probe run",
+        "phison-ps2303 loader-check",
+        "phison-ps2303 geometry",
+        "phison-ps2303 inspect",
+        "phison-ps2303 enter-bootrom",
+        "phison-ps2303 load",
+        "phison-ps2303 probe-loader",
+        "\\-\\-pre\\-hil",
+        "\\-\\-artifact\\-dir",
+        "\\-\\-confirm\\-research\\-device",
+    ] {
+        assert!(
+            man.contains(contract),
+            "man/nclr-lab.1 must document {contract}"
+        );
+    }
+}
+
+#[test]
 fn backend_contract_man_page_covers_the_protocol() {
     let man = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../man/nclr-backend.7"),

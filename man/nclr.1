@@ -71,6 +71,12 @@ mode are reported when an identification profile
 selects a supported family or a standard INQUIRY carries a controller
 marker (e.g. the USBest UT163 "U163" signature), and the reason is reported
 instead when the probe cannot run or fails.
+On macOS, a package-managed
+.B probe\-*.toml
+may bind one complete USB/SCSI tuple to exactly two fixed read-only identity
+commands. An already unmounted removable non-system whole disk is opened with
+exclusive SCSITask access; only exact 6, 10, 12 or 16-byte CDBs are sent and
+both signed payloads must match. This path never enables purge.
 For native SD, JSON also includes a command-free
 .B sd_research
 handoff with every available CID, CSD, SCR, card and host identity field.

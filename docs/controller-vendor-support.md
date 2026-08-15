@@ -37,7 +37,7 @@
 | `ktc-ufd` | FC1325N | なし | あり | 0 |
 | `smsc-ufd` | USB97C242 | なし | あり | 0 |
 
-全 28 family は controller/NAND identity、page + OOB read、physical erase/status、BBT、FTL、capacity metadata、service transition、resume/salvage の同じ検証済み役割へ接続される。固定 probe のない 24 family と、固定 probe の対象外世代は、exact USB descriptor + SCSI bootstrap と recipe-owned 2 段 identity を必須とする。したがって上表の adapter 数を C3/C4 対応媒体数として数えてはならない。
+全 28 family は controller/NAND identity、page + OOB read、physical erase/status、BBT、FTL、capacity metadata、service transition、resume/salvage の同じ検証済み役割へ接続される。さらに全 28 family は、exact USB descriptor + SCSI bootstrap で 1 個の `probe-*.toml` を選び、trace 由来の固定 `read-controller-id` と `read-nand-id` を実行する共通 read-only probe 基盤を利用できる。固定 probe のない 24 family と、固定 probe の対象外世代では、この package probe または full recipe の 2 段 identity が必要である。したがって上表の adapter 数や package probe 対応を C3/C4 対応媒体数として数えてはならない。
 
 「MPTool で初期化できる」「コマンドが GOOD status を返す」「ファームウェアを書き換えられる」は、D1–D4 の処理証拠ではない。C3 を有効にするには、少なくとも全非 FBB ブロックの列挙、D1/D2 の物理消去、旧 RBB の個別消去結果、旧・新 BBT 差分、旧 FTL 世代の無効化、新 FTL の commit、電源再投入後の独立確認が必要である。
 
@@ -54,6 +54,9 @@
 - コンパイル済み support は USB VID ではなく、署名検証済み controller response へ結び付ける。probe 失敗時や `unidentified` を名乗る profile は実行可能にならない。
 - controller backend は core が同一 SCSI object から解決した `/dev/sgN` を必須とし、block fd と sysfs `device` が一致しなければ拒否する。
 - 不明な vendor opcode、OEM VID に対するファミリー横断プローブ、Alcor `0x81` config write、Phison BootROM 遷移は通常の `probe` で送信しない。
+- `nclr-lab probe new` は `nclr info -j` の exact tuple から全 family 用の不完全 skeleton を生成する。`probe check` は exactly 2 個の fixed device-to-host CDB、bounded timeout / transfer、response signature、controller payload、完全な NAND ID、trace digest、HTTPS source を要求する。profile に trust や write role はなく、成功しても destructive capability を公開しない。
+- macOS の `nclr info` と `nclr-lab probe run` は package-managed exact profile が 1 個だけ一致する場合に Apple SCSITask で 2 個の read を実行できる。system disk、non-removable、mounted、holder 付き媒体を拒否し、Apple が許可する exact 6 / 10 / 12 / 16-byte CDB 以外を暗黙変換しない。
+- `nclr-lab tool` は全 28 family の package inventory marker と共通 NAND / BBT / ECC / loader vocabulary、Phison / Alcor / SMI の公開固定列、SanDisk U3 の source literal と x86 constructor を静的抽出する。schema 2 は SMI FFW の controller + exact 6-byte NAND ID + artifact 代入、Alcor の exact FID と CTL generation module 表も抽出し、競合、参照欠落、basename ambiguity を明示する。これは追加対応の調査入口であり、出力は常に candidate-only / production-ineligible である。
 - destructive recipe engine は CDB opcode を固定し、可変 field の byte 0 上書き、overlap、範囲外 transfer、署名のない status / commit response を拒否する。旧 RBB は消去後も再利用せず、FBB と preserve system range を target から除外する。
 - BBT / FTL は inactive 固定長 image、exact checksum algorithm / coverage、prepare / commit marker、generation を recipe で明示し、activate 後に BBT state と commit generation を再読する。host response 消失時は commit state を先に照会する。
 - service mode の USB reset は同一 physical USB path 上の唯一の whole device だけを再 bind し、2-slot SHA-256 controller state と fsync journal から再開する。
@@ -120,7 +123,7 @@ AppoTech、SiliconGo、iCreate、OTi、Prolific、Ameco、Netac、eFortune、ITE
 - [flowswitch/phison](https://github.com/flowswitch/phison) は PS2303 を BootROM 化し、揮発 PRAM コードを実行する public-domain 実装である。[Phison.py](https://github.com/flowswitch/phison/blob/master/host/Phison.py) は同じ version signature と転送シーケンスを独立に実装している。
 - [nand_test.py](https://github.com/flowswitch/phison/blob/master/host/nand_test.py) は XDATA register access と NAND READ ID の研究コードだが、全 NAND geometry、ECC、FBB 保護、RBB、BBT/FTL commit を実装していない。
 
-したがって BootROM / PRAM へ入れる事実だけで D1–D4 を宣言してはならない。nclr は `BtPramCd` の exact length、header/body 512-byte chunk、各 acknowledgement、run command、entry / loader の 2 段階 USB 再列挙を実装した。残る tuple 固有情報は、burner が公開する raw page/erase/status/metadata command と response layout であり、これを authenticated recipe に固定して NAND geometry / ECC layout ごとに HIL 認定する。
+したがって BootROM / PRAM へ入れる事実だけで D1–D4 を宣言してはならない。nclr は `BtPramCd` の exact length、header/body 512-byte chunk、各 acknowledgement、run command、entry / loader の 2 段階 USB 再列挙を実装した。残る tuple 固有情報は、burner が公開する raw page/erase/status/metadata command と response layout である。これらを静的解析と trace から authenticated recipe に固定し、NAND geometry / ECC layout と metadata format を pre-HIL check まで完成させた後、最後に HIL 認定する。
 
 ### MPALL 実ファイル解析
 
@@ -166,6 +169,8 @@ archive 内の `AU698X MP user's manual_Chinese.pdf` は Alcor Micro Internation
 - `FlashList.ini` / `FlashList.dat` / encrypted `flashlist.afl`: 6-byte Flash ID、driving level、NAND 固有設定。
 - `LLF.dll`: 1.5 MiB の opaque LLF payload。通常 PE DLL ではない。
 
+schema 2 の構造解析では、top-level `FlashList.ini` から `89d3902e6452` / `JS29F08G08AANC1` と `ec79a5c00000` / `K9K1G08U0M/A/B` の 2 個の exact FID を取得した。`UfdApi_Gen/CTL/10/FlashList.ini` からは 306 個の module 行を 8／9 個の raw integer parameter として保持し、109 参照を package 内 BIN へ一意解決した。残る 197 参照は package にないため `missing` とし、似た file 名へ置換しない。合計 124 file を controller GEN、NAND operation、die-grade、scan/sort、database role として SHA-256 付き inventory にした。parameter の意味は vendor format で確定していないため、数値を geometry field として解釈していない。
+
 `UfdApi_Gen.dll` は page mapping、original / current bad block、physical page、reserve block、scan pattern、EraseAfterMP、BBT read/write failure を個別に扱う。したがって `82 51 01`、`FA 00`、`81 00 FF` の 3 command だけを hard-code しても正規処理にはならない。controller code と NAND scan code の upload sequence、response signature、BBT / reserve metadata commit を capture から recipe 化する必要がある。
 
 ALCOR U2 MP v20.09.16.00 も追加取得し、2013 年版の分離構造が 3D NAND 世代でも維持されることを確認した。`AlcorMP.exe` は version 3.1.1.33、548,864 byte、SHA-256 `7e4eda0629333e7921c5f73a8300de6d959cf25eb34c0fa626eaa16357770362`、`UfdApi_X3.dll` は 1,736,704 byte、SHA-256 `52c06d1ce3537e431f72d226bfc05a8dc0b6180d72030d0fc47be9c2d32a8340`、`UfdComLib.dll` は SHA-256 `0f215cc08232232d7dbddee85d6a9e8adbff68d337f6add140ea44f1d6e85f01` で、全て署名なしである。2019 年版 vendor manual は SHA-256 `1bce74e048acdf8d6878d7613e59ccc97a3b5be0c7e5e0059e3d5631f7ceb1d7`、2020 年 change log は SHA-256 `14454f9cfa0db097a92407e6c65236ede5c08e14629538eaa4f7f8c8f018b3e7` である。
@@ -195,11 +200,15 @@ package は SM3254AE / SM3255AB / SM3255ENA1 / SM3257AA / SM3257ENAA / SM3260AB 
 - default `SM3257ENAAISP.BIN` は 71,680 byte、SHA-256 `49da877e11c49624773894ac1e7e872eda88a6816a2b644c7f4c153fbb26d1a6`、header 内に `SM3257ENAA` と firmware `111123-AA-` を持つ。
 - `SM3257ENAAPTEST.bin` は 24,576 byte、SHA-256 `cd39a2f34100df1742bb65773a1b3a893f85d40c1408da483eace30731237486` で、original bad block を検出する pretest code である。
 
+schema 2 の構造解析を展開 tree 全体へ適用すると、6 controller map から 154 個の exact NAND binding を得た。対象の `smi-sm3257enaa` だけでは 71 個の完全な 6-byte NAND ID と 142 個の ISP / PTEST 参照があり、142 個全てを package 内の 1 file + size + SHA-256 へ一意解決した。他 controller 用 map の参照 168 個はこの SM3257ENAA 配布物に存在しないため `missing` のままであり、別世代 artifact へ暗黙 fallback しない。
+
 main tool は Info Block と backup、ISP block、spare、erase count、original/new bad block、CE / plane / block / page、ECC、read-retry を区別する。これも host の単一 erase CDB ではなく、Flash ID で選んだ NAND-specific ISP / pretest を controller へ導入して処理する構造である。nclr の `F0 04 00 00 00 00 00 00 00 00 00 02` はこの package と同じ SM32X family を識別するが、NAND ID ではないため、`nclr-lab decode` でもその境界を明示する。
 
 Dyna SM3281 series U0204 も追加取得した。`SMIMPTool.exe` は version 21.2.1.1、3,588,096 byte、SHA-256 `e5d95716610c173a5f11b655e53ef39a5dde5f8f81ee9df5b94cdf65c7c1a5f7`、署名なしである。一方、`PretestGP3265_U0203V1.dll` は Silicon Motion Inc. metadata を持つ version 21.2.3.1、SHA-256 `464381a2b9164834e6547c9cb9bf0b066bb9b5c8ec684d50ddcdab27de97f63e`、`PretestGP3271_U0115V2.dll` は version 21.1.15.2、SHA-256 `43870049820bad7a024e182bce59520fc400338d86c40ffc83b93a0639e53dc3` である。
 
 package は SM3265AB、SM3271AB／AD／BA、SM3281AB／BA／BB ごとの `.FFW`、SM3265AB／SM3271AB／SM3281AB／BB ごとの `.dbf`、1,886 個の NAND / ISP / pretest `.bin`、211 個の `.ebi`、controller 別 read-retry table を分離する。例として `SM3265AB.FFW` は SHA-256 `a6d7cbde3eab116491f0116d69b91ece6bf1999809b730d595556af60f4bfca4`、`SM3271BA.FFW` は `3e68061e965d9a08c1f08c80354bbdb126d93e5bc461d5be814261765e2a65b5`、`SM3281AB.FFW` は `282d96c219f280a798f33a7fb13cc38eee3f71ba1fc43af43b363b0a9419c1da` である。pretest module の文字列は system page/block、original page count、ISP block count、backup page、remapping、SLC/TLC spare pool、ECC 144、read-retry table、multi-CE / plane を個別 field として扱う。
+
+schema 2 の全 tree 解析では 7 controller generation、1,835 個の exact NAND binding、451 個の read-retry table を抽出した。146 binding は同一 key に複数の active value を持つため selection ambiguity を明示したままにする。同名 artifact が複数 path にある場合も、全候補の size と SHA-256 が一致するときだけ `identical-content` とし、異なる byte 列を 1 個へ縮約しない。この静的 binding により NAND ID から候補 ISP / retry / sorting / generic-info 部品までは実機なしで絞れるが、FFW の競合を解消する追加条件と controller への upload / execution protocol は別途確定が必要である。
 
 旧 `UFDIF.dll` には SM325x／SM326x の分岐が残る一方、後期 controller は別 pretest DLL と ISP 群へ委譲される。公開 `F0 04 ... 02` identity command の 12 byte 固定列は後期 PE 内に静的定数として存在せず、動的構築の可能性もあるため、これだけを根拠に SM3281 へ対応済みとはしない。SM3281 系では exact USB / SCSI bootstrap で recipe artifact だけを選び、USB trace 由来の `read-controller-id` / `read-nand-id` response を破壊境界より前に完全一致させる経路を実装した。旧 SM3257 の response parser へ暗黙 fallback しない。
 
@@ -230,6 +239,10 @@ SanDisk が案内していた `LPInstaller.exe` と `launchpadremoval.exe` を�
 
 1.0.2.36 の PE Authenticode は古い MD5 署名なので現在の暗号強度はないが、PE checksum field と certificate table を除外して再計算した Authenticode digest `20e63b5c6974fd6d31a771e859816e2c` は SignedData 内の値と完全一致した。さらに、別の Internet Archive item から取得した同名 file と SanDisk 正規 URL の 2011 年 response は 1,039,736 byte 全体が一致した。
 
+1.0.2.36 は RAR SFX であり、内部の実処理 PE `LPInstaller.exe` は 1,733,944 byte、SHA-256 `26a0aef18db3da91c594f1650e657d4d89181ae02ca76a4e9b2cb0f58b837cf3` である。`nclr-lab tool --family sandisk-cruzer` をこの PE へ適用すると、offset `0x80a21`、`0x91dde`、`0x91ea7`、`0x92460`、`0x92610`、`0x927b0`、`0x92950`、`0x92f30`、`0x9320e`、`0x932df` 付近から 10 個の dynamic x86 constructor candidate を抽出した。命令列は `push 0; push 0xff; push direction; push opcode; push length; call constructor` で、opcode は `25`、`20`、`21`、`22`、`23`、`24`、`25`、`40`、`41`、`42` である。tool 出力はこれらを logical-domain / CD / private configuration と分類し、`production_eligible = false` を固定する。
+
+[Debian u3-tool 0.3-4 の `u3_commands.c`](https://sources.debian.org/src/u3-tool/0.3-4/src/u3_commands.c/) は 13,813 byte、取得 byte 列の SHA-256 は `2f005d2ace03818a74ed05a23517c55c6a311cde0dad55d894bd1c264270a5bc` である。source literal analyzer は `FF 22` と `FF 03 01` を直接検出し、同 source に定義された `FF 00`、`20`、`21`、`42`、`A0`、`A2`、`A3`、`A4`、`A6`、`A7`、`01 01` も logical property / domain / CD / security / reset として分類する。正規 binary の constructor と独立した公開 source が同じ command family を示すため、これらを raw NAND command と解釈する余地はない。
+
 3 世代の LPInstaller と 2 世代の Removal Tool はいずれも `MUSK SDK`、`U3CfgCommands.cpp`、`U3CDCommands.cpp`、`SCSICommands.cpp` を含む。後期 Removal Tool の本処理は `CConfigServiceImpl::setDomains` であり、Vista では `DISABLE_FORMAT` flag を付ける分岐がある。LPInstaller は user data の backup、U3 domain の再構成、`cruzer-autorun.iso` 相当の CD image 書き込み、logical volume format、restore を行う。
 
 正規 binary の constructor と [u3-tool 0.3 source](https://sources.debian.org/src/u3-tool/) を相互照合すると、関連する 12-byte CDB は次の範囲である。
@@ -259,7 +272,7 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 4. 同一 bootstrap tuple に複数 profile が一致する場合、短い NAND prefix しか得られない場合、または response が全 `00` / 全 `FF` の場合は拒否する。
 5. `SDTNNNAHSM` / `SDTNNNAHEM` / `SDTNNNBHSM` / `SDTNNNBHEM`、8-bit / 16-bit / 16-8 表現、XOR / randomizer、page/OOB、ECC layout を別 tuple とし、`82-00263-1` だけを根拠に geometry を共用しない。
 
-このため engine は `82-00263-1` を含む SanDisk proprietary controller recipe を実行できるが、repository には未確認 PID、firmware、CDB、geometry を埋めた production profile を同梱しない。対象個体の正規 tool capture から exact `read-controller-id`、`read-nand-id`、physical erase / raw page / status / BBT / FTL commit command を抽出し、同一 tuple の recipe として固定する必要がある。
+このため engine の bounded grammar は `82-00263-1` を含む SanDisk proprietary controller recipe を表現できるが、現時点でこの marking の媒体に送信できる raw NAND recipe は repository にない。未確認 PID、firmware、CDB、geometry を埋めた profile も同梱しない。対象個体の正規 tool capture から exact `read-controller-id`、`read-nand-id`、physical erase / raw page / status / BBT / FTL commit command を抽出し、同一 tuple の pre-HIL recipe として固定する必要がある。HIL はその後の最終認定であり、これらの command を取得する前提ではない。
 
 ## USBest UT163
 
@@ -286,4 +299,6 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 
 1 組でも不明なら、その領域は `unreachable` または `unknown` のままにする。成功 status だけを根拠に trust を `production` へ変更しない。
 
-プロファイル検証もこの境界を強制する。実媒体で `trust = "production"` を指定する場合、firmware / NAND 範囲は `min = max` の完全一致、D1–D4 の全 accounting、BBT / FTL / spare rebuild、独立 HIL report の SHA-256、reader 名、sample 数、power-cut case 数が必須である。さらに `protected_area_bytes` の明示値、事後の全 LBA 検証で使う `logical_blank_value` (`0` または `255`)、clean-room / runtime artifact の provenance、protocol trace、exact NAND geometry、FBB marker、randomizer / read-retry / ECC layout、BBT / FTL / spare format、atomic commit protocol、明示 policy 付き system block range、exact runtime recipe を必須とする。recipe schema と crash/re-enumeration 契約は [`controller-protocol-recipe.md`](controller-protocol-recipe.md) に記載する。`simulated = true` は組み込み `sim-controller-1` 以外では拒否される。
+プロファイル検証もこの境界を強制する。`trust = "validated"` の real profile に `nclr-lab profile --check --pre-hil --artifact-dir STORE PROFILE` を適用すると、firmware / NAND の完全一致、D1–D4 accounting、BBT / FTL / spare rebuild、`protected_area_bytes`、`logical_blank_value`、clean-room / runtime provenance、protocol trace、exact NAND geometry、FBB marker、randomizer / read-retry / ECC layout、BBT / FTL / spare format、atomic commit、system block policy、runtime recipe、全 non-HIL artifact の実 byte 検証を要求する。recipe は parse だけでなく crash / re-enumeration、response、address field、metadata layout まで意味検証される。
+
+`trust = "production"` への最終昇格で初めて、独立 HIL report の SHA-256、reader 名、sample 数、power-cut case 数を追加する。この分離により、HIL 不在を理由に command 解析や pre-HIL 実装を未完了のまま残せない一方、HIL のない profile が purge capability を自己申告することもできない。recipe schema と crash / re-enumeration 契約は [`controller-protocol-recipe.md`](controller-protocol-recipe.md) に記載する。`simulated = true` は組み込み `sim-controller-1` 以外では拒否される。

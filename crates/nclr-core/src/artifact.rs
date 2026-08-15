@@ -33,6 +33,7 @@ pub enum ArtifactKind {
 pub enum ArtifactFormat {
     PhisonBtPram,
     PhisonBtPramExtended,
+    AlcorAu698xServicePayload,
     PortableExecutable,
     Archive,
     Json,
@@ -147,7 +148,9 @@ pub fn validate_spec(spec: &ArtifactSpec) -> Result<()> {
     match (&spec.kind, &spec.format) {
         (
             ArtifactKind::ServiceLoader,
-            ArtifactFormat::PhisonBtPram | ArtifactFormat::PhisonBtPramExtended,
+            ArtifactFormat::PhisonBtPram
+            | ArtifactFormat::PhisonBtPramExtended
+            | ArtifactFormat::AlcorAu698xServicePayload,
         )
         | (ArtifactKind::FactoryToolExecutable, ArtifactFormat::PortableExecutable)
         | (ArtifactKind::FactoryToolArchive, ArtifactFormat::Archive)
@@ -252,6 +255,22 @@ fn inspect_format(file: &mut File, spec: &ArtifactSpec) -> Result<()> {
                 }
                 _ => unreachable!("matched Phison PRAM formats"),
             }
+        }
+        ArtifactFormat::AlcorAu698xServicePayload => {
+            if spec.size_bytes
+                > (crate::alcor_au698x::MAX_MODULE_SECTORS + 1) as u64
+                    * crate::alcor_au698x::SECTOR_BYTES as u64
+            {
+                return Err(Error::Invalid(
+                    "Alcor AU698x service payload exceeds its bounded sector count".into(),
+                ));
+            }
+            file.seek(SeekFrom::Start(0))
+                .map_err(|e| Error::io("seek Alcor service payload", Some(e)))?;
+            let mut payload = Vec::with_capacity(spec.size_bytes as usize);
+            file.read_to_end(&mut payload)
+                .map_err(|e| Error::io("read Alcor service payload", Some(e)))?;
+            crate::alcor_au698x::validate_service_payload(&payload)?;
         }
         ArtifactFormat::PortableExecutable => {
             if n < 2 || &head[..2] != b"MZ" {
@@ -619,6 +638,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("loader.bin");
         std::fs::write(&path, image).unwrap();
+        open_verified(&path, &spec).unwrap();
+    }
+
+    #[test]
+    fn validates_alcor_service_payload_structure_after_digest() {
+        let mut module = vec![0u8; crate::alcor_au698x::SECTOR_BYTES];
+        let end = module.len();
+        module[end - 2..].copy_from_slice(&[0x55, 0xaa]);
+        let mut parameters = vec![0u8; crate::alcor_au698x::PARAMETER_PAGE_BYTES];
+        let end = parameters.len();
+        parameters[end - 2..].copy_from_slice(b"JN");
+        let payload = crate::alcor_au698x::build_service_upload(&module, &parameters)
+            .unwrap()
+            .payload;
+        let spec = spec(
+            &payload,
+            ArtifactFormat::AlcorAu698xServicePayload,
+            ArtifactKind::ServiceLoader,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service-payload.bin");
+        std::fs::write(&path, payload).unwrap();
         open_verified(&path, &spec).unwrap();
     }
 

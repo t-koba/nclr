@@ -153,12 +153,33 @@ pub struct PhysicalPageGeometry {
     pub page: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PageEccStatus {
+    /// The transport returned raw bytes without a controller- or host-side
+    /// ECC verdict. These bytes are useful for forensics but cannot establish
+    /// that a programmed page was reconstructed correctly.
+    #[default]
+    Unknown,
+    Correctable,
+    Uncorrectable,
+}
+
+impl PageEccStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Correctable => "correctable",
+            Self::Uncorrectable => "uncorrectable",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PageMetrics {
     pub corrected_bits: u64,
     pub read_retries: u64,
     pub read_latency_ms: u64,
-    pub uncorrectable: bool,
+    pub ecc_status: PageEccStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,6 +201,7 @@ pub struct BlockSweepSummary {
     pub pages: u64,
     pub readable_pages: u64,
     pub unreadable_pages: u64,
+    pub ecc_unknown_pages: u64,
     pub uncorrectable_pages: u64,
     pub non_erased_pages: u64,
     pub non_erased_bytes: u64,
@@ -195,16 +217,19 @@ pub struct SweepSummary {
     pub total_pages: u64,
     pub readable_pages: u64,
     pub unreadable_pages: u64,
+    pub ecc_unknown_pages: u64,
     pub uncorrectable_pages: u64,
     pub target_pages: u64,
     pub target_readable_pages: u64,
     pub target_unreadable_pages: u64,
+    pub target_ecc_unknown_pages: u64,
     pub target_uncorrectable_pages: u64,
     pub excluded_unreadable_pages: u64,
     pub target_non_erased_pages: u64,
     pub target_non_erased_bytes: u64,
     pub excluded_non_erased_pages: u64,
     pub all_addresses_readable: bool,
+    pub all_pages_ecc_known: bool,
     pub all_pages_correctable: bool,
     pub erased_scope_verified: bool,
     pub ordered_sweep_sha256: String,
@@ -244,6 +269,7 @@ struct MapPage<'a> {
     corrected_bits: Option<u64>,
     read_retries: Option<u64>,
     read_latency_ms: Option<u64>,
+    ecc_known: Option<bool>,
     uncorrectable: Option<bool>,
     error: Option<&'a str>,
 }
@@ -328,10 +354,12 @@ pub fn sweep_physical_pages(
     let mut image_hash = image.as_ref().map(|_| Sha256::new());
     let mut readable_pages = 0u64;
     let mut unreadable_pages = 0u64;
+    let mut ecc_unknown_pages = 0u64;
     let mut uncorrectable_pages = 0u64;
     let mut target_pages = 0u64;
     let mut target_readable_pages = 0u64;
     let mut target_unreadable_pages = 0u64;
+    let mut target_ecc_unknown_pages = 0u64;
     let mut target_uncorrectable_pages = 0u64;
     let mut excluded_unreadable_pages = 0u64;
     let mut target_non_erased_pages = 0u64;
@@ -400,9 +428,16 @@ pub fn sweep_physical_pages(
                         .max(read.metrics.read_latency_ms);
                     if expected_erased {
                         target_readable_pages = target_readable_pages.saturating_add(1);
-                        if read.metrics.uncorrectable {
-                            target_uncorrectable_pages =
-                                target_uncorrectable_pages.saturating_add(1);
+                        match read.metrics.ecc_status {
+                            PageEccStatus::Unknown => {
+                                target_ecc_unknown_pages =
+                                    target_ecc_unknown_pages.saturating_add(1);
+                            }
+                            PageEccStatus::Uncorrectable => {
+                                target_uncorrectable_pages =
+                                    target_uncorrectable_pages.saturating_add(1);
+                            }
+                            PageEccStatus::Correctable => {}
                         }
                         if non_erased > 0 {
                             target_non_erased_pages = target_non_erased_pages.saturating_add(1);
@@ -417,16 +452,27 @@ pub fn sweep_physical_pages(
                         block.non_erased_pages = block.non_erased_pages.saturating_add(1);
                         block.non_erased_bytes = block.non_erased_bytes.saturating_add(non_erased);
                     }
-                    if read.metrics.uncorrectable {
-                        uncorrectable_pages = uncorrectable_pages.saturating_add(1);
-                        block.uncorrectable_pages = block.uncorrectable_pages.saturating_add(1);
+                    match read.metrics.ecc_status {
+                        PageEccStatus::Unknown => {
+                            ecc_unknown_pages = ecc_unknown_pages.saturating_add(1);
+                            block.ecc_unknown_pages = block.ecc_unknown_pages.saturating_add(1);
+                        }
+                        PageEccStatus::Uncorrectable => {
+                            uncorrectable_pages = uncorrectable_pages.saturating_add(1);
+                            block.uncorrectable_pages = block.uncorrectable_pages.saturating_add(1);
+                        }
+                        PageEccStatus::Correctable => {}
                     }
                     sweep_hash.update([1]);
                     sweep_hash.update(hex::decode(&digest).expect("SHA-256 is valid hex"));
                     sweep_hash.update(read.metrics.corrected_bits.to_le_bytes());
                     sweep_hash.update(read.metrics.read_retries.to_le_bytes());
                     sweep_hash.update(read.metrics.read_latency_ms.to_le_bytes());
-                    sweep_hash.update([u8::from(read.metrics.uncorrectable)]);
+                    sweep_hash.update([match read.metrics.ecc_status {
+                        PageEccStatus::Unknown => 0,
+                        PageEccStatus::Correctable => 1,
+                        PageEccStatus::Uncorrectable => 2,
+                    }]);
                     if let Some(hasher) = image_hash.as_mut() {
                         hasher.update(&read.raw);
                     }
@@ -450,17 +496,18 @@ pub fn sweep_physical_pages(
                                 data_length: geometry.page_bytes,
                                 oob_length: geometry.oob_bytes,
                                 read_status: "ok",
-                                ecc_status: if read.metrics.uncorrectable {
-                                    "uncorrectable"
-                                } else {
-                                    "correctable"
-                                },
+                                ecc_status: read.metrics.ecc_status.as_str(),
                                 sha256: Some(digest),
                                 non_erased_bytes: Some(non_erased),
                                 corrected_bits: Some(read.metrics.corrected_bits),
                                 read_retries: Some(read.metrics.read_retries),
                                 read_latency_ms: Some(read.metrics.read_latency_ms),
-                                uncorrectable: Some(read.metrics.uncorrectable),
+                                ecc_known: Some(read.metrics.ecc_status != PageEccStatus::Unknown),
+                                uncorrectable: match read.metrics.ecc_status {
+                                    PageEccStatus::Unknown => None,
+                                    PageEccStatus::Correctable => Some(false),
+                                    PageEccStatus::Uncorrectable => Some(true),
+                                },
                                 error: None,
                             },
                         )?;
@@ -506,6 +553,7 @@ pub fn sweep_physical_pages(
                                 corrected_bits: None,
                                 read_retries: None,
                                 read_latency_ms: None,
+                                ecc_known: None,
                                 uncorrectable: None,
                                 error: Some(&message),
                             },
@@ -541,19 +589,23 @@ pub fn sweep_physical_pages(
         total_pages,
         readable_pages,
         unreadable_pages,
+        ecc_unknown_pages,
         uncorrectable_pages,
         target_pages,
         target_readable_pages,
         target_unreadable_pages,
+        target_ecc_unknown_pages,
         target_uncorrectable_pages,
         excluded_unreadable_pages,
         target_non_erased_pages,
         target_non_erased_bytes,
         excluded_non_erased_pages,
         all_addresses_readable: unreadable_pages == 0,
-        all_pages_correctable: uncorrectable_pages == 0,
+        all_pages_ecc_known: ecc_unknown_pages == 0,
+        all_pages_correctable: ecc_unknown_pages == 0 && uncorrectable_pages == 0,
         erased_scope_verified: target_readable_pages == target_pages
             && target_unreadable_pages == 0
+            && target_ecc_unknown_pages == 0
             && target_uncorrectable_pages == 0
             && target_non_erased_pages == 0,
         ordered_sweep_sha256: hex::encode(sweep_hash.finalize()),
@@ -598,7 +650,10 @@ mod tests {
                 };
                 Ok(PageRead {
                     raw,
-                    metrics: PageMetrics::default(),
+                    metrics: PageMetrics {
+                        ecc_status: PageEccStatus::Correctable,
+                        ..PageMetrics::default()
+                    },
                 })
             },
             |_, _| Ok(()),
@@ -707,7 +762,7 @@ mod tests {
                 Ok(PageRead {
                     raw: vec![0xff; 4],
                     metrics: PageMetrics {
-                        uncorrectable: true,
+                        ecc_status: PageEccStatus::Uncorrectable,
                         ..PageMetrics::default()
                     },
                 })
@@ -718,6 +773,41 @@ mod tests {
         assert_eq!(summary.readable_pages, 1);
         assert_eq!(summary.uncorrectable_pages, 1);
         assert_eq!(summary.target_uncorrectable_pages, 1);
+        assert!(!summary.all_pages_correctable);
+        assert!(!summary.erased_scope_verified);
+    }
+
+    #[test]
+    fn raw_page_without_ecc_verdict_cannot_verify_erasure() {
+        let summary = sweep_physical_pages(
+            SweepGeometry {
+                blocks: 1,
+                channels: 1,
+                chips_per_channel: 1,
+                luns_per_chip: 1,
+                planes_per_lun: 1,
+                blocks_per_lun: 1,
+                pages_per_block: 1,
+                page_bytes: 4,
+                oob_bytes: 0,
+            },
+            &[PhysicalDisposition::Data],
+            0xff,
+            None,
+            None,
+            |_flat, _page| {
+                Ok(PageRead {
+                    raw: vec![0xff; 4],
+                    metrics: PageMetrics::default(),
+                })
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(summary.readable_pages, 1);
+        assert_eq!(summary.ecc_unknown_pages, 1);
+        assert_eq!(summary.target_ecc_unknown_pages, 1);
+        assert!(!summary.all_pages_ecc_known);
         assert!(!summary.all_pages_correctable);
         assert!(!summary.erased_scope_verified);
     }

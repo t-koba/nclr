@@ -193,12 +193,16 @@ inferred.
 Built-in read-only probes are deliberately narrower than that catalog:
 Phison PS2251-compatible version pages, Alcor AU698x-compatible configuration
 pages, the public SMI SM32X identity page, and the USBest UT163-compatible
-INQUIRY marker. Other families and generations first select the required
-recipe by an exact USB descriptor plus SCSI tuple, then verify recipe-owned
-controller and NAND identity responses before execution. A VID hint is only a
-candidate and exposes no capability. The tuple never authorizes destructive
-commands by itself. No real tuple is bundled as `production`, so D1-D4/C3
-remains unavailable until that tuple's recipe and independent HIL
+INQUIRY marker. All 28 families also share package-managed `probe-*.toml`
+support: one exact USB descriptor plus SCSI tuple selects exactly two fixed
+device-to-host commands whose signed controller and NAND identity payloads
+must match byte-for-byte. On macOS these reads use Apple SCSITask and require
+an unmounted removable whole disk; only exact 6/10/12/16-byte CDBs are sent.
+The profile has no trust or write role and never authorizes purge. Other
+families and generations use the same two identities in the full runtime
+recipe before execution. A VID hint is only a candidate and exposes no
+capability. No real tuple is bundled as `production`, so D1-D4/C3 remains
+unavailable until that tuple's complete recipe and independent HIL
 qualification are installed. Planning pins the required runtime artifact
 digests; execution verifies those bytes before enabling destructive commands.
 The boundary is documented in
@@ -218,7 +222,9 @@ nclr ls
 # remaining evidence required to add an unsupported controller. Native SD
 # adds an sd_research bundle with all available CID/CSD/SCR/card fields and
 # the distinct internal-controller evidence still missing. On macOS, OS
-# identity collection itself sends no media command.
+# identity collection itself sends no media command; an already installed
+# exact probe profile may add only its two declared reads when the disk is
+# unmounted and passes the read-only safety preflight.
 nclr info /dev/diskN
 nclr info -j /dev/diskN
 
@@ -286,6 +292,14 @@ target/debug/nclr-lab profile --new --family sim --controller ctlr-1
 target/debug/nclr-lab trace factory-tool.pcapng -o factory-tool.ndjson
 target/debug/nclr-lab artifact verify artifact.toml --store controller-artifacts
 target/debug/nclr-lab recipe --profile exact-production.toml --file recipe.json
+target/debug/nclr-lab tool downloaded-tool --family sandisk-cruzer
+target/debug/nclr-lab probe new controller-inventory.json \
+  --family sandisk-cruzer --controller sandisk-82-00263-1 \
+  --firmware EXACT --nand-id EXACT_HEX -o probe.toml
+target/debug/nclr-lab probe check probe.toml
+target/debug/nclr-lab probe run probe.toml /dev/diskN
+target/debug/nclr-lab profile --check --pre-hil \
+  --artifact-dir controller-artifacts exact-validated.toml
 ```
 
 ### Machine-observable results
@@ -378,10 +392,11 @@ Evidence is graded independently:
 | Component            | Linux (x86_64/arm64)       | macOS                         |
 |----------------------|----------------------------|-------------------------------|
 | `ls`/`info`          | sysfs (block, mmc, sg, usb) | diskutil / IOKit info         |
+| exact controller read probe | SG_IO package profile | SCSITask package profile      |
 | `plan`/`run`         | /dev/sdX, /dev/mmcblkN     | /dev/rdiskN (raw, needs root) |
 | SCSI SANITIZE (C2)   | `nclr-scsi` (SG_IO)        | — (falls back to lba, C1)     |
 | SD full-range ERASE  | `nclr-sd-native` (MMC)     | — (falls back to lba, C1)     |
-| controller reinit    | `nclr-controller` (profiles) | sim reference only         |
+| controller reinit    | `nclr-controller` (production profiles) | sim reference only |
 | sim/file targets     | full                       | full                          |
 | power cycle          | `--power-cycle CMD` / sim  | `--power-cycle CMD` / sim     |
 
@@ -453,7 +468,7 @@ write test: the range is saved, PRBS-written, flushed, verified and restored
   an undefined structure or an unrepresentable full range disables C2
   explicitly.
 - `nclr-lab` (research tooling: artifact/cap/controller/decode/diff/infer/
-  profile/recipe/replay/trace) is separated from destructive handlers. Artifact
+  probe/profile/recipe/replay/tool/trace) is separated from destructive handlers. Artifact
   acquisition pins HTTPS source, terms, size, SHA-256, format and exact
   hardware tuple without redistributing vendor bytes. Trace conversion runs
   on macOS with Wireshark/TShark, validates USB BOT CBW/CSW framing, and
@@ -470,11 +485,13 @@ write test: the range is saved, PRBS-written, flushed, verified and restored
 - C4 applies to the certified sim family; real-vendor physical backends
   need their own certified profiles + HIL.
 - Real vendor controller execution for every registered family requires a
-  certified production profile and hardware-in-the-loop qualification. The
+  certified production profile and hardware-in-the-loop qualification. Before
+  HIL, `profile --check --pre-hil` now requires exact geometry, metadata
+  layout, authenticated protocol recipe/trace, clean-room/runtime provenance
+  and every non-qualification artifact byte to match and validates recipe
+  semantics. HIL adds only the independent qualification evidence. The
   compiled recipe engine implements the erase/rebuild primitives for all 28
-  adapters, but capability is exposed only when exact geometry, metadata
-  layout, authenticated protocol recipe/trace, qualification report and
-  clean-room/runtime provenance all match. Without the trusted exact profile,
+  adapters, but capability is exposed only after both stages match. Without the trusted exact profile,
   `-l controller` fails at plan time (exit 2); without its pinned artifact
   bytes, `run` fails before confirmation.
 - LBA processing cannot prove that OP/spare blocks, retired blocks or

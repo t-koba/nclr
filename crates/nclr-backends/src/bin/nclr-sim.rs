@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Sim backend: executes the L1 recipe, device
 //! erase and controller reinitialization actions against the virtual NAND
 //! model (crates/nclr-core/src/sim.rs). Power cycle is internal.
@@ -799,7 +801,10 @@ fn dispatch(
                     dev.read_physical_page(flat as u32, page, &mut raw)?;
                     Ok(nclr::physical::PageRead {
                         raw,
-                        metrics: nclr::physical::PageMetrics::default(),
+                        metrics: nclr::physical::PageMetrics {
+                            ecc_status: nclr::physical::PageEccStatus::Correctable,
+                            ..nclr::physical::PageMetrics::default()
+                        },
                     })
                 },
                 |done, total| events.progress(action, done, total, "page"),
@@ -827,6 +832,7 @@ fn dispatch(
                 .iter()
                 .filter(|block| {
                     block.unreadable_pages > 0
+                        || block.ecc_unknown_pages > 0
                         || block.uncorrectable_pages > 0
                         || (!salvage
                             && block.disposition.expected_erased()
@@ -838,6 +844,7 @@ fn dispatch(
                 .iter()
                 .filter(|block| {
                     block.unreadable_pages > 0
+                        || block.ecc_unknown_pages > 0
                         || block.uncorrectable_pages > 0
                         || (!salvage
                             && block.disposition.expected_erased()
@@ -848,9 +855,12 @@ fn dispatch(
             Ok(json!({
                "status": if complete { "ok" } else { "partial" },
                "errors": if complete { 0 } else if salvage {
-                   summary.unreadable_pages.saturating_add(summary.uncorrectable_pages)
+                   summary.unreadable_pages
+                       .saturating_add(summary.ecc_unknown_pages)
+                       .saturating_add(summary.uncorrectable_pages)
                } else {
                    summary.target_unreadable_pages
+                       .saturating_add(summary.target_ecc_unknown_pages)
                        .saturating_add(summary.target_uncorrectable_pages)
                        .saturating_add(summary.target_non_erased_pages)
                },
@@ -858,16 +868,19 @@ fn dispatch(
                "total_pages": summary.total_pages,
                "readable_pages": summary.readable_pages,
                "unreadable_pages": summary.unreadable_pages,
+               "ecc_unknown_pages": summary.ecc_unknown_pages,
                "uncorrectable_pages": summary.uncorrectable_pages,
                "target_pages": summary.target_pages,
                "target_readable_pages": summary.target_readable_pages,
                "target_unreadable_pages": summary.target_unreadable_pages,
+               "target_ecc_unknown_pages": summary.target_ecc_unknown_pages,
                "target_uncorrectable_pages": summary.target_uncorrectable_pages,
                "excluded_unreadable_pages": summary.excluded_unreadable_pages,
                "target_non_erased_pages": summary.target_non_erased_pages,
                "target_non_erased_bytes": summary.target_non_erased_bytes,
                "excluded_non_erased_pages": summary.excluded_non_erased_pages,
                "all_addresses_readable": summary.all_addresses_readable,
+               "all_pages_ecc_known": summary.all_pages_ecc_known,
                "all_pages_correctable": summary.all_pages_correctable,
                "erased_scope_verified": summary.erased_scope_verified,
                "ordered_sweep_sha256": summary.ordered_sweep_sha256,
@@ -895,6 +908,7 @@ fn dispatch(
                             "pages": block.pages,
                             "readable_pages": block.readable_pages,
                             "unreadable_pages": block.unreadable_pages,
+                            "ecc_unknown_pages": block.ecc_unknown_pages,
                             "uncorrectable_pages": block.uncorrectable_pages,
                             "non_erased_pages": block.non_erased_pages,
                             "non_erased_bytes": block.non_erased_bytes,

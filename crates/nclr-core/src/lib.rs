@@ -1,15 +1,18 @@
 //! nclr - NAND media erase / reinitialize CLI.
 //!
 //! Phase 0 (Safe Core) + Phase 1 (LBA C1) implementation.
-//! Target platform is Linux (x86_64/arm64); macOS is supported for
-//! development and for the LBA path. See README.md for the support matrix.
+//! Linux uses SG_IO for controller recipes and macOS uses Apple SCSITask;
+//! both platforms also support the LBA path. See README.md for the support
+//! matrix.
 
+pub mod alcor_au698x;
 pub mod artifact;
 pub mod backend;
 pub mod backend_common;
 pub mod config;
 pub mod confirm;
 pub mod controller;
+pub mod controller_probe;
 pub mod controller_protocol;
 pub mod controller_recipe;
 pub mod device;
@@ -19,6 +22,13 @@ pub mod grade;
 pub mod journal;
 pub mod lba;
 pub mod lock;
+#[cfg(target_os = "macos")]
+mod macos_iokit;
+#[cfg(target_os = "macos")]
+pub mod macos_scsi;
+#[cfg(target_os = "macos")]
+pub mod macos_usb_bot;
+pub mod phison_ps2303;
 pub mod physical;
 pub mod plan;
 pub mod powercycle;
@@ -29,7 +39,9 @@ pub mod scsi;
 pub mod sd;
 pub mod signal;
 pub mod sim;
+pub mod smi_ufdif;
 pub mod usb_bot;
+pub mod vendor_tool;
 
 pub const SCHEMA_DEVICE: &str = "nclr.device.v1";
 pub const SCHEMA_PLAN: &str = "nclr.plan.v1";

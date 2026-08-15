@@ -6,7 +6,7 @@
 //! Destructive execution requires an *exact* match and a `production` trust
 //! state; anything else is refused.
 
-use crate::artifact::{self, ArtifactFormat, ArtifactKind, ArtifactSpec};
+use crate::artifact::{self, ArtifactFormat, ArtifactKind, ArtifactSpec, VerifiedArtifact};
 use crate::errors::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -134,7 +134,9 @@ pub struct QualificationPolicy {
 pub struct ImplementationPolicy {
     /// `clean-room` or `runtime-artifact`.
     pub strategy: String,
-    /// Digest of a captured USB BOT trace supporting the implementation.
+    /// Digest of the exact protocol trace or factory-tool executable used as
+    /// implementation evidence. Executables are analyzed as inert bytes and
+    /// are never inherited by the backend through this field.
     pub protocol_evidence_sha256: String,
     /// Primary-source URL or public clean-room design record.
     pub source_reference: String,
@@ -707,6 +709,14 @@ pub fn source_digest(source: &str) -> String {
 }
 
 pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
+    validate_common(profile, path)?;
+    if profile.destructive_allowed() && !profile.simulated {
+        validate_real_production(profile, path)?;
+    }
+    Ok(())
+}
+
+fn validate_common(profile: &Profile, path: &Path) -> Result<()> {
     if profile.schema != PROFILE_SCHEMA {
         return Err(Error::Invalid(format!(
             "profile {}: schema {} != {PROFILE_SCHEMA}",
@@ -753,40 +763,7 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
         )));
     }
     if let Some(bootstrap) = &profile.controller_bootstrap {
-        let canonical_scsi = |value: &str, maximum: usize| {
-            !value.is_empty()
-                && value.len() <= maximum
-                && value.trim() == value
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-        };
-        let canonical_usb = |value: &str| {
-            value.len() <= 255
-                && value
-                    .chars()
-                    .all(|character| !character.is_control() && character != '\0')
-        };
-        let family = crate::controller_protocol::family_from_recipe_str(&bootstrap.family);
-        let controller_family_matches =
-            family.is_some_and(|family| family.accepts_controller_id(&profile.controller_id));
-        if profile.simulated
-            || family.is_none()
-            || family.is_some_and(|family| bootstrap.family != family.recipe_str())
-            || !controller_family_matches
-            || bootstrap.usb_vid == 0
-            || !canonical_usb(&bootstrap.usb_manufacturer)
-            || !canonical_usb(&bootstrap.usb_product)
-            || !canonical_usb(&bootstrap.usb_serial)
-            || !canonical_scsi(&bootstrap.scsi_vendor, 8)
-            || !canonical_scsi(&bootstrap.scsi_product, 16)
-            || !canonical_scsi(&bootstrap.scsi_revision, 4)
-        {
-            return Err(Error::Invalid(format!(
-                "profile {}: controller_bootstrap must name a supported family and exact USB/SCSI tuple",
-                path.display()
-            )));
-        }
+        validate_controller_bootstrap(bootstrap, &profile.controller_id, profile.simulated, path)?;
     }
     // A read-only health query is a CMD56-style read (SD spec argument
     // bit 0 = 1); declaring read_only_health with the write direction is
@@ -815,9 +792,6 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
             ))
         })?;
     }
-    if profile.destructive_allowed() && !profile.simulated {
-        validate_real_production(profile, path)?;
-    }
     if let Some(d) = &profile.sha256 {
         let d = d.strip_prefix("sha256:").unwrap_or(d);
         if d.len() != 64 || !d.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -839,6 +813,52 @@ pub fn validate(profile: &Profile, path: &Path) -> Result<()> {
                 path.display(),
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate an exact USB/SCSI bootstrap used only to select a controller-
+/// owned identity command. The tuple is a selector, never authorization for
+/// destructive execution.
+pub fn validate_controller_bootstrap(
+    bootstrap: &ControllerBootstrapPolicy,
+    controller_id: &str,
+    simulated: bool,
+    path: &Path,
+) -> Result<()> {
+    let canonical_scsi = |value: &str, maximum: usize| {
+        !value.is_empty()
+            && value.len() <= maximum
+            && value.trim() == value
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    };
+    let canonical_usb = |value: &str| {
+        value.len() <= 255
+            && value
+                .chars()
+                .all(|character| !character.is_control() && character != '\0')
+    };
+    let family = crate::controller_protocol::family_from_recipe_str(&bootstrap.family);
+    let controller_family_matches =
+        family.is_some_and(|family| family.accepts_controller_id(controller_id));
+    if simulated
+        || family.is_none()
+        || family.is_some_and(|family| bootstrap.family != family.recipe_str())
+        || !controller_family_matches
+        || bootstrap.usb_vid == 0
+        || !canonical_usb(&bootstrap.usb_manufacturer)
+        || !canonical_usb(&bootstrap.usb_product)
+        || !canonical_usb(&bootstrap.usb_serial)
+        || !canonical_scsi(&bootstrap.scsi_vendor, 8)
+        || !canonical_scsi(&bootstrap.scsi_product, 16)
+        || !canonical_scsi(&bootstrap.scsi_revision, 4)
+    {
+        return Err(Error::Invalid(format!(
+            "profile {}: controller_bootstrap must name a supported family and exact USB/SCSI tuple",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -914,25 +934,51 @@ fn validate_artifacts(profile: &Profile, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
+/// Validate every production-profile requirement that can be established
+/// without hardware-in-the-loop qualification. Passing this function does
+/// not authorize destructive execution and does not change profile trust.
+pub fn validate_pre_hil(profile: &Profile, path: &Path) -> Result<()> {
+    validate_common(profile, path)?;
+    validate_pre_hil_requirements(profile, path)
+}
+
+fn validate_pre_hil_requirements(profile: &Profile, path: &Path) -> Result<()> {
+    if profile.simulated {
+        return Err(Error::Invalid(format!(
+            "profile {}: pre-HIL validation applies only to real controller profiles",
+            path.display()
+        )));
+    }
+    if !matches!(profile.logical_blank_value, Some(0x00 | 0xff)) {
+        return Err(Error::Invalid(format!(
+            "profile {}: a pre-HIL controller profile requires logical_blank_value 0 or 255",
+            path.display()
+        )));
+    }
+    validate_capacity_policy(&profile.capacity).map_err(|error| {
+        Error::Invalid(format!(
+            "profile {}: invalid capacity policy: {error}",
+            path.display()
+        ))
+    })?;
     let firmware = exact_value(&profile.firmware);
     let nand_id = exact_value(&profile.nand_id);
     if firmware.is_none() || nand_id.is_none() {
         return Err(Error::Invalid(format!(
-            "profile {}: a real production profile requires exact firmware and NAND ids",
+            "profile {}: a pre-HIL controller profile requires exact firmware and NAND ids",
             path.display()
         )));
     }
     if profile.protected_area_bytes.is_none() {
         return Err(Error::Invalid(format!(
-            "profile {}: a real production profile must explicitly declare protected_area_bytes",
+            "profile {}: a pre-HIL controller profile must explicitly declare protected_area_bytes",
             path.display()
         )));
     }
     for domain in ["D1", "D2", "D3", "D4"] {
         if !profile.coverage.iter().any(|d| d == domain) {
             return Err(Error::Invalid(format!(
-                "profile {}: a real production profile must account for {domain}",
+                "profile {}: a pre-HIL controller profile must account for {domain}",
                 path.display()
             )));
         }
@@ -940,65 +986,14 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
     for rebuild in ["BBT", "FTL", "spare"] {
         if !profile.rebuilds.iter().any(|r| r == rebuild) {
             return Err(Error::Invalid(format!(
-                "profile {}: a real production profile must declare {rebuild} rebuild",
+                "profile {}: a pre-HIL controller profile must declare {rebuild} rebuild",
                 path.display()
             )));
         }
     }
-    let q = profile.qualification.as_ref().ok_or_else(|| {
-        Error::Invalid(format!(
-            "profile {}: a real production profile requires independent qualification",
-            path.display()
-        ))
-    })?;
-    let digest = digest_value(&q.report_sha256);
-    if digest.is_none() {
-        return Err(Error::Invalid(format!(
-            "profile {}: qualification report_sha256 must be 64 hex chars",
-            path.display()
-        )));
-    }
-    if q.independent_reader.trim().is_empty()
-        || q.samples == 0
-        || q.power_cut_cases == 0
-        || q.report_artifact_id.is_empty()
-    {
-        return Err(Error::Invalid(format!(
-            "profile {}: qualification requires an independent reader, samples, power-cut cases and report artifact",
-            path.display()
-        )));
-    }
-    let report = profile
-        .artifacts
-        .iter()
-        .find(|a| a.id == q.report_artifact_id)
-        .ok_or_else(|| {
-            Error::Invalid(format!(
-                "profile {}: qualification report artifact {} is absent",
-                path.display(),
-                q.report_artifact_id
-            ))
-        })?;
-    if report.kind != ArtifactKind::QualificationReport
-        || report.format != ArtifactFormat::Json
-        || !digest
-            .expect("validated report digest")
-            .eq_ignore_ascii_case(
-                report
-                    .sha256
-                    .strip_prefix("sha256:")
-                    .unwrap_or(&report.sha256),
-            )
-    {
-        return Err(Error::Invalid(format!(
-            "profile {}: qualification report artifact kind or digest mismatch",
-            path.display()
-        )));
-    }
-
     let implementation = profile.implementation.as_ref().ok_or_else(|| {
         Error::Invalid(format!(
-            "profile {}: a real production profile requires implementation provenance",
+            "profile {}: a pre-HIL controller profile requires implementation provenance",
             path.display()
         ))
     })?;
@@ -1033,14 +1028,24 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
             path.display()
         )));
     }
-    if !profile.artifacts.iter().any(|a| {
-        a.kind == ArtifactKind::ProtocolTrace
-            && a.format == ArtifactFormat::Pcapng
-            && protocol_digest
-                .eq_ignore_ascii_case(a.sha256.strip_prefix("sha256:").unwrap_or(&a.sha256))
-    }) {
+    let valid_protocol_evidence = profile.artifacts.iter().any(|artifact| {
+        protocol_digest.eq_ignore_ascii_case(
+            artifact
+                .sha256
+                .strip_prefix("sha256:")
+                .unwrap_or(&artifact.sha256),
+        ) && matches!(
+            (&artifact.kind, &artifact.format),
+            (ArtifactKind::ProtocolTrace, ArtifactFormat::Pcapng)
+                | (
+                    ArtifactKind::FactoryToolExecutable,
+                    ArtifactFormat::PortableExecutable
+                )
+        ) && (artifact.kind != ArtifactKind::FactoryToolExecutable || artifact.source_url.is_some())
+    });
+    if !valid_protocol_evidence {
         return Err(Error::Invalid(format!(
-            "profile {}: no protocol-trace artifact matches protocol_evidence_sha256",
+            "profile {}: no protocol-trace or sourced factory-tool executable artifact matches protocol_evidence_sha256",
             path.display()
         )));
     }
@@ -1055,6 +1060,14 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
         if !profile.artifacts.iter().any(|a| &a.id == id) {
             return Err(Error::Invalid(format!(
                 "profile {}: runtime artifact {id} is not declared",
+                path.display()
+            )));
+        }
+        if profile.artifacts.iter().any(|artifact| {
+            &artifact.id == id && artifact.kind == ArtifactKind::FactoryToolExecutable
+        }) {
+            return Err(Error::Invalid(format!(
+                "profile {}: factory-tool executable {id} is static evidence and must not be inherited by the backend",
                 path.display()
             )));
         }
@@ -1087,21 +1100,21 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
         )
     {
         return Err(Error::Invalid(format!(
-            "profile {}: a real production profile requires exactly one runtime protocol-recipe artifact",
+            "profile {}: a pre-HIL controller profile requires exactly one runtime protocol-recipe artifact",
             path.display()
         )));
     }
 
     let geometry = profile.geometry.as_ref().ok_or_else(|| {
         Error::Invalid(format!(
-            "profile {}: a real production profile requires exact NAND geometry",
+            "profile {}: a pre-HIL controller profile requires exact NAND geometry",
             path.display()
         ))
     })?;
     validate_geometry(geometry, path)?;
     let metadata = profile.metadata_layout.as_ref().ok_or_else(|| {
         Error::Invalid(format!(
-            "profile {}: a real production profile requires controller metadata layout",
+            "profile {}: a pre-HIL controller profile requires controller metadata layout",
             path.display()
         ))
     })?;
@@ -1112,11 +1125,109 @@ fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
         .any(|range| range.policy == SystemBlockPolicy::Preserve)
     {
         return Err(Error::Invalid(format!(
-            "profile {}: a real production profile cannot preserve controller metadata blocks",
+            "profile {}: a pre-HIL controller profile cannot preserve controller metadata blocks",
             path.display()
         )));
     }
     Ok(())
+}
+
+/// Authenticate and semantically validate every non-HIL artifact declared by
+/// a pre-HIL profile. Qualification reports are deliberately excluded: they
+/// are hardware evidence and are checked by [`validate_hil_qualification`].
+///
+/// Passing this function establishes that the profile, static executable or
+/// trace evidence, runtime recipe, loader and other declared research bytes
+/// are locally complete. It never changes trust or authorizes destructive
+/// execution.
+pub fn validate_pre_hil_artifacts(
+    profile: &Profile,
+    path: &Path,
+    stores: &[PathBuf],
+) -> Result<Vec<VerifiedArtifact>> {
+    validate_pre_hil(profile, path)?;
+    if stores.is_empty() {
+        return Err(Error::Usage(
+            "pre-HIL artifact validation requires at least one artifact store".into(),
+        ));
+    }
+
+    let mut verified = Vec::new();
+    for spec in profile
+        .artifacts
+        .iter()
+        .filter(|spec| spec.kind != ArtifactKind::QualificationReport)
+    {
+        let (mut file, artifact) = artifact::find_verified(spec, stores)?;
+        if spec.kind == ArtifactKind::ProtocolRecipe {
+            let recipe = crate::controller_recipe::load_reader(&mut file, spec.format.clone())?;
+            crate::controller_recipe::validate(&recipe, profile)?;
+        }
+        verified.push(artifact);
+    }
+    Ok(verified)
+}
+
+/// Validate the independent HIL evidence required for a production profile.
+/// This function validates only the qualification attachment; callers that
+/// need a production decision must also call [`validate_pre_hil`].
+pub fn validate_hil_qualification(profile: &Profile, path: &Path) -> Result<()> {
+    let q = profile.qualification.as_ref().ok_or_else(|| {
+        Error::Invalid(format!(
+            "profile {}: a real production profile requires independent qualification",
+            path.display()
+        ))
+    })?;
+    let digest = digest_value(&q.report_sha256);
+    if digest.is_none() {
+        return Err(Error::Invalid(format!(
+            "profile {}: qualification report_sha256 must be 64 hex chars",
+            path.display()
+        )));
+    }
+    if q.independent_reader.trim().is_empty()
+        || q.samples == 0
+        || q.power_cut_cases == 0
+        || q.report_artifact_id.is_empty()
+    {
+        return Err(Error::Invalid(format!(
+            "profile {}: qualification requires an independent reader, samples, power-cut cases and report artifact",
+            path.display()
+        )));
+    }
+    let report = profile
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id == q.report_artifact_id)
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "profile {}: qualification report artifact {} is absent",
+                path.display(),
+                q.report_artifact_id
+            ))
+        })?;
+    if report.kind != ArtifactKind::QualificationReport
+        || report.format != ArtifactFormat::Json
+        || !digest
+            .expect("validated report digest")
+            .eq_ignore_ascii_case(
+                report
+                    .sha256
+                    .strip_prefix("sha256:")
+                    .unwrap_or(&report.sha256),
+            )
+    {
+        return Err(Error::Invalid(format!(
+            "profile {}: qualification report artifact kind or digest mismatch",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_real_production(profile: &Profile, path: &Path) -> Result<()> {
+    validate_pre_hil_requirements(profile, path)?;
+    validate_hil_qualification(profile, path)
 }
 
 fn validate_geometry(geometry: &NandGeometryPolicy, path: &Path) -> Result<()> {
@@ -1255,6 +1366,18 @@ pub fn trusted_search_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// Whether a TOML file is a full runtime profile rather than a read-only
+/// identification or probe profile stored in the same package directory.
+pub fn is_runtime_profile_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    path.extension().and_then(|extension| extension.to_str()) == Some("toml")
+        && !name.starts_with("identify-")
+        && !name.starts_with("probe-")
 }
 
 fn install_prefix(executable: &Path) -> Option<&Path> {
@@ -1587,6 +1710,100 @@ mod tests {
         });
         assert!(validate(&p, path).is_ok());
         let complete = p.clone();
+        let mut pre_hil = complete.clone();
+        pre_hil.trust = "validated".into();
+        pre_hil.qualification = None;
+        pre_hil
+            .artifacts
+            .retain(|artifact| artifact.kind != ArtifactKind::QualificationReport);
+        assert!(validate(&pre_hil, path).is_ok());
+        assert!(validate_pre_hil(&pre_hil, path).is_ok());
+        assert!(validate_hil_qualification(&pre_hil, path).is_err());
+
+        let mut static_evidence = pre_hil.clone();
+        let evidence = static_evidence
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.kind == ArtifactKind::ProtocolTrace)
+            .unwrap();
+        evidence.id = "factory-tool-evidence".into();
+        evidence.role = "protocol-evidence".into();
+        evidence.kind = ArtifactKind::FactoryToolExecutable;
+        evidence.format = ArtifactFormat::PortableExecutable;
+        assert!(validate_pre_hil(&static_evidence, path).is_ok());
+        static_evidence
+            .implementation
+            .as_mut()
+            .unwrap()
+            .artifact_ids
+            .push("factory-tool-evidence".into());
+        assert!(validate_pre_hil(&static_evidence, path).is_err());
+        static_evidence
+            .implementation
+            .as_mut()
+            .unwrap()
+            .artifact_ids
+            .pop();
+        static_evidence
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.id == "factory-tool-evidence")
+            .unwrap()
+            .source_url = None;
+        assert!(validate_pre_hil(&static_evidence, path).is_err());
+
+        assert!(validate_pre_hil_artifacts(&pre_hil, path, &[]).is_err());
+        let empty_store = tempfile::tempdir().unwrap();
+        assert!(
+            validate_pre_hil_artifacts(&pre_hil, path, &[empty_store.path().to_path_buf()])
+                .is_err()
+        );
+
+        let mut invalid_recipe_profile = pre_hil.clone();
+        let trace_bytes = b"\x0a\x0d\x0d\x0a";
+        let recipe_bytes = b"{}";
+        let trace_digest = crate::digest(trace_bytes)
+            .trim_start_matches("sha256:")
+            .to_string();
+        let recipe_digest = crate::digest(recipe_bytes)
+            .trim_start_matches("sha256:")
+            .to_string();
+        for artifact in &mut invalid_recipe_profile.artifacts {
+            let (digest, size) = if artifact.kind == ArtifactKind::ProtocolTrace {
+                (&trace_digest, trace_bytes.len())
+            } else {
+                (&recipe_digest, recipe_bytes.len())
+            };
+            artifact.sha256 = digest.clone();
+            artifact.size_bytes = size as u64;
+        }
+        invalid_recipe_profile
+            .implementation
+            .as_mut()
+            .unwrap()
+            .protocol_evidence_sha256 = trace_digest;
+        let store = tempfile::tempdir().unwrap();
+        for artifact in &invalid_recipe_profile.artifacts {
+            let bytes = if artifact.kind == ArtifactKind::ProtocolTrace {
+                trace_bytes.as_slice()
+            } else {
+                recipe_bytes.as_slice()
+            };
+            let artifact_path = crate::artifact::store_path(store.path(), artifact);
+            std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+            std::fs::write(artifact_path, bytes).unwrap();
+        }
+        let error = validate_pre_hil_artifacts(
+            &invalid_recipe_profile,
+            path,
+            &[store.path().to_path_buf()],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("controller recipe JSON"),
+            "verified but semantically incomplete recipe must be rejected: {error}"
+        );
+
         p.metadata_layout.as_mut().unwrap().system_block_ranges[0].policy =
             SystemBlockPolicy::Preserve;
         assert!(validate(&p, path).is_err());
@@ -1668,6 +1885,18 @@ mod tests {
         let mut p = profile();
         p.id = "other-sim".into();
         assert!(validate(&p, Path::new("other-sim.toml")).is_err());
+    }
+
+    #[test]
+    fn runtime_profile_paths_exclude_read_only_profile_namespaces() {
+        assert!(is_runtime_profile_path(Path::new("phison-ps2303.toml")));
+        assert!(!is_runtime_profile_path(Path::new(
+            "identify-phison-ufd.toml"
+        )));
+        assert!(!is_runtime_profile_path(Path::new(
+            "probe-phison-ps2303.toml"
+        )));
+        assert!(!is_runtime_profile_path(Path::new("phison-ps2303.json")));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! `usb.frame.data` field. It validates CBW/CSW framing and tags, bounds the
 //! declared transfer length, and emits one normalized record per command.
 
+use crate::controller_recipe::TransferDirection;
 use crate::errors::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,9 +12,91 @@ use std::collections::BTreeMap;
 
 const CBW_SIGNATURE: &[u8; 4] = b"USBC";
 const CSW_SIGNATURE: &[u8; 4] = b"USBS";
-const CBW_LEN: usize = 31;
-const CSW_LEN: usize = 13;
+pub const CBW_LEN: usize = 31;
+pub const CSW_LEN: usize = 13;
 const MAX_BOT_TRANSFER: u32 = 64 * 1024 * 1024;
+
+/// Decoded USB Mass Storage Bulk-Only Command Status Wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandStatusWrapper {
+    pub residue: u32,
+    pub status: u8,
+}
+
+/// Build the exact 31-byte CBW defined by the USB-IF Bulk-Only Transport
+/// specification. The CDB length is preserved; vendor CDBs are zero-filled
+/// only in the CBWCB tail and are never promoted to a different SCSI size.
+pub fn command_block_wrapper(
+    tag: u32,
+    lun: u8,
+    cdb: &[u8],
+    direction: TransferDirection,
+    transfer_length: u32,
+) -> Result<[u8; CBW_LEN]> {
+    if tag == 0 {
+        return Err(Error::Invalid("USB BOT tag must be non-zero".into()));
+    }
+    if lun > 0x0f {
+        return Err(Error::Invalid("USB BOT LUN must fit four bits".into()));
+    }
+    if !(1..=16).contains(&cdb.len()) {
+        return Err(Error::Invalid(format!(
+            "USB BOT CDB length {} is outside 1..=16",
+            cdb.len()
+        )));
+    }
+    if (direction == TransferDirection::None) != (transfer_length == 0) {
+        return Err(Error::Invalid(
+            "USB BOT no-data direction and zero transfer length must agree".into(),
+        ));
+    }
+
+    let mut cbw = [0u8; CBW_LEN];
+    cbw[..4].copy_from_slice(CBW_SIGNATURE);
+    cbw[4..8].copy_from_slice(&tag.to_le_bytes());
+    cbw[8..12].copy_from_slice(&transfer_length.to_le_bytes());
+    cbw[12] = u8::from(direction == TransferDirection::FromDevice) << 7;
+    cbw[13] = lun;
+    cbw[14] = cdb.len() as u8;
+    cbw[15..15 + cdb.len()].copy_from_slice(cdb);
+    Ok(cbw)
+}
+
+/// Decode and authenticate the exact 13-byte CSW for one outstanding CBW.
+pub fn command_status_wrapper(
+    bytes: &[u8],
+    expected_tag: u32,
+    transfer_length: u32,
+) -> Result<CommandStatusWrapper> {
+    if bytes.len() != CSW_LEN {
+        return Err(Error::Invalid(format!(
+            "USB BOT CSW length {} != {CSW_LEN}",
+            bytes.len()
+        )));
+    }
+    if &bytes[..4] != CSW_SIGNATURE {
+        return Err(Error::Invalid("USB BOT CSW signature is invalid".into()));
+    }
+    let tag = u32::from_le_bytes(bytes[4..8].try_into().expect("fixed CSW tag"));
+    if tag != expected_tag {
+        return Err(Error::Invalid(format!(
+            "USB BOT CSW tag {tag:#010x} does not match CBW tag {expected_tag:#010x}"
+        )));
+    }
+    let residue = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed CSW residue"));
+    if residue > transfer_length {
+        return Err(Error::Invalid(format!(
+            "USB BOT CSW residue {residue} exceeds transfer length {transfer_length}"
+        )));
+    }
+    let status = bytes[12];
+    if status > 2 {
+        return Err(Error::Invalid(format!(
+            "USB BOT CSW has reserved status {status}"
+        )));
+    }
+    Ok(CommandStatusWrapper { residue, status })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct DeviceKey {
@@ -354,6 +437,39 @@ fn parse_cbw(frame: &UsbPayloadFrame) -> Result<Pending> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_exact_cbw_without_changing_vendor_cdb_length() {
+        let cdb = [0xfa, 0x0b, 0x06, 0, 0, 0, 0, 0];
+        let cbw = command_block_wrapper(0x1234_5678, 0, &cdb, TransferDirection::FromDevice, 512)
+            .unwrap();
+        assert_eq!(&cbw[..4], b"USBC");
+        assert_eq!(&cbw[4..8], &0x1234_5678u32.to_le_bytes());
+        assert_eq!(&cbw[8..12], &512u32.to_le_bytes());
+        assert_eq!(cbw[12], 0x80);
+        assert_eq!(cbw[14], 8);
+        assert_eq!(&cbw[15..23], &cdb);
+        assert_eq!(&cbw[23..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn authenticates_csw_signature_tag_residue_and_status() {
+        let valid = csw(7, 12, 0);
+        assert_eq!(
+            command_status_wrapper(&valid, 7, 512).unwrap(),
+            CommandStatusWrapper {
+                residue: 12,
+                status: 0
+            }
+        );
+
+        let mut bad_signature = valid.clone();
+        bad_signature[0] = 0;
+        assert!(command_status_wrapper(&bad_signature, 7, 512).is_err());
+        assert!(command_status_wrapper(&csw(8, 0, 0), 7, 512).is_err());
+        assert!(command_status_wrapper(&csw(7, 513, 0), 7, 512).is_err());
+        assert!(command_status_wrapper(&csw(7, 0, 3), 7, 512).is_err());
+    }
 
     fn frame(number: u64, endpoint: u8, data: Vec<u8>) -> UsbPayloadFrame {
         UsbPayloadFrame {

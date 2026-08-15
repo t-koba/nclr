@@ -228,8 +228,8 @@ struct OpenRun {
 
 /// Open controller-adjacent device nodes in the trusted core and pass only
 /// inherited descriptors to backends. On Linux, an sg node is resolved from
-/// the same sysfs SCSI object as the block target; other platforms have no
-/// extra descriptor.
+/// the same sysfs SCSI object as the block target. macOS uses the inherited
+/// whole-disk descriptor to resolve an Apple SCSITask service.
 #[cfg(target_os = "linux")]
 fn open_backend_extras(identity: &DeviceIdentity, write: bool) -> Result<Vec<(OwnedFd, String)>> {
     use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
@@ -334,7 +334,46 @@ fn reopen_controller_transport(
     Ok(identity)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn reopen_controller_transport(
+    physical_path: &str,
+    allow_nonremovable: bool,
+    destructive: bool,
+    device_fd: &mut OwnedFd,
+    _extras: &mut Vec<(OwnedFd, String)>,
+) -> Result<DeviceIdentity> {
+    let matches = device::list_all_devices()?
+        .into_iter()
+        .filter(|identity| identity.physical_path == physical_path)
+        .collect::<Vec<_>>();
+    let identity = match matches.as_slice() {
+        [] => {
+            return Err(Error::Io(
+                format!("no disk is present at USB path {physical_path}"),
+                None,
+            ))
+        }
+        [identity] => identity.clone(),
+        _ => {
+            return Err(Error::Permission(format!(
+                "multiple disks appeared at USB path {physical_path}"
+            )))
+        }
+    };
+    let options = nclr::safety::SafetyOptions {
+        unmount: false,
+        allow_nonremovable,
+    };
+    if destructive {
+        nclr::safety::preflight(&identity, &options)?;
+    } else {
+        nclr::safety::preflight_read(&identity, &options)?;
+    }
+    *device_fd = OwnedFd::from(device::open_raw(&identity.kernel_path, destructive)?);
+    Ok(identity)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reopen_controller_transport(
     _physical_path: &str,
     _allow_nonremovable: bool,
@@ -343,7 +382,7 @@ fn reopen_controller_transport(
     _extras: &mut Vec<(OwnedFd, String)>,
 ) -> Result<DeviceIdentity> {
     Err(Error::Unsupported(
-        "controller re-enumeration requires Linux".into(),
+        "controller re-enumeration requires Linux or macOS".into(),
     ))
 }
 
@@ -1130,6 +1169,7 @@ fn unidentified_controller(
 
 /// Open the device read-only, retrying briefly. A USB bridge that reset its
 /// transport (NOT READY / ENOMEDIUM) usually recovers within a second.
+#[cfg(not(target_os = "macos"))]
 fn open_raw_with_retry(device_path: &str, attempts: u32) -> Result<std::fs::File> {
     let mut last = None;
     for attempt in 0..attempts {
@@ -1261,7 +1301,7 @@ fn info_impl(device_path: &str, backend_dir: &[PathBuf]) -> Result<InfoResult> {
 fn controller_identify(
     identity: &DeviceIdentity,
     device_path: &str,
-    backend_dir: &[PathBuf],
+    _backend_dir: &[PathBuf],
     site: &nclr::config::SiteConfig,
 ) -> Option<ControllerIdentify> {
     // Only USB-attached devices carry a vendor VID that could select a
@@ -1275,6 +1315,22 @@ fn controller_identify(
             Some("controller backend disabled by site policy".into()),
         ));
     }
+    #[cfg(target_os = "macos")]
+    {
+        Some(macos_controller_identify(identity, device_path))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        controller_identify_backend(identity, device_path, _backend_dir)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn controller_identify_backend(
+    identity: &DeviceIdentity,
+    device_path: &str,
+    backend_dir: &[PathBuf],
+) -> Option<ControllerIdentify> {
     let handle = match backend::find("controller", &backend::search_dirs(backend_dir)) {
         Ok(h) => h,
         Err(error) => return Some(unidentified_controller(identity, Some(error.to_string()))),
@@ -1377,6 +1433,158 @@ fn controller_identify(
     ))
 }
 
+#[cfg(target_os = "macos")]
+fn macos_usb_value(value: &str, field: &str) -> Result<u16> {
+    let digits = value.trim().trim_start_matches("0x").replace('.', "");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Invalid(format!(
+            "device USB {field} is not hexadecimal"
+        )));
+    }
+    u16::from_str_radix(&digits, 16)
+        .map_err(|_| Error::Invalid(format!("device USB {field} exceeds u16")))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_observed_bootstrap(
+    identity: &DeviceIdentity,
+) -> Result<nclr::controller_probe::ObservedBootstrap<'_>> {
+    let usb = identity.usb.as_ref().ok_or_else(|| {
+        Error::Unsupported("read-only controller probes require USB mass storage".into())
+    })?;
+    let scsi = identity.scsi.as_ref().ok_or_else(|| {
+        Error::Invalid("device identity lacks an exact SCSI INQUIRY tuple".into())
+    })?;
+    if scsi.vendor.is_empty() || scsi.model.is_empty() || scsi.rev.is_empty() {
+        return Err(Error::Invalid(
+            "device identity has an incomplete SCSI INQUIRY tuple".into(),
+        ));
+    }
+    Ok(nclr::controller_probe::ObservedBootstrap {
+        usb_vid: macos_usb_value(&usb.vid, "VID")?,
+        usb_pid: macos_usb_value(&usb.pid, "PID")?,
+        usb_bcd_device: macos_usb_value(&usb.bcd_device, "bcdDevice")?,
+        usb_manufacturer: &usb.manufacturer,
+        usb_product: &usb.product,
+        usb_serial: &usb.serial,
+        scsi_vendor: &scsi.vendor,
+        scsi_product: &scsi.model,
+        scsi_revision: &scsi.rev,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_controller_identify(identity: &DeviceIdentity, device_path: &str) -> ControllerIdentify {
+    let observed = match macos_observed_bootstrap(identity) {
+        Ok(observed) => observed,
+        Err(error) => return unidentified_controller(identity, Some(error.to_string())),
+    };
+    let family_hint = local_family_hint(identity);
+    let dirs = nclr::profile::trusted_search_dirs();
+    let profile = match nclr::controller_probe::matching(&dirs, &observed, family_hint) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return unidentified_controller(identity, None),
+        Err(error) => return unidentified_controller(identity, Some(error.to_string())),
+    };
+    if let Err(error) =
+        nclr::safety::preflight_read(identity, &nclr::safety::SafetyOptions::default())
+    {
+        return unidentified_controller(
+            identity,
+            Some(format!(
+                "exact read-only probe {} matched but the read-only media preflight failed: {error}",
+                profile.id,
+            )),
+        );
+    }
+
+    let mut commands = Vec::with_capacity(profile.commands.len());
+    for (name, command) in &profile.commands {
+        let cdb = match nclr::controller_recipe::build_cdb(
+            command,
+            nclr::controller_recipe::CommandContext::default(),
+        ) {
+            Ok(cdb) => cdb,
+            Err(error) => return unidentified_controller(identity, Some(error.to_string())),
+        };
+        commands.push(json!({
+            "transport": "macos-scsitask",
+            "command": name,
+            "cdb_hex": hex::encode(cdb),
+            "direction": "from-device",
+            "transfer_bytes": command.transfer_bytes,
+            "source": "package-read-only-probe-profile",
+        }));
+    }
+    let mut transport = match nclr::macos_scsi::ScsiDevice::open(device_path) {
+        Ok(transport) => transport,
+        Err(error) => return unidentified_controller(identity, Some(error.to_string())),
+    };
+    let operation = nclr::controller_probe::execute_with(&profile, |_, cdb, length, timeout_ms| {
+        transport.read_exact(cdb, length, timeout_ms)
+    });
+    let cleanup = transport.close();
+    let detected = match (operation, cleanup) {
+        (Ok(detected), Ok(())) => detected,
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => {
+            return unidentified_controller(identity, Some(error.to_string()))
+        }
+        (Err(operation), Err(cleanup)) => {
+            return unidentified_controller(
+                identity,
+                Some(format!(
+                    "read-only controller probe failed: {operation}; cleanup also failed: {cleanup}"
+                )),
+            )
+        }
+    };
+    let research = json!({
+        "schema": 1,
+        "selection": "package-read-only-probe",
+        "recipe_family_candidates": [profile.family.as_str()],
+        "read_only_probe_profile": profile.id,
+        "read_only_probe_profile_sha256": profile.source_sha256,
+        "exact_bootstrap_observed": {
+            "family": profile.family,
+            "usb_vid": format!("{:04x}", observed.usb_vid),
+            "usb_pid": format!("{:04x}", observed.usb_pid),
+            "usb_bcd_device": format!("{:04x}", observed.usb_bcd_device),
+            "usb_manufacturer": observed.usb_manufacturer,
+            "usb_product": observed.usb_product,
+            "usb_serial": observed.usb_serial,
+            "scsi_vendor": observed.scsi_vendor,
+            "scsi_product": observed.scsi_product,
+            "scsi_revision": observed.scsi_revision,
+        },
+        "identity_source": "package-read-only-probe+macos-scsitask",
+        "media_commands_sent": commands,
+        "unknown_vendor_commands_sent": false,
+        "missing_for_production": [
+            "exact NAND geometry and ECC/randomizer layout",
+            "service transition and runtime loader artifacts",
+            "physical erase/status and page/OOB command contracts",
+            "BBT, FTL, spare and atomic commit metadata layouts",
+            "complete pre-HIL runtime recipe and profile",
+            "independent HIL qualification and power-cut evidence"
+        ],
+    });
+    with_vendor(
+        ControllerIdentify {
+            vendor: None,
+            model: None,
+            family_hint: Some(detected.family.as_str().to_string()),
+            controller_id: detected.controller_id,
+            firmware: detected.firmware,
+            nand_id: detected.nand_id,
+            service_mode: detected.mode,
+            capability_probe: None,
+            probe_error: None,
+            controller_research: Some(research),
+        },
+        identity,
+    )
+}
+
 /// Level name for a C grade (site policy floor / requested levels).
 fn level_name(g: CGrade) -> &'static str {
     match g {
@@ -1452,7 +1660,7 @@ fn pick_backend(
         None => backend_id_for(identity),
     };
     let expected = backend_id_for(identity);
-    let compatible_controller = cfg!(target_os = "linux")
+    let compatible_controller = cfg!(any(target_os = "linux", target_os = "macos"))
         && id == "controller"
         && matches!(
             identity.transport.as_str(),
@@ -1554,7 +1762,7 @@ fn plan_impl(req: &PlanRequest, site: &nclr::config::SiteConfig) -> Result<Plan>
             None
         }
     });
-    let try_controller_for_best = cfg!(target_os = "linux")
+    let try_controller_for_best = cfg!(any(target_os = "linux", target_os = "macos"))
         && is_usb
         && req.backend.is_none()
         && req.level == "best"
@@ -2106,7 +2314,9 @@ impl GradeEvidence {
                 all_reads_ok: e.logical_reads_ok,
                 flush_ok: e.flush_ok,
                 power_cycle_consistent: e.power_cycled && e.capacity_stable && e.logical_reads_ok,
-                no_uncorrectable: e.io_errors == 0 && e.physical_uncorrectable_pages == 0,
+                no_uncorrectable: e.io_errors == 0
+                    && e.physical_ecc_unknown_pages == 0
+                    && e.physical_uncorrectable_pages == 0,
                 spare_ok: e.spare_ok,
                 weak_blocks: e.isolated_blocks,
                 new_bad_blocks: e.blocks_erase_failed,
@@ -2666,6 +2876,10 @@ fn apply_outcome_to_evidence(
                     e.physical_pages = total_pages;
                     e.physical_readable_pages = readable_pages;
                     e.physical_unreadable_pages = unreadable_pages;
+                    e.physical_ecc_unknown_pages = details
+                        .and_then(|d| d.get("ecc_unknown_pages"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(readable_pages);
                     e.physical_uncorrectable_pages = details
                         .and_then(|d| d.get("uncorrectable_pages"))
                         .and_then(|v| v.as_u64())
@@ -2686,6 +2900,10 @@ fn apply_outcome_to_evidence(
                         .and_then(|d| d.get("target_unreadable_pages"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(e.target_pages);
+                    e.target_ecc_unknown_pages = details
+                        .and_then(|d| d.get("target_ecc_unknown_pages"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(e.target_readable_pages);
                     e.target_uncorrectable_pages = details
                         .and_then(|d| d.get("target_uncorrectable_pages"))
                         .and_then(|v| v.as_u64())
@@ -4836,11 +5054,13 @@ fn run_execute_inner(
                 "physical_pages": e.physical_pages,
                 "physical_readable_pages": e.physical_readable_pages,
                 "physical_unreadable_pages": e.physical_unreadable_pages,
+                "physical_ecc_unknown_pages": e.physical_ecc_unknown_pages,
                 "physical_uncorrectable_pages": e.physical_uncorrectable_pages,
                 "ordered_sweep_sha256": e.ordered_sweep_sha256,
                 "target_pages": e.target_pages,
                 "target_readable_pages": e.target_readable_pages,
                 "target_unreadable_pages": e.target_unreadable_pages,
+                "target_ecc_unknown_pages": e.target_ecc_unknown_pages,
                 "target_uncorrectable_pages": e.target_uncorrectable_pages,
                 "target_non_erased_pages": e.target_non_erased_pages,
                 "excluded_unreadable_pages": e.excluded_unreadable_pages,
@@ -5649,10 +5869,19 @@ fn finish_salvage_run(
         .as_ref()
         .and_then(|details| details.get("uncorrectable_pages"))
         .and_then(Value::as_u64);
+    let ecc_unknown_pages = salvage_details
+        .as_ref()
+        .and_then(|details| details.get("ecc_unknown_pages"))
+        .and_then(Value::as_u64);
     let result_name = match status {
         ResultStatus::Interrupted => "interrupted",
         ResultStatus::Failed => "failed",
-        _ if unreadable_pages == Some(0) && uncorrectable_pages == Some(0) => "complete",
+        _ if unreadable_pages == Some(0)
+            && ecc_unknown_pages == Some(0)
+            && uncorrectable_pages == Some(0) =>
+        {
+            "complete"
+        }
         _ => "partial",
     };
     let code = match result_name {
@@ -6649,11 +6878,13 @@ fn cmd_resume(config: Option<&Path>, state_file: &Path, opts: &RunOptions) -> i3
                     "physical_pages": e.physical_pages,
                     "physical_readable_pages": e.physical_readable_pages,
                     "physical_unreadable_pages": e.physical_unreadable_pages,
+                    "physical_ecc_unknown_pages": e.physical_ecc_unknown_pages,
                     "physical_uncorrectable_pages": e.physical_uncorrectable_pages,
                     "ordered_sweep_sha256": e.ordered_sweep_sha256,
                     "target_pages": e.target_pages,
                     "target_readable_pages": e.target_readable_pages,
                     "target_unreadable_pages": e.target_unreadable_pages,
+                    "target_ecc_unknown_pages": e.target_ecc_unknown_pages,
                     "target_uncorrectable_pages": e.target_uncorrectable_pages,
                     "target_non_erased_pages": e.target_non_erased_pages,
                     "excluded_unreadable_pages": e.excluded_unreadable_pages,

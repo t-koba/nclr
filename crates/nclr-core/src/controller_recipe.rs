@@ -14,12 +14,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-pub const RECIPE_SCHEMA: u32 = 1;
+pub const RECIPE_SCHEMA: u32 = 4;
+pub const TRANSPORT_SCSI_COMMAND: &str = "scsi-command";
+pub const TRANSPORT_USB_BOT: &str = "usb-bot";
+
+fn transport_supports_cdb(transport: &str, length: usize) -> bool {
+    match transport {
+        TRANSPORT_SCSI_COMMAND => matches!(length, 6 | 10 | 12 | 16),
+        TRANSPORT_USB_BOT => (6..=MAX_CDB_BYTES).contains(&length),
+        _ => false,
+    }
+}
 pub const STATE_SCHEMA: u32 = 1;
 pub const MAX_RECIPE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_CDB_BYTES: usize = 16;
 pub const MAX_COMMAND_TRANSFER: u32 = 16 * 1024 * 1024;
 pub const MAX_PHYSICAL_BLOCKS: u64 = 131_072;
+const MAX_CONTEXT_PAYLOAD_FIELDS: usize = 32;
+const MAX_VALUE_OPERATIONS: usize = 16;
+const MAX_OPERATION_SEQUENCE_STEPS: usize = 64;
 const STATE_SLOT_BYTES: u64 = 64 * 1024 * 1024;
 const STATE_DATA_OFFSET: u64 = 4096;
 const STATE_DESCRIPTOR_BYTES: usize = 512;
@@ -58,6 +71,41 @@ pub enum RuntimeValue {
     SpareBlocks,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "kind")]
+pub enum ValueOperation {
+    Add { value: u64 },
+    Subtract { value: u64 },
+    Multiply { value: u64 },
+    Divide { value: u64 },
+    Modulo { value: u64 },
+    XorModulo { value: u64 },
+    And { mask: u64 },
+    Or { mask: u64 },
+    ShiftLeft { bits: u8 },
+    ShiftRight { bits: u8 },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadFieldBinding {
+    pub offset: u32,
+    pub width: u8,
+    pub endian: Endian,
+    pub value: RuntimeValue,
+    #[serde(default)]
+    pub operations: Vec<ValueOperation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct PayloadConstantBinding {
+    pub offset: u32,
+    pub width: u8,
+    pub endian: Endian,
+    pub value: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct FieldBinding {
@@ -65,6 +113,8 @@ pub struct FieldBinding {
     pub width: u8,
     pub endian: Endian,
     pub value: RuntimeValue,
+    #[serde(default)]
+    pub operations: Vec<ValueOperation>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -113,6 +163,15 @@ pub enum PayloadSource {
     Bbt,
     Ftl,
     Capacity,
+    Context {
+        record_bytes: u32,
+        repeat: u32,
+        #[serde(default)]
+        fill_byte: u8,
+        #[serde(default)]
+        constants: Vec<PayloadConstantBinding>,
+        fields: Vec<PayloadFieldBinding>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -129,6 +188,38 @@ pub struct CommandSpec {
     pub payload: Option<PayloadSource>,
     #[serde(default)]
     pub response: ResponseRule,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SequenceCapture {
+    None,
+    Payload,
+    Fields,
+    PayloadAndFields,
+}
+
+impl SequenceCapture {
+    pub fn captures_payload(self) -> bool {
+        matches!(self, Self::Payload | Self::PayloadAndFields)
+    }
+
+    pub fn captures_fields(self) -> bool {
+        matches!(self, Self::Fields | Self::PayloadAndFields)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OperationStep {
+    pub command: String,
+    pub capture: SequenceCapture,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct OperationSequence {
+    pub steps: Vec<OperationStep>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -317,11 +408,69 @@ pub struct ControllerRecipe {
     pub transport: String,
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
+    /// Ordered wire commands for a logical operation. A sequence must contain
+    /// its same-named target command exactly once. Device-to-host fragments
+    /// are appended and decoded fields are merged only when explicitly
+    /// captured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_sequences: BTreeMap<String, OperationSequence>,
     pub bbt: BbtLayout,
     pub bbt_output: MetadataTableLayout,
     pub ftl_output: FtlPayloadLayout,
     pub capacity_output: CapacityPayloadLayout,
     pub policy: RecipePolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedOperationStep<'a> {
+    pub command_name: &'a str,
+    pub command: &'a CommandSpec,
+    pub capture: SequenceCapture,
+    pub is_target: bool,
+}
+
+pub fn resolve_operation_steps<'a>(
+    recipe: &'a ControllerRecipe,
+    operation: &str,
+) -> Result<Vec<ResolvedOperationStep<'a>>> {
+    if let Some(sequence) = recipe.operation_sequences.get(operation) {
+        return sequence
+            .steps
+            .iter()
+            .map(|step| {
+                let (command_name, command) = recipe
+                    .commands
+                    .get_key_value(&step.command)
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "operation {operation} references absent command {}",
+                            step.command
+                        ))
+                    })?;
+                Ok(ResolvedOperationStep {
+                    command_name,
+                    command,
+                    capture: step.capture,
+                    is_target: command_name == operation,
+                })
+            })
+            .collect();
+    }
+    let (command_name, command) = recipe
+        .commands
+        .get_key_value(operation)
+        .ok_or_else(|| Error::Invalid(format!("command {operation} is absent")))?;
+    let capture = if command.direction == TransferDirection::FromDevice {
+        SequenceCapture::PayloadAndFields
+    } else {
+        SequenceCapture::None
+    };
+    Ok(vec![ResolvedOperationStep {
+        command_name,
+        command,
+        capture,
+        is_target: true,
+    }])
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -505,6 +654,276 @@ fn validate_artifact_payload(name: &str, command: &CommandSpec, profile: &Profil
     Ok(())
 }
 
+fn validate_context_payload(name: &str, command: &CommandSpec) -> Result<()> {
+    let Some(PayloadSource::Context {
+        record_bytes,
+        repeat,
+        constants,
+        fields,
+        ..
+    }) = command.payload.as_ref()
+    else {
+        return Ok(());
+    };
+    let payload_bytes = record_bytes
+        .checked_mul(*repeat)
+        .ok_or_else(|| Error::Invalid(format!("command {name} context payload size overflow")))?;
+    if command.direction != TransferDirection::ToDevice
+        || *record_bytes == 0
+        || *repeat == 0
+        || payload_bytes != command.transfer_bytes
+        || fields
+            .len()
+            .checked_add(constants.len())
+            .is_none_or(|count| count > MAX_CONTEXT_PAYLOAD_FIELDS)
+    {
+        return Err(Error::Invalid(format!(
+            "command {name} has an invalid context-generated payload"
+        )));
+    }
+    let mut occupied = BTreeSet::new();
+    for constant in constants {
+        if !(1..=8).contains(&constant.width)
+            || constant
+                .offset
+                .checked_add(u32::from(constant.width))
+                .is_none_or(|end| end > *record_bytes)
+            || (constant.width < 8 && constant.value >= (1u64 << (u32::from(constant.width) * 8)))
+        {
+            return Err(Error::Invalid(format!(
+                "command {name} has an invalid context payload constant"
+            )));
+        }
+        for byte in constant.offset..constant.offset + u32::from(constant.width) {
+            if !occupied.insert(byte) {
+                return Err(Error::Invalid(format!(
+                    "command {name} has overlapping context payload constants"
+                )));
+            }
+        }
+    }
+    for field in fields {
+        if !(1..=8).contains(&field.width)
+            || field
+                .offset
+                .checked_add(u32::from(field.width))
+                .is_none_or(|end| end > *record_bytes)
+            || !value_operations_valid(&field.operations)
+        {
+            return Err(Error::Invalid(format!(
+                "command {name} has an invalid context payload field"
+            )));
+        }
+        for byte in field.offset..field.offset + u32::from(field.width) {
+            if !occupied.insert(byte) {
+                return Err(Error::Invalid(format!(
+                    "command {name} has overlapping context payload fields"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_alcor_service_upload_contract(
+    command_name: &str,
+    command: &CommandSpec,
+    transport: &str,
+    enter_reenumerates: bool,
+    loader_reenumerates: bool,
+    artifact_id: &str,
+    artifact_size: u64,
+) -> Result<()> {
+    let cdb = hex_bytes(&command.cdb_hex, &format!("command {command_name} cdb_hex"))?;
+    let field = command.fields.first();
+    let exact_field = field.is_some_and(|field| {
+        field.offset == 3
+            && field.width == 1
+            && field.endian == Endian::Big
+            && field.value == RuntimeValue::PayloadBytes
+            && field.operations
+                == [
+                    ValueOperation::Divide { value: 512 },
+                    ValueOperation::Subtract { value: 1 },
+                ]
+    });
+    let exact_payload = matches!(
+        command.payload.as_ref(),
+        Some(PayloadSource::Artifact {
+            artifact_id: id,
+            offset: 0,
+            length: 0,
+        }) if id == artifact_id
+    );
+    let total_sectors = artifact_size.checked_div(crate::alcor_au698x::SECTOR_BYTES as u64);
+    let exact_artifact_size = artifact_size >= (crate::alcor_au698x::SECTOR_BYTES * 2) as u64
+        && artifact_size
+            <= ((crate::alcor_au698x::MAX_MODULE_SECTORS + 1) * crate::alcor_au698x::SECTOR_BYTES)
+                as u64
+        && artifact_size.is_multiple_of(crate::alcor_au698x::SECTOR_BYTES as u64)
+        && total_sectors.is_some_and(|sectors| (2..=256).contains(&sectors));
+    if transport != TRANSPORT_USB_BOT
+        || enter_reenumerates
+        || loader_reenumerates
+        || cdb != [0xfa, 0x0a, 0, 0, 0, 0, 0, 0]
+        || command.direction != TransferDirection::ToDevice
+        || command.timeout_ms != 60_000
+        || command.fields.len() != 1
+        || !exact_field
+        || !exact_payload
+        || !exact_artifact_size
+        || u64::from(command.transfer_bytes) != artifact_size
+    {
+        return Err(Error::Invalid(
+            format!("Alcor AU698x service upload command {command_name} must exactly reproduce FA 0A 00 N over USB BOT with the complete authenticated module-plus-parameter artifact"),
+        ));
+    }
+
+    let derived = build_cdb(
+        command,
+        CommandContext {
+            payload_bytes: artifact_size,
+            ..CommandContext::default()
+        },
+    )?;
+    let module_sectors = u8::try_from(total_sectors.unwrap() - 1)
+        .map_err(|_| Error::Invalid("Alcor service module sector count overflow".into()))?;
+    if derived != [0xfa, 0x0a, 0, module_sectors, 0, 0, 0, 0] {
+        return Err(Error::Invalid(
+            format!("Alcor AU698x service upload command {command_name} derives the wrong module-sector CDB"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operation_sequences(
+    recipe: &ControllerRecipe,
+    profile: &Profile,
+    family: Family,
+) -> Result<()> {
+    let referenced_commands = recipe
+        .operation_sequences
+        .values()
+        .flat_map(|sequence| sequence.steps.iter().map(|step| step.command.as_str()))
+        .collect::<BTreeSet<_>>();
+    for name in recipe
+        .commands
+        .keys()
+        .filter(|name| name.starts_with("step-"))
+    {
+        if !referenced_commands.contains(name.as_str()) {
+            return Err(Error::Invalid(format!(
+                "controller recipe sequence command {name} is not referenced"
+            )));
+        }
+    }
+
+    for (operation, sequence) in &recipe.operation_sequences {
+        if !recipe.commands.contains_key(operation)
+            || !(2..=MAX_OPERATION_SEQUENCE_STEPS).contains(&sequence.steps.len())
+        {
+            return Err(Error::Invalid(format!(
+                "operation {operation} has an invalid command sequence"
+            )));
+        }
+        let mut command_names = BTreeSet::new();
+        let mut target_count = 0usize;
+        let mut output_bytes = 0u64;
+        let mut output_fields = BTreeSet::new();
+        for step in &sequence.steps {
+            if step.command.is_empty() || !command_names.insert(step.command.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "operation {operation} has an empty or duplicate sequence command"
+                )));
+            }
+            if step.command == *operation {
+                target_count += 1;
+            }
+            let command = recipe.commands.get(&step.command).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "operation {operation} references absent command {}",
+                    step.command
+                ))
+            })?;
+            if (step.capture.captures_payload() || step.capture.captures_fields())
+                && command.direction != TransferDirection::FromDevice
+            {
+                return Err(Error::Invalid(format!(
+                    "operation {operation} captures output from non-read command {}",
+                    step.command
+                )));
+            }
+            if step.capture.captures_payload() {
+                if command.response.payload_bytes == 0 {
+                    return Err(Error::Invalid(format!(
+                        "operation {operation} captures a variable payload from command {}",
+                        step.command
+                    )));
+                }
+                output_bytes = output_bytes
+                    .checked_add(u64::from(command.response.payload_bytes))
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "operation {operation} payload aggregation overflows"
+                        ))
+                    })?;
+            }
+            if step.capture.captures_fields() {
+                for field in &command.response.fields {
+                    if !output_fields.insert(field.name.as_str()) {
+                        return Err(Error::Invalid(format!(
+                            "operation {operation} captures duplicate response field {}",
+                            field.name
+                        )));
+                    }
+                }
+            }
+
+            let Some(PayloadSource::Artifact {
+                artifact_id,
+                offset: 0,
+                length: 0,
+            }) = command.payload.as_ref()
+            else {
+                continue;
+            };
+            let artifact = profile
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == *artifact_id)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "operation {operation} artifact {artifact_id} is absent"
+                    ))
+                })?;
+            if artifact.format == crate::artifact::ArtifactFormat::AlcorAu698xServicePayload {
+                if family != Family::AlcorUfd
+                    || artifact.kind != crate::artifact::ArtifactKind::ServiceLoader
+                {
+                    return Err(Error::Invalid(format!(
+                        "operation {operation} uses an Alcor service payload outside an Alcor service-loader step"
+                    )));
+                }
+                validate_alcor_service_upload_contract(
+                    &step.command,
+                    command,
+                    &recipe.transport,
+                    false,
+                    false,
+                    artifact_id,
+                    artifact.size_bytes,
+                )?;
+            }
+        }
+        if target_count != 1 || output_bytes > u64::from(MAX_COMMAND_TRANSFER) {
+            return Err(Error::Invalid(format!(
+                "operation {operation} must contain its target once and stay within the aggregate transfer bound"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
     if recipe.schema != RECIPE_SCHEMA {
         return Err(Error::Invalid(format!(
@@ -530,7 +949,12 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
             recipe.family
         ))
     })?;
-    if recipe.family != family.recipe_str() || recipe.transport != "scsi-sg" {
+    if recipe.family != family.recipe_str()
+        || !matches!(
+            recipe.transport.as_str(),
+            TRANSPORT_SCSI_COMMAND | TRANSPORT_USB_BOT
+        )
+    {
         return Err(Error::Invalid(
             "controller recipe family or transport is unsupported".into(),
         ));
@@ -589,7 +1013,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
     }
     for (name, command) in &recipe.commands {
         let cdb = hex_bytes(&command.cdb_hex, &format!("command {name} cdb_hex"))?;
-        if !(6..=MAX_CDB_BYTES).contains(&cdb.len())
+        if !transport_supports_cdb(&recipe.transport, cdb.len())
             || command.transfer_bytes > MAX_COMMAND_TRANSFER
             || !(100..=3_600_000).contains(&command.timeout_ms)
         {
@@ -633,11 +1057,13 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
             _ => {}
         }
         validate_artifact_payload(name, command, profile)?;
+        validate_context_payload(name, command)?;
         let mut occupied = BTreeSet::new();
         for field in &command.fields {
             if field.offset == 0
                 || !width_valid(field.width)
                 || usize::from(field.offset) + usize::from(field.width) > cdb.len()
+                || !value_operations_valid(&field.operations)
             {
                 return Err(Error::Invalid(format!(
                     "command {name} has an out-of-range field binding or a variable opcode"
@@ -653,6 +1079,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         }
         validate_response(name, &command.response)?;
     }
+    validate_operation_sequences(recipe, profile, family)?;
     require_command_contract(
         &recipe.commands,
         "read-nand-id",
@@ -685,6 +1112,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         TransferDirection::ToDevice,
         Some("caller"),
     )?;
+    require_erase_command_contract(&recipe.commands)?;
     require_command_contract(
         &recipe.commands,
         "prepare-bbt",
@@ -703,31 +1131,24 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         TransferDirection::ToDevice,
         Some("capacity"),
     )?;
-    require_response_fields(
-        &recipe.commands,
-        "read-status",
-        &["busy", "failed", "service_mode"],
-    )?;
+    require_response_fields(recipe, "read-status", &["busy", "failed", "service_mode"])?;
     for name in ["read-page", "program-page", "erase-block"] {
-        require_physical_address_binding(&recipe.commands, name)?;
+        require_physical_address_binding(recipe, name)?;
     }
     for name in ["read-page", "program-page"] {
-        require_runtime_binding(&recipe.commands, name, RuntimeValue::Page)?;
+        require_runtime_binding(recipe, name, RuntimeValue::Page)?;
     }
-    require_runtime_binding(
-        &recipe.commands,
-        "activate-metadata",
-        RuntimeValue::Generation,
-    )?;
+    require_runtime_binding(recipe, "activate-metadata", RuntimeValue::Generation)?;
     require_response_fields(
-        &recipe.commands,
+        recipe,
         "read-commit-state",
         &["busy", "failed", "generation", "committed"],
     )?;
     require_response_fields(
-        &recipe.commands,
+        recipe,
         "read-page",
         &[
+            "ecc_known",
             "uncorrectable",
             "corrected_bits",
             "read_retries",
@@ -735,9 +1156,12 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         ],
     )?;
     for name in ["read-bbt", "read-status", "read-commit-state"] {
-        if recipe.commands[name].response.prefix_hex.is_empty() {
+        if !resolve_operation_steps(recipe, name)?.iter().any(|step| {
+            (step.capture.captures_payload() || step.capture.captures_fields())
+                && !step.command.response.prefix_hex.is_empty()
+        }) {
             return Err(Error::Invalid(format!(
-                "command {name} requires a non-empty response signature"
+                "operation {name} requires a non-empty response signature"
             )));
         }
     }
@@ -754,7 +1178,7 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         }
     }
     validate_bbt_layout(&recipe.bbt)?;
-    let bbt_response = &recipe.commands["read-bbt"];
+    let bbt_payload_bytes = operation_payload_bytes(recipe, "read-bbt")?;
     let bbt_end = u64::from(recipe.bbt.entries_offset)
         .checked_add(
             u64::from(recipe.bbt.maximum_entries)
@@ -765,9 +1189,8 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
     if !range_fits(
         recipe.bbt.count_offset,
         recipe.bbt.count_width,
-        bbt_response.response.min_bytes,
-    ) || bbt_end > u64::from(bbt_response.transfer_bytes)
-        || bbt_end > u64::from(bbt_response.response.max_bytes)
+        bbt_payload_bytes,
+    ) || bbt_end > u64::from(bbt_payload_bytes)
     {
         return Err(Error::Invalid(
             "old BBT layout exceeds the read-bbt response bounds".into(),
@@ -800,22 +1223,60 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
     }
     match &recipe.policy.service_loader_artifact_id {
         Some(id) => {
-            if recipe.family != "phison-ufd"
-                || !recipe.policy.enter_reenumerates
-                || !profile.artifacts.iter().any(|artifact| {
-                    artifact.id == *id
-                        && artifact.kind == crate::artifact::ArtifactKind::ServiceLoader
-                        && matches!(
-                            artifact.format,
-                            crate::artifact::ArtifactFormat::PhisonBtPram
-                                | crate::artifact::ArtifactFormat::PhisonBtPramExtended
-                        )
-                })
-            {
+            let artifact = profile
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == *id)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "service loader artifact {id} is absent from the profile"
+                    ))
+                })?;
+            let valid_loader = artifact.kind == crate::artifact::ArtifactKind::ServiceLoader
+                && match recipe.family.as_str() {
+                    "phison-ufd" => {
+                        recipe.policy.enter_reenumerates
+                            && matches!(
+                                artifact.format,
+                                crate::artifact::ArtifactFormat::PhisonBtPram
+                                    | crate::artifact::ArtifactFormat::PhisonBtPramExtended
+                            )
+                    }
+                    "alcor-ufd" => {
+                        !recipe.policy.loader_reenumerates
+                            && artifact.format
+                                == crate::artifact::ArtifactFormat::AlcorAu698xServicePayload
+                            && recipe.commands["enter-service-mode"]
+                                .payload
+                                .as_ref()
+                                .is_some_and(|payload| {
+                                    matches!(
+                                        payload,
+                                        PayloadSource::Artifact {
+                                            artifact_id,
+                                            offset: 0,
+                                            length: 0
+                                        } if artifact_id == id
+                                    )
+                                })
+                    }
+                    _ => false,
+                };
+            if !valid_loader {
                 return Err(Error::Invalid(
-                    "service loader must be a declared Phison BtPram artifact with entry re-enumeration"
-                        .into(),
+                    "service loader format, family or service-entry contract is invalid".into(),
                 ));
+            }
+            if recipe.family == "alcor-ufd" {
+                validate_alcor_service_upload_contract(
+                    "enter-service-mode",
+                    &recipe.commands["enter-service-mode"],
+                    &recipe.transport,
+                    recipe.policy.enter_reenumerates,
+                    recipe.policy.loader_reenumerates,
+                    id,
+                    artifact.size_bytes,
+                )?;
             }
         }
         None if recipe.policy.loader_reenumerates => {
@@ -849,11 +1310,66 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
                 RuntimeValue::UserBlocks | RuntimeValue::SpareBlocks => total,
                 RuntimeValue::Generation => continue,
             };
-            if !integer_fits(field.width, maximum) {
-                return Err(Error::Invalid(format!(
-                    "command {name} field {:?} cannot represent the profile geometry",
-                    field.value
-                )));
+            for input in 0..=maximum {
+                let encoded =
+                    apply_value_operations(input, &field.operations).map_err(|error| {
+                        Error::Invalid(format!(
+                        "command {name} field {:?} cannot transform runtime value {input}: {error}",
+                        field.value
+                    ))
+                    })?;
+                if !integer_fits(field.width, encoded) {
+                    return Err(Error::Invalid(format!(
+                        "command {name} field {:?} cannot represent transformed runtime value {encoded}",
+                        field.value
+                    )));
+                }
+            }
+        }
+        if matches!(
+            command.payload.as_ref(),
+            Some(PayloadSource::Context { .. })
+        ) {
+            if let Some(PayloadSource::Context { fields, .. }) = command.payload.as_ref() {
+                for field in fields {
+                    let maximum = match field.value {
+                        RuntimeValue::Channel => u64::from(geometry.channels.saturating_sub(1)),
+                        RuntimeValue::Chip => {
+                            u64::from(geometry.chips_per_channel.saturating_sub(1))
+                        }
+                        RuntimeValue::Lun => u64::from(geometry.luns_per_chip.saturating_sub(1)),
+                        RuntimeValue::Plane => u64::from(geometry.planes_per_lun.saturating_sub(1)),
+                        RuntimeValue::Block => u64::from(geometry.blocks_per_lun.saturating_sub(1)),
+                        RuntimeValue::Page => u64::from(geometry.pages_per_block.saturating_sub(1)),
+                        RuntimeValue::FlatBlock => total.saturating_sub(1),
+                        RuntimeValue::PayloadBytes => u64::from(command.transfer_bytes),
+                        RuntimeValue::UserBlocks | RuntimeValue::SpareBlocks => total,
+                        RuntimeValue::Generation => continue,
+                    };
+                    for input in 0..=maximum {
+                        let encoded = apply_value_operations(input, &field.operations).map_err(
+                            |error| {
+                                Error::Invalid(format!(
+                                    "command {name} context field {:?} cannot transform runtime value {input}: {error}",
+                                    field.value
+                                ))
+                            },
+                        )?;
+                        if !integer_fits(field.width, encoded) {
+                            return Err(Error::Invalid(format!(
+                                "command {name} context field {:?} cannot represent transformed runtime value {encoded}",
+                                field.value
+                            )));
+                        }
+                    }
+                }
+            }
+            for flat in 0..total {
+                build_context_payload(command, coordinate(flat, geometry)?).map_err(|error| {
+                    Error::Invalid(format!(
+                        "command {name} cannot encode physical block {flat}: {error}"
+                    ))
+                })?;
             }
         }
     }
@@ -866,14 +1382,8 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         .page_bytes
         .checked_add(geometry.oob_bytes)
         .ok_or_else(|| Error::Invalid("page plus OOB transfer size overflow".into()))?;
-    let read_page = &recipe.commands["read-page"];
     let program_transfer = recipe.commands["program-page"].transfer_bytes;
-    if read_page.response.payload_bytes != page_transfer
-        || read_page
-            .response
-            .payload_offset
-            .checked_add(page_transfer)
-            .is_none_or(|end| end > read_page.response.min_bytes)
+    if operation_payload_bytes(recipe, "read-page")? != page_transfer
         || !matches!(program_transfer, value if value == geometry.page_bytes || value == page_transfer)
     {
         return Err(Error::Invalid(format!(
@@ -881,11 +1391,11 @@ pub fn validate(recipe: &ControllerRecipe, profile: &Profile) -> Result<()> {
         )));
     }
     let expected_nand = exact_nand_id_bytes(&recipe.nand_id)?;
-    let read_nand = &recipe.commands["read-nand-id"];
-    if read_nand.response.payload_bytes as usize != expected_nand.len() {
+    let read_nand_bytes = operation_payload_bytes(recipe, "read-nand-id")?;
+    if read_nand_bytes as usize != expected_nand.len() {
         return Err(Error::Invalid(format!(
             "read-nand-id payload length {} does not match exact NAND id length {}",
-            read_nand.response.payload_bytes,
+            read_nand_bytes,
             expected_nand.len()
         )));
     }
@@ -979,32 +1489,21 @@ fn exact_controller_identity_value(value: Option<&str>) -> Result<Vec<u8>> {
 }
 
 fn require_runtime_binding(
-    commands: &BTreeMap<String, CommandSpec>,
-    command: &str,
+    recipe: &ControllerRecipe,
+    operation: &str,
     value: RuntimeValue,
 ) -> Result<()> {
-    if commands[command]
-        .fields
-        .iter()
-        .any(|field| field.value == value)
-    {
+    if operation_runtime_bindings(recipe, operation)?.contains(&value) {
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "command {command} has no {value:?} field binding"
+            "operation {operation} has no {value:?} field binding"
         )))
     }
 }
 
-fn require_physical_address_binding(
-    commands: &BTreeMap<String, CommandSpec>,
-    command: &str,
-) -> Result<()> {
-    let values = commands[command]
-        .fields
-        .iter()
-        .map(|field| field.value)
-        .collect::<BTreeSet<_>>();
+fn require_physical_address_binding(recipe: &ControllerRecipe, operation: &str) -> Result<()> {
+    let values = operation_runtime_bindings(recipe, operation)?;
     let flat = values.contains(&RuntimeValue::FlatBlock);
     let coordinates = [
         RuntimeValue::Channel,
@@ -1018,29 +1517,78 @@ fn require_physical_address_binding(
         Ok(())
     } else {
         Err(Error::Invalid(format!(
-            "command {command} must bind exactly one flat-block or complete channel/chip/lun/block address"
+            "operation {operation} must bind exactly one flat-block or complete channel/chip/lun/block address"
         )))
     }
 }
 
+fn operation_runtime_bindings(
+    recipe: &ControllerRecipe,
+    operation: &str,
+) -> Result<BTreeSet<RuntimeValue>> {
+    let mut values = BTreeSet::new();
+    for step in resolve_operation_steps(recipe, operation)? {
+        values.extend(runtime_bindings(step.command));
+    }
+    Ok(values)
+}
+
+fn runtime_bindings(command: &CommandSpec) -> BTreeSet<RuntimeValue> {
+    let mut values = command
+        .fields
+        .iter()
+        .map(|field| field.value)
+        .collect::<BTreeSet<_>>();
+    if let Some(PayloadSource::Context { fields, .. }) = command.payload.as_ref() {
+        values.extend(fields.iter().map(|field| field.value));
+    }
+    values
+}
+
 fn require_response_fields(
-    commands: &BTreeMap<String, CommandSpec>,
-    command: &str,
+    recipe: &ControllerRecipe,
+    operation: &str,
     required: &[&str],
 ) -> Result<()> {
-    let fields = &commands
-        .get(command)
-        .ok_or_else(|| Error::Invalid(format!("command {command} is absent")))?
-        .response
-        .fields;
+    let fields = resolve_operation_steps(recipe, operation)?
+        .into_iter()
+        .filter(|step| step.capture.captures_fields())
+        .flat_map(|step| {
+            step.command
+                .response
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+        })
+        .collect::<BTreeSet<_>>();
     for name in required {
-        if !fields.iter().any(|field| field.name == *name) {
+        if !fields.contains(name) {
             return Err(Error::Invalid(format!(
-                "command {command} response is missing required field {name}"
+                "operation {operation} response is missing required field {name}"
             )));
         }
     }
     Ok(())
+}
+
+fn operation_payload_bytes(recipe: &ControllerRecipe, operation: &str) -> Result<u32> {
+    let total = resolve_operation_steps(recipe, operation)?
+        .into_iter()
+        .filter(|step| step.capture.captures_payload())
+        .try_fold(0u64, |total, step| {
+            if step.command.response.payload_bytes == 0 {
+                return Err(Error::Invalid(format!(
+                    "operation {operation} has a variable captured payload"
+                )));
+            }
+            total
+                .checked_add(u64::from(step.command.response.payload_bytes))
+                .ok_or_else(|| {
+                    Error::Invalid(format!("operation {operation} payload size overflow"))
+                })
+        })?;
+    u32::try_from(total)
+        .map_err(|_| Error::Invalid(format!("operation {operation} payload exceeds u32")))
 }
 
 fn integer_fits(width: u8, value: u64) -> bool {
@@ -1070,6 +1618,25 @@ fn require_command_contract(
         )));
     }
     Ok(())
+}
+
+fn require_erase_command_contract(commands: &BTreeMap<String, CommandSpec>) -> Result<()> {
+    let command = &commands["erase-block"];
+    if matches!(
+        (command.direction, command.payload.as_ref()),
+        (TransferDirection::None, None)
+            | (
+                TransferDirection::ToDevice,
+                Some(PayloadSource::Context { .. })
+            )
+    ) {
+        Ok(())
+    } else {
+        Err(Error::Invalid(
+            "command erase-block must use either a no-data CDB or a context-generated payload"
+                .into(),
+        ))
+    }
 }
 
 fn validate_response(name: &str, response: &ResponseRule) -> Result<()> {
@@ -1128,6 +1695,34 @@ fn validate_response(name: &str, response: &ResponseRule) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a fixed, device-to-host identity command for use before a full
+/// destructive recipe exists. Variable CDB fields, payload writes, partial
+/// transfers and unsigned responses are intentionally forbidden.
+pub fn validate_identity_command(name: &str, command: &CommandSpec) -> Result<()> {
+    let cdb = hex_bytes(&command.cdb_hex, &format!("command {name} cdb_hex"))?;
+    if !(6..=MAX_CDB_BYTES).contains(&cdb.len())
+        || !command.fields.is_empty()
+        || command.direction != TransferDirection::FromDevice
+        || command.payload.is_some()
+        || !(1..=64 * 1024).contains(&command.transfer_bytes)
+        || !(100..=60_000).contains(&command.timeout_ms)
+    {
+        return Err(Error::Invalid(format!(
+            "identity command {name} must be a fixed bounded device-to-host CDB"
+        )));
+    }
+    if command.response.min_bytes != command.transfer_bytes
+        || command.response.max_bytes != command.transfer_bytes
+        || command.response.prefix_hex.is_empty()
+        || command.response.payload_bytes == 0
+    {
+        return Err(Error::Invalid(format!(
+            "identity command {name} requires one exact transfer length, a response signature and a payload window"
+        )));
+    }
+    validate_response(name, &command.response)
 }
 
 fn validate_bbt_layout(layout: &BbtLayout) -> Result<()> {
@@ -1342,15 +1937,121 @@ fn validate_metadata_layouts(
 pub fn build_cdb(command: &CommandSpec, context: CommandContext) -> Result<Vec<u8>> {
     let mut cdb = hex_bytes(&command.cdb_hex, "command cdb_hex")?;
     for field in &command.fields {
+        let value = apply_value_operations(context.value(field.value), &field.operations)?;
         put_integer(
             &mut cdb,
             usize::from(field.offset),
             field.width,
             field.endian,
-            context.value(field.value),
+            value,
         )?;
     }
     Ok(cdb)
+}
+
+fn value_operations_valid(operations: &[ValueOperation]) -> bool {
+    operations.len() <= MAX_VALUE_OPERATIONS
+        && operations.iter().all(|operation| match operation {
+            ValueOperation::Divide { value }
+            | ValueOperation::Modulo { value }
+            | ValueOperation::XorModulo { value } => *value != 0,
+            ValueOperation::ShiftLeft { bits } | ValueOperation::ShiftRight { bits } => *bits < 64,
+            _ => true,
+        })
+}
+
+fn apply_value_operations(mut value: u64, operations: &[ValueOperation]) -> Result<u64> {
+    for operation in operations {
+        value = match operation {
+            ValueOperation::Add { value: operand } => value
+                .checked_add(*operand)
+                .ok_or_else(|| Error::Invalid("value operation addition overflow".into()))?,
+            ValueOperation::Subtract { value: operand } => value
+                .checked_sub(*operand)
+                .ok_or_else(|| Error::Invalid("value operation subtraction underflow".into()))?,
+            ValueOperation::Multiply { value: operand } => value
+                .checked_mul(*operand)
+                .ok_or_else(|| Error::Invalid("value operation multiplication overflow".into()))?,
+            ValueOperation::Divide { value: operand } => value
+                .checked_div(*operand)
+                .ok_or_else(|| Error::Invalid("value operation division by zero".into()))?,
+            ValueOperation::Modulo { value: operand } => value
+                .checked_rem(*operand)
+                .ok_or_else(|| Error::Invalid("value operation modulo by zero".into()))?,
+            ValueOperation::XorModulo { value: operand } => {
+                value
+                    ^ value.checked_rem(*operand).ok_or_else(|| {
+                        Error::Invalid("value operation xor-modulo by zero".into())
+                    })?
+            }
+            ValueOperation::And { mask } => value & mask,
+            ValueOperation::Or { mask } => value | mask,
+            ValueOperation::ShiftLeft { bits } => {
+                let factor = 1u64.checked_shl(u32::from(*bits)).ok_or_else(|| {
+                    Error::Invalid("value operation left shift is out of range".into())
+                })?;
+                value
+                    .checked_mul(factor)
+                    .ok_or_else(|| Error::Invalid("value operation left shift overflow".into()))?
+            }
+            ValueOperation::ShiftRight { bits } => value
+                .checked_shr(u32::from(*bits))
+                .ok_or_else(|| Error::Invalid("value operation right shift overflow".into()))?,
+        };
+    }
+    Ok(value)
+}
+
+pub fn build_context_payload(command: &CommandSpec, context: CommandContext) -> Result<Vec<u8>> {
+    let Some(PayloadSource::Context {
+        record_bytes,
+        repeat,
+        fill_byte,
+        constants,
+        fields,
+    }) = command.payload.as_ref()
+    else {
+        return Err(Error::Invalid(
+            "command has no context-generated payload".into(),
+        ));
+    };
+    let record_bytes = usize::try_from(*record_bytes)
+        .map_err(|_| Error::Invalid("context payload record is too large".into()))?;
+    let repeat = usize::try_from(*repeat)
+        .map_err(|_| Error::Invalid("context payload repeat is too large".into()))?;
+    let total = record_bytes
+        .checked_mul(repeat)
+        .ok_or_else(|| Error::Invalid("context payload size overflow".into()))?;
+    if total != command.transfer_bytes as usize || total > MAX_COMMAND_TRANSFER as usize {
+        return Err(Error::Invalid(
+            "context payload does not match command transfer length".into(),
+        ));
+    }
+    let mut record = vec![*fill_byte; record_bytes];
+    for constant in constants {
+        put_integer(
+            &mut record,
+            constant.offset as usize,
+            constant.width,
+            constant.endian,
+            constant.value,
+        )?;
+    }
+    for field in fields {
+        let value = apply_value_operations(context.value(field.value), &field.operations)?;
+        put_integer(
+            &mut record,
+            field.offset as usize,
+            field.width,
+            field.endian,
+            value,
+        )?;
+    }
+    let mut payload = Vec::with_capacity(total);
+    for _ in 0..repeat {
+        payload.extend_from_slice(&record);
+    }
+    Ok(payload)
 }
 
 pub fn decode_response(command: &CommandSpec, data: &[u8]) -> Result<BTreeMap<String, u64>> {
@@ -1563,7 +2264,24 @@ impl ControllerRunState {
                 "controller state binding mismatch".into(),
             ));
         }
+        self.service_mode_transition_active()?;
         Ok(())
+    }
+
+    pub fn service_mode_transition_active(&self) -> Result<bool> {
+        match self.service_mode.as_str() {
+            "normal" => Ok(false),
+            "entry-command-pending"
+            | "entry-reenumerating"
+            | "loader-command-pending"
+            | "loader-reenumerating"
+            | "in-service"
+            | "exit-command-pending"
+            | "exit-reenumerating" => Ok(true),
+            value => Err(Error::Permission(format!(
+                "controller state has unknown service mode {value}"
+            ))),
+        }
     }
 }
 
@@ -2246,6 +2964,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transport_preserves_exact_cdb_length_contract() {
+        for length in [6, 10, 12, 16] {
+            assert!(transport_supports_cdb(TRANSPORT_SCSI_COMMAND, length));
+            assert!(transport_supports_cdb(TRANSPORT_USB_BOT, length));
+        }
+        assert!(!transport_supports_cdb(TRANSPORT_SCSI_COMMAND, 8));
+        assert!(transport_supports_cdb(TRANSPORT_USB_BOT, 8));
+        assert!(!transport_supports_cdb(TRANSPORT_USB_BOT, 5));
+        assert!(!transport_supports_cdb(TRANSPORT_USB_BOT, 17));
+        assert!(!transport_supports_cdb("unknown", 16));
+    }
+
+    #[test]
     fn sandisk_u3_logical_commands_cannot_claim_raw_roles() {
         let mut set_domains = [0u8; 12];
         set_domains[..3].copy_from_slice(&[0xff, 0x22, 0x00]);
@@ -2321,6 +3052,75 @@ mod tests {
     }
 
     #[test]
+    fn alcor_service_upload_is_byte_exact_and_non_reenumerating() {
+        let mut command = CommandSpec {
+            cdb_hex: "fa0a000000000000".into(),
+            direction: TransferDirection::ToDevice,
+            transfer_bytes: 1024,
+            timeout_ms: 60_000,
+            fields: vec![FieldBinding {
+                offset: 3,
+                width: 1,
+                endian: Endian::Big,
+                value: RuntimeValue::PayloadBytes,
+                operations: vec![
+                    ValueOperation::Divide { value: 512 },
+                    ValueOperation::Subtract { value: 1 },
+                ],
+            }],
+            payload: Some(PayloadSource::Artifact {
+                artifact_id: "alcor-service".into(),
+                offset: 0,
+                length: 0,
+            }),
+            response: ResponseRule::default(),
+        };
+        validate_alcor_service_upload_contract(
+            "enter-service-mode",
+            &command,
+            TRANSPORT_USB_BOT,
+            false,
+            false,
+            "alcor-service",
+            1024,
+        )
+        .unwrap();
+
+        assert!(validate_alcor_service_upload_contract(
+            "enter-service-mode",
+            &command,
+            TRANSPORT_SCSI_COMMAND,
+            false,
+            false,
+            "alcor-service",
+            1024,
+        )
+        .is_err());
+        assert!(validate_alcor_service_upload_contract(
+            "enter-service-mode",
+            &command,
+            TRANSPORT_USB_BOT,
+            true,
+            false,
+            "alcor-service",
+            1024,
+        )
+        .is_err());
+
+        command.fields[0].operations.swap(0, 1);
+        assert!(validate_alcor_service_upload_contract(
+            "enter-service-mode",
+            &command,
+            TRANSPORT_USB_BOT,
+            false,
+            false,
+            "alcor-service",
+            1024,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn cdb_fields_are_bounded_and_endian_correct() {
         let command = CommandSpec {
             cdb_hex: "06000000000000000000".into(),
@@ -2332,6 +3132,7 @@ mod tests {
                 width: 4,
                 endian: Endian::Big,
                 value: RuntimeValue::FlatBlock,
+                operations: Vec::new(),
             }],
             payload: None,
             response: ResponseRule::default(),
@@ -2345,6 +3146,199 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&cdb[2..6], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn cdb_fields_apply_checked_value_operations() {
+        let command = CommandSpec {
+            cdb_hex: "fa0a000000000000".into(),
+            direction: TransferDirection::ToDevice,
+            transfer_bytes: 1536,
+            timeout_ms: 60_000,
+            fields: vec![FieldBinding {
+                offset: 3,
+                width: 1,
+                endian: Endian::Big,
+                value: RuntimeValue::PayloadBytes,
+                operations: vec![ValueOperation::Subtract { value: 2048 }],
+            }],
+            payload: Some(PayloadSource::Caller),
+            response: ResponseRule::default(),
+        };
+        assert!(build_cdb(
+            &command,
+            CommandContext {
+                payload_bytes: 1536,
+                ..CommandContext::default()
+            }
+        )
+        .is_err());
+
+        let mut command = command;
+        command.fields[0].operations = vec![ValueOperation::Add { value: u64::MAX }];
+        assert!(build_cdb(
+            &command,
+            CommandContext {
+                payload_bytes: 1536,
+                ..CommandContext::default()
+            }
+        )
+        .is_err());
+
+        command.fields[0].operations = vec![
+            ValueOperation::Divide { value: 512 },
+            ValueOperation::Subtract { value: 1 },
+        ];
+        assert_eq!(
+            build_cdb(
+                &command,
+                CommandContext {
+                    payload_bytes: 1536,
+                    ..CommandContext::default()
+                }
+            )
+            .unwrap(),
+            [0xfa, 0x0a, 0, 2, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn context_payload_encodes_and_repeats_a_transformed_block_address() {
+        let command = CommandSpec {
+            cdb_hex: "ea0000000000000000000000000000e2".into(),
+            direction: TransferDirection::ToDevice,
+            transfer_bytes: 8,
+            timeout_ms: 1000,
+            fields: Vec::new(),
+            payload: Some(PayloadSource::Context {
+                record_bytes: 4,
+                repeat: 2,
+                fill_byte: 0,
+                constants: Vec::new(),
+                fields: vec![
+                    PayloadFieldBinding {
+                        offset: 0,
+                        width: 3,
+                        endian: Endian::Little,
+                        value: RuntimeValue::FlatBlock,
+                        operations: vec![
+                            ValueOperation::Multiply { value: 0x100 },
+                            ValueOperation::XorModulo { value: 0x400 },
+                            ValueOperation::And { mask: 0x00ff_ffff },
+                        ],
+                    },
+                    PayloadFieldBinding {
+                        offset: 3,
+                        width: 1,
+                        endian: Endian::Little,
+                        value: RuntimeValue::FlatBlock,
+                        operations: vec![
+                            ValueOperation::Multiply { value: 0x100 },
+                            ValueOperation::Divide { value: 0x400 },
+                            ValueOperation::And { mask: 0xff },
+                        ],
+                    },
+                ],
+            }),
+            response: ResponseRule::default(),
+        };
+        let payload = build_context_payload(
+            &command,
+            CommandContext {
+                flat_block: 0x123,
+                ..CommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(payload, [0x00, 0x20, 0x01, 0x48, 0x00, 0x20, 0x01, 0x48]);
+        validate_context_payload("erase-block", &command).unwrap();
+    }
+
+    #[test]
+    fn context_payload_rejects_zero_divisors_and_overlap() {
+        let command = CommandSpec {
+            cdb_hex: "ea0000000000000000000000000000e2".into(),
+            direction: TransferDirection::ToDevice,
+            transfer_bytes: 4,
+            timeout_ms: 1000,
+            fields: Vec::new(),
+            payload: Some(PayloadSource::Context {
+                record_bytes: 4,
+                repeat: 1,
+                fill_byte: 0,
+                constants: Vec::new(),
+                fields: vec![
+                    PayloadFieldBinding {
+                        offset: 0,
+                        width: 4,
+                        endian: Endian::Little,
+                        value: RuntimeValue::FlatBlock,
+                        operations: vec![ValueOperation::Divide { value: 0 }],
+                    },
+                    PayloadFieldBinding {
+                        offset: 3,
+                        width: 1,
+                        endian: Endian::Little,
+                        value: RuntimeValue::Block,
+                        operations: Vec::new(),
+                    },
+                ],
+            }),
+            response: ResponseRule::default(),
+        };
+        assert!(validate_context_payload("erase-block", &command).is_err());
+        assert!(build_context_payload(&command, CommandContext::default()).is_err());
+    }
+
+    #[test]
+    fn context_payload_combines_constants_and_runtime_fields() {
+        let command = CommandSpec {
+            cdb_hex: "f1200000000000000000000100000000".into(),
+            direction: TransferDirection::ToDevice,
+            transfer_bytes: 8,
+            timeout_ms: 1000,
+            fields: Vec::new(),
+            payload: Some(PayloadSource::Context {
+                record_bytes: 8,
+                repeat: 1,
+                fill_byte: 0,
+                constants: vec![PayloadConstantBinding {
+                    offset: 2,
+                    width: 2,
+                    endian: Endian::Big,
+                    value: 1,
+                }],
+                fields: vec![
+                    PayloadFieldBinding {
+                        offset: 0,
+                        width: 1,
+                        endian: Endian::Big,
+                        value: RuntimeValue::FlatBlock,
+                        operations: vec![ValueOperation::Divide { value: 0x400 }],
+                    },
+                    PayloadFieldBinding {
+                        offset: 4,
+                        width: 2,
+                        endian: Endian::Big,
+                        value: RuntimeValue::FlatBlock,
+                        operations: vec![ValueOperation::Modulo { value: 0x400 }],
+                    },
+                ],
+            }),
+            response: ResponseRule::default(),
+        };
+        validate_context_payload("erase-block", &command).unwrap();
+        assert_eq!(
+            build_context_payload(
+                &command,
+                CommandContext {
+                    flat_block: 0x923,
+                    ..CommandContext::default()
+                }
+            )
+            .unwrap(),
+            [0x02, 0x00, 0x00, 0x01, 0x01, 0x23, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -2376,6 +3370,45 @@ mod tests {
         let loaded = load_state(&mut file).unwrap().unwrap();
         assert_eq!(loaded.sequence, 1);
         assert_eq!(loaded.phase, "inventory-complete");
+    }
+
+    #[test]
+    fn service_resume_accepts_only_known_durable_states() {
+        let mut state = ControllerRunState {
+            schema: STATE_SCHEMA,
+            sequence: 0,
+            plan_hash: "p".into(),
+            profile_id: "x".into(),
+            profile_sha256: "a".repeat(64),
+            recipe_sha256: "b".repeat(64),
+            controller_id: "c".into(),
+            firmware: "f".into(),
+            nand_id: "n".into(),
+            service_mode: "normal".into(),
+            phase: "new".into(),
+            old_bbt_sha256: String::new(),
+            new_bbt_sha256: String::new(),
+            generation: 0,
+            user_blocks: 0,
+            spare_blocks: 0,
+            blocks: Vec::new(),
+            in_flight: None,
+        };
+        assert!(!state.service_mode_transition_active().unwrap());
+        for mode in [
+            "entry-command-pending",
+            "entry-reenumerating",
+            "loader-command-pending",
+            "loader-reenumerating",
+            "in-service",
+            "exit-command-pending",
+            "exit-reenumerating",
+        ] {
+            state.service_mode = mode.into();
+            assert!(state.service_mode_transition_active().unwrap());
+        }
+        state.service_mode = "unknown-service-state".into();
+        assert!(state.service_mode_transition_active().is_err());
     }
 
     #[test]

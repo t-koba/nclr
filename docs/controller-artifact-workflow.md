@@ -6,6 +6,22 @@
 
 この仕組みは vendor tool が存在することを D1–D4 到達の証拠に変換するものではない。実装 provenance、NAND geometry、metadata layout、電源断 recovery、独立 HIL report がすべて揃うまで、実媒体の `CONTROLLER_REINITIALIZE` capability は無効のままである。
 
+HIL は service command、loader、geometry、BBT / FTL format を発見する工程ではない。これらは正規 tool の静的解析、USB trace の差分、clean-room 実装、artifact の意味検証として HIL より前に完成させる。HIL に残すのは、完成済みの exact tuple を犠牲媒体へ適用し、独立 reader、power-cut、再列挙後の全物理読み出しで結果を認定する最終工程だけである。
+
+## HIL 前に完了させる経路
+
+対象媒体 1 個を追加する作業順は次のとおりである。
+
+1. `nclr info -j /dev/diskN` で command-free の OS identity と exact USB / SCSI bootstrap を保存する。package-managed `probe-*.toml` が既に一致し、媒体が unmount 済みなら、macOS ではその profile に固定された 2 個の読み取りだけも実行する。
+2. 正規 tool または正規 installer を取得し、実行せず `nclr-lab tool` で file tree、SHA-256、format、protocol candidate、loader / NAND / BBT / ECC marker を抽出する。SMI FFW では controller + 完全な 6-byte NAND ID ごとの全代入行と参照 artifact、Alcor FlashList では完全な FID と CTL generation 別 module parameter も抽出する。
+3. tool の成功、失敗、NAND 設定差を USB capture し、`nclr-lab trace`、`diff`、`decode`、`infer` で固定 CDB、direction、transfer length、response signature、payload window を確定する。
+4. `nclr-lab probe new` で exact bootstrap を転記し、trace から確定した `read-controller-id` と `read-nand-id` だけを記入する。`probe check` を通した後、犠牲 research device に限り `probe run --execute --confirm-research-device` で完全一致を確認する。
+5. service transition、loader、raw page + OOB、physical erase/status、BBT / FTL / spare / capacity commit を 1 個の runtime recipe と exact geometry / metadata profile に固定する。
+6. `nclr-lab profile --check --pre-hil --artifact-dir STORE PROFILE` で、qualification report 以外の全 artifact byte 列と recipe semantics を検査する。この時点の profile は `trust = "validated"` のままにする。
+7. 最後に HIL qualification を実施し、独立 evidence を追加して package-managed production profile へ昇格する。
+
+手順 1–6 は HIL なしで完了できる。一方、正規 tool や trace に存在しない command を HIL の代わりに推測することはできない。pre-HIL check が通ることと、実媒体へ C3/C4 purge を許可することは別である。
+
 ## 一次資料と実装根拠
 
 - USB Mass Storage Bulk-Only Transport の CBW / data / CSW は [USB-IF Bulk-Only Transport 1.0](https://www.usb.org/sites/default/files/usbmassbulk_10.pdf) に従う。
@@ -22,6 +38,21 @@
 - Flash ID と geometry / timing / ECC の table
 - USB capture から確定した command recipe
 - loader が返す response signature と BBT / FTL / reserve metadata layout
+
+取得物の最初の静的 inventory は次で作る。
+
+```sh
+nclr-lab tool downloaded-or-extracted-path --family phison-ufd
+nclr-lab tool downloaded-or-extracted-path --family silicon-motion-ufd
+nclr-lab tool downloaded-or-extracted-path --family alcor-ufd
+nclr-lab tool downloaded-or-extracted-path --family sandisk-cruzer
+```
+
+`tool` は binary の固定列、C / C++ source literal、ASCII / UTF-16LE marker を読み、symbolic link を拒否し、file 数、file size、structured text size、行数、行長を上限付きで処理する。全 28 family に inventory marker と共通の `Flash ID`、`NAND ID`、`Bad Block`、`BBT`、`Low Level Format`、`Preformat`、`ISP`、`Loader`、`ECC`、`Read Retry`、`Randomizer`、`Page Size`、`Spare`、`OOB`、`Burner` marker を適用する。
+
+schema 2 の `nand_binding_records` は、SMI `UFD_ALL_ForceFW/*.FFW` の active な `FLASH_<12 hex>` 行だけを controller + exact NAND ID ごとに保持する。comment 化された短い legacy ID は無視し、active な短縮 ID、全 `00` / 全 `FF`、不正 key、unmatched quote は error にする。同じ key に複数の値がある場合は後勝ちにせず全行を残し、`conflicting_key_suffixes` と `selection_unambiguous = false` で示す。`.bin` / `.dll` / `.ebi` 参照は package 内の exact suffix または basename で SHA-256 付き候補へ解決し、`unique` / `identical-content` / `ambiguous` / `missing` を区別する。複数 path の size と SHA-256 が全て同じ場合だけ `identical-content` とし、候補 path 自体は全て保持する。
+
+`nand_identity_records` は Alcor の numeric section にある `FlashName` と exactly 6 個の `0xNN` `FID` の組だけを保持する。`module_mapping_records` は `UfdApi_Gen/CTL/<generation>/FlashList.ini` の `[MODULE_FETURE]` から 8／9 個の整数を意味付けせず raw parameter として保存し、対応 BIN の有無と SHA-256 を解決する。field の意味を未確認のまま geometry へ転記しない。出力の `candidate_family_scope` は解析対象 family、`static_matches_are_candidates_only = true` と `production_eligible = false` は発見が実行許可でないことを固定する。
 
 二次 archive しか入手できない tool は、内部 vendor metadata が整合しても正規署名済みとは扱わない。manifest の `source_url` は実際に取得した object、`terms_url` は vendor の適用条件を記録し、hash が異なる別 build を同じ artifact id で置換しない。
 
@@ -118,6 +149,26 @@ macOS では `diskutil` と IOKit registry を結合し、対象 BSD whole disk 
 
 JSON の `controller_research` は、selection 根拠、候補 family、観測した exact bootstrap、identity source、実際に送信した read-only command 一覧、production 化に不足する証拠を返す。VID だけで選ばれた family は候補にすぎず、未知 vendor command は送信せず capability も公開しない。固定 probe が利用できない macOS でも、この bundle から exact bootstrap profile の作成、正規 tool trace の対応付け、追加調査の不足項目を再現できる。
 
+完成した exact read-only probe は package-managed directory の `probe-*.toml` として置く。tuple が 1 個だけ一致する場合に限り、`nclr info` は Apple SCSITask を使って profile 内の `read-controller-id` と `read-nand-id` を送信できる。complete disk の unmount、removable、system-disk protection、holder 不在、6 / 10 / 12 / 16-byte CDB、1–64 KiB exact transfer、GOOD status、TASK COMPLETE、response signature と payload 完全一致をすべて要求する。8-byte Alcor command のように Apple interface が表現できない CDB を暗黙に padding しない。
+
+profile の作成、検査、dry-run、明示実行は次のとおりである。
+
+```sh
+nclr-lab probe new controller-inventory.json \
+  --family sandisk-cruzer \
+  --controller sandisk-82-00263-1 \
+  --firmware EXACT_VERSION \
+  --nand-id EXACT_FULL_NAND_ID \
+  -o probe-sandisk-82-00263-1.toml
+nclr-lab probe check probe-sandisk-82-00263-1.toml
+nclr-lab probe run probe-sandisk-82-00263-1.toml /dev/diskN
+diskutil unmountDisk /dev/diskN
+nclr-lab probe run probe-sandisk-82-00263-1.toml /dev/diskN \
+  --execute --confirm-research-device
+```
+
+生成直後の file は command、response、trace digest、source reference が placeholder なので意図的に `probe check` を通らない。trace にない値を補完してはならない。probe profile 自体には `trust`、erase、program、service-entry role が存在せず、成功しても purge capability を生まない。
+
 この出力には USB serial が含まれるため、外部共有前に取り扱いを決める。ただし production bootstrap では serial の空文字も wildcard ではなく exact absence として扱い、識別強度を下げる暗黙 fallback は行わない。
 
 native SD では同じ `info -j` が command-free の `sd_research` を返す。Linux の MMC registry から取得できる CID、CSD、SCR、manufacturer/OEM ID、product、serial、製造日、host、card kind、erase group を complete / partial に分類し、macOS で card register が公開されない場合は `os-identity-only` と明示する。CSD の address structure と erase command class から、SDSC の byte-addressed または SDHC/SDXC/SDUC の block-addressed standard full-user erase が protocol 上成立するかも事前計算する。CID/CSD/SCR は card identity であって内部 controller / firmware identity ではないため、vendor service command、NAND geometry、page/OOB addressing、BBT/FTL metadata、loader、recovery と HIL 証拠を別の不足項目として保持し、C3/C4 capability へ変換しない。
@@ -152,9 +203,9 @@ nclr-lab trace factory-success.pcapng \
 
 normalized NDJSON は `decode`、`diff`、`infer`、read-only 限定の `replay` へ渡せる。write / unknown opcode は replay されない。
 
-## Production profile の必須条件
+## Pre-HIL profile と production profile
 
-実媒体で `trust = "production"` を成立させるには、従来の exact firmware / NAND、D1–D4 accounting、BBT / FTL / spare rebuild、HIL 条件に加え、次を profile validator が強制する。
+`trust = "validated"` の profile に対して `nclr-lab profile --check --pre-hil` を実行すると、HIL qualification 以外の production 条件を全て強制する。
 
 1. `implementation.strategy`: `clean-room` または `runtime-artifact`。
 2. `protocol_evidence_sha256`: 同じ profile 内の `protocol-trace` artifact と一致。
@@ -162,7 +213,15 @@ normalized NDJSON は `decode`、`diff`、`infer`、read-only 限定の `replay`
 4. runtime artifact id: profile 内の exact controller / firmware / NAND artifact を参照。`protocol-recipe` はちょうど 1 個、`role = "runtime"` でなければならない。`strategy = "runtime-artifact"` は backend が実際に controller へ渡す `service-loader` を最低 1 個要求し、factory-tool PE / archive だけでは成立しない。固定 probe を持たない family の bootstrap は USB VID / PID / bcdDevice / manufacturer / product / serial と SCSI vendor / product / revision を全て exact に固定する。
 5. geometry: channel、CE、LUN、plane、block、page、page/OOB size、address cycle、bits/cell、FBB marker、randomizer、read-retry、ECC layout。
 6. metadata: BBT / FTL / spare format、atomic commit protocol、順序付けされた非重複 system block range。
-7. qualification report: `qualification-report` artifact の SHA-256 と `report_sha256` が一致。
+7. content-addressed store: qualification report 以外の宣言済み artifact を全て実際に開き、size、SHA-256、format を一致させる。runtime recipe は parse 後に command、response、geometry、metadata、recovery policy まで意味検証する。
+
+```sh
+nclr-lab profile --check --pre-hil \
+  --artifact-dir "$PWD/controller-artifacts" \
+  exact-validated.toml
+```
+
+この pre-HIL check が通った後にだけ HIL を開始する。実媒体で `trust = "production"` を成立させる最終追加条件は、`qualification-report` artifact の SHA-256 と `report_sha256`、独立 reader、sample 数、power-cut case 数が一致することである。
 
 TOML だけでは capability を有効化できない。profile、recipe、trace、qualification report、必要な loader の全 byte 列が hash 一致し、controller-owned response から exact controller / firmware / NAND が再確認された場合だけ C3/C4 capability を公開する。
 

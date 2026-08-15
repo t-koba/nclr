@@ -11,29 +11,30 @@
 //! declarative protocol recipe. The common engine implements the physical
 //! block, BBT and FTL lifecycle without embedding guessed vendor opcodes.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use nclr::backend::{FD_DEVICE, PROTOCOL_API};
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use nclr::VERSION;
 
 fn main() {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (FD_DEVICE, PROTOCOL_API, VERSION);
-        eprintln!("nclr-controller: the controller backend requires Linux (SG_IO); use the sim backend for the reference implementation");
+        eprintln!("nclr-controller: the controller backend requires Linux SG_IO or macOS SCSITask");
         std::process::exit(69);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        linux::linux_main();
+        platform::platform_main();
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod platform {
     use nclr::backend::{BackendEvents, FD_DEVICE, PROTOCOL_API};
     use nclr::backend_common;
     use nclr::controller::{self, ServiceModeState};
+    use nclr::controller_probe::{self, ObservedBootstrap};
     use nclr::controller_protocol::{self as vendor, ControllerIdentity, Family};
     use nclr::controller_recipe::{
         self as recipe, BlockDisposition, CommandContext, ControllerRecipe, ControllerRunState,
@@ -50,27 +51,236 @@ mod linux {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::FromRawFd;
 
+    trait CommandTransport {
+        fn select_recipe_transport(&self, transport: &str) -> Result<()> {
+            if matches!(
+                transport,
+                recipe::TRANSPORT_SCSI_COMMAND | recipe::TRANSPORT_USB_BOT
+            ) {
+                Ok(())
+            } else {
+                Err(Error::Unsupported(format!(
+                    "controller recipe transport {transport} is unsupported"
+                )))
+            }
+        }
+
+        fn execute(
+            &self,
+            cdb: &[u8],
+            direction: TransferDirection,
+            data: &mut [u8],
+            timeout_ms: u64,
+        ) -> Result<usize>;
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl CommandTransport for std::fs::File {
+        fn execute(
+            &self,
+            cdb: &[u8],
+            direction: TransferDirection,
+            data: &mut [u8],
+            timeout_ms: u64,
+        ) -> Result<usize> {
+            let direction = match direction {
+                TransferDirection::None => scsi::SG_DXFER_NONE,
+                TransferDirection::FromDevice => scsi::SG_DXFER_FROM_DEV,
+                TransferDirection::ToDevice => scsi::SG_DXFER_TO_DEV,
+            };
+            let timeout_ms = u32::try_from(timeout_ms)
+                .map_err(|_| Error::Invalid("SCSI timeout does not fit SG_IO".into()))?;
+            scsi::sg::exec_len(self, cdb, direction, data, timeout_ms)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MacSelectedTransport {
+        ScsiCommand,
+        UsbBot,
+    }
+
+    #[cfg(target_os = "macos")]
+    enum MacTransportState {
+        Unopened,
+        Scsi(nclr::macos_scsi::ScsiDevice),
+        UsbBot(nclr::macos_usb_bot::UsbBotDevice),
+        Closed,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacTransportInner {
+        selected: MacSelectedTransport,
+        state: MacTransportState,
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacCommandTransport {
+        disk_path: String,
+        expected_usb: Option<nclr::macos_usb_bot::ExpectedUsbDevice>,
+        inner: std::cell::RefCell<MacTransportInner>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl MacCommandTransport {
+        fn new(
+            disk_path: String,
+            expected_usb: Option<nclr::macos_usb_bot::ExpectedUsbDevice>,
+        ) -> Self {
+            Self {
+                disk_path,
+                expected_usb,
+                inner: std::cell::RefCell::new(MacTransportInner {
+                    selected: MacSelectedTransport::ScsiCommand,
+                    state: MacTransportState::Unopened,
+                }),
+            }
+        }
+
+        fn open_selected(&self, inner: &mut MacTransportInner) -> Result<()> {
+            if !matches!(inner.state, MacTransportState::Unopened) {
+                return Ok(());
+            }
+            inner.state = match inner.selected {
+                MacSelectedTransport::ScsiCommand => {
+                    MacTransportState::Scsi(nclr::macos_scsi::ScsiDevice::open(&self.disk_path)?)
+                }
+                MacSelectedTransport::UsbBot => {
+                    let expected = self.expected_usb.ok_or_else(|| {
+                        Error::Unsupported(
+                            "macOS USB BOT requires an exact USB descriptor and location tuple"
+                                .into(),
+                        )
+                    })?;
+                    MacTransportState::UsbBot(nclr::macos_usb_bot::UsbBotDevice::open(
+                        &self.disk_path,
+                        expected,
+                    )?)
+                }
+            };
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl CommandTransport for MacCommandTransport {
+        fn select_recipe_transport(&self, transport: &str) -> Result<()> {
+            let selected = match transport {
+                recipe::TRANSPORT_SCSI_COMMAND => MacSelectedTransport::ScsiCommand,
+                recipe::TRANSPORT_USB_BOT => MacSelectedTransport::UsbBot,
+                other => {
+                    return Err(Error::Unsupported(format!(
+                        "controller recipe transport {other} is unsupported on macOS"
+                    )))
+                }
+            };
+            let mut inner = self.inner.try_borrow_mut().map_err(|_| {
+                Error::Backend("macOS command transport is already borrowed".into())
+            })?;
+            if matches!(inner.state, MacTransportState::Closed) {
+                return Err(Error::Backend("macOS command transport is closed".into()));
+            }
+            if inner.selected == selected {
+                return Ok(());
+            }
+            if matches!(inner.state, MacTransportState::UsbBot(_)) {
+                return Err(Error::Permission(
+                    "macOS cannot switch a seized USB BOT session back to SCSITask".into(),
+                ));
+            }
+            if let MacTransportState::Scsi(mut device) =
+                std::mem::replace(&mut inner.state, MacTransportState::Unopened)
+            {
+                device.close()?;
+            }
+            inner.selected = selected;
+            Ok(())
+        }
+
+        fn execute(
+            &self,
+            cdb: &[u8],
+            direction: TransferDirection,
+            data: &mut [u8],
+            timeout_ms: u64,
+        ) -> Result<usize> {
+            let mut inner = self.inner.try_borrow_mut().map_err(|_| {
+                Error::Backend("macOS command transport is already borrowed".into())
+            })?;
+            self.open_selected(&mut inner)?;
+            match &mut inner.state {
+                MacTransportState::Scsi(device) => {
+                    match direction {
+                        TransferDirection::None => device.execute_no_data(cdb, timeout_ms)?,
+                        TransferDirection::FromDevice => {
+                            let received = device.read_exact(cdb, data.len(), timeout_ms)?;
+                            data.copy_from_slice(&received);
+                        }
+                        TransferDirection::ToDevice => device.write_exact(cdb, data, timeout_ms)?,
+                    }
+                    Ok(data.len())
+                }
+                MacTransportState::UsbBot(device) => {
+                    device.execute(cdb, direction, data, timeout_ms)
+                }
+                MacTransportState::Unopened => Err(Error::Backend(
+                    "macOS command transport remained unopened".into(),
+                )),
+                MacTransportState::Closed => {
+                    Err(Error::Backend("macOS command transport is closed".into()))
+                }
+            }
+        }
+
+        fn close(&self) -> Result<()> {
+            let mut inner = self.inner.try_borrow_mut().map_err(|_| {
+                Error::Backend("macOS command transport is already borrowed".into())
+            })?;
+            let state = std::mem::replace(&mut inner.state, MacTransportState::Closed);
+            match state {
+                MacTransportState::Scsi(mut device) => device.close(),
+                MacTransportState::UsbBot(mut device) => device.close(),
+                MacTransportState::Unopened | MacTransportState::Closed => Ok(()),
+            }
+        }
+    }
+
     /// SCSI INQUIRY is reported for diagnostics only. It is not sufficiently
     /// controller-specific to authorize a vendor profile.
-    fn scsi_identity(file: &std::fs::File) -> Result<(nclr::scsi::Inquiry, Vec<u8>)> {
+    fn scsi_identity(transport: &dyn CommandTransport) -> Result<(nclr::scsi::Inquiry, Vec<u8>)> {
         let inq_raw = scsi_command(
-            file,
+            transport,
             &scsi::cdb_inquiry(false, 0, 96),
-            scsi::SG_DXFER_FROM_DEV,
+            TransferDirection::FromDevice,
             96,
         )?;
         Ok((scsi::parse_inquiry(&inq_raw)?, inq_raw))
     }
 
     fn scsi_command(
-        file: &std::fs::File,
+        transport: &dyn CommandTransport,
         cdb: &[u8],
-        direction: i32,
+        direction: TransferDirection,
         len: usize,
     ) -> Result<Vec<u8>> {
+        scsi_command_timeout(transport, cdb, direction, len, 60_000)
+    }
+
+    fn scsi_command_timeout(
+        transport: &dyn CommandTransport,
+        cdb: &[u8],
+        direction: TransferDirection,
+        len: usize,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        let transferred = scsi::sg::exec_len(file, cdb, direction, &mut buf, 60_000)?;
-        if direction == scsi::SG_DXFER_FROM_DEV {
+        let transferred = transport.execute(cdb, direction, &mut buf, timeout_ms)?;
+        if direction == TransferDirection::FromDevice {
             buf.truncate(transferred);
         } else if transferred != len {
             return Err(Error::Invalid(format!(
@@ -88,12 +298,13 @@ mod linux {
     }
 
     fn execute_recipe_command(
-        file: &std::fs::File,
+        transport: &dyn CommandTransport,
         recipe: &ControllerRecipe,
         name: &str,
         mut context: CommandContext,
         payload: Option<&[u8]>,
     ) -> Result<(Vec<u8>, BTreeMap<String, u64>)> {
+        transport.select_recipe_transport(&recipe.transport)?;
         let spec = command(recipe, name)?;
         context.payload_bytes = payload.map_or(0, |data| data.len() as u64);
         let cdb = recipe::build_cdb(spec, context)?;
@@ -127,14 +338,7 @@ mod linux {
                 payload.to_vec()
             }
         };
-        let direction = match spec.direction {
-            TransferDirection::None => scsi::SG_DXFER_NONE,
-            TransferDirection::FromDevice => scsi::SG_DXFER_FROM_DEV,
-            TransferDirection::ToDevice => scsi::SG_DXFER_TO_DEV,
-        };
-        let timeout_ms = u32::try_from(spec.timeout_ms)
-            .map_err(|_| Error::Invalid(format!("command {name} timeout does not fit SG_IO")))?;
-        let transferred = scsi::sg::exec_len(file, &cdb, direction, &mut data, timeout_ms)?;
+        let transferred = transport.execute(&cdb, spec.direction, &mut data, spec.timeout_ms)?;
         if spec.direction == TransferDirection::ToDevice && transferred != data.len() {
             return Err(Error::Invalid(format!(
                 "command {name} transferred {transferred} of {} payload bytes",
@@ -197,6 +401,7 @@ mod linux {
     fn command_payload(
         spec: &recipe::CommandSpec,
         files: &mut [(String, std::fs::File)],
+        context: CommandContext,
         caller: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>> {
         match spec.payload.as_ref() {
@@ -223,20 +428,61 @@ mod linux {
                     .ok_or_else(|| Error::Invalid("generated command payload is absent".into()))?
                     .to_vec(),
             )),
+            Some(recipe::PayloadSource::Context { .. }) => {
+                if caller.is_some() {
+                    return Err(Error::Invalid(
+                        "context-generated command received a caller payload".into(),
+                    ));
+                }
+                Ok(Some(recipe::build_context_payload(spec, context)?))
+            }
         }
     }
 
     fn execute_named(
-        file: &std::fs::File,
+        transport: &dyn CommandTransport,
         recipe: &ControllerRecipe,
         files: &mut [(String, std::fs::File)],
         name: &str,
         context: CommandContext,
         caller: Option<&[u8]>,
     ) -> Result<(Vec<u8>, BTreeMap<String, u64>)> {
-        let spec = command(recipe, name)?;
-        let payload = command_payload(spec, files, caller)?;
-        execute_recipe_command(file, recipe, name, context, payload.as_deref())
+        let steps = recipe::resolve_operation_steps(recipe, name)?;
+        let mut output = Vec::new();
+        let mut fields = BTreeMap::new();
+        for step in steps {
+            let step_caller = if step.is_target { caller } else { None };
+            let payload = command_payload(step.command, files, context, step_caller)?;
+            let (step_output, step_fields) = execute_recipe_command(
+                transport,
+                recipe,
+                step.command_name,
+                context,
+                payload.as_deref(),
+            )?;
+            if step.capture.captures_payload() {
+                let aggregate = output
+                    .len()
+                    .checked_add(step_output.len())
+                    .ok_or_else(|| Error::Invalid("operation output length overflow".into()))?;
+                if aggregate > recipe::MAX_COMMAND_TRANSFER as usize {
+                    return Err(Error::Invalid(format!(
+                        "operation {name} output exceeds the aggregate transfer bound"
+                    )));
+                }
+                output.extend_from_slice(&step_output);
+            }
+            if step.capture.captures_fields() {
+                for (field, value) in step_fields {
+                    if fields.insert(field.clone(), value).is_some() {
+                        return Err(Error::Invalid(format!(
+                            "operation {name} returned duplicate field {field}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok((output, fields))
     }
 
     fn state_digest(state: &ControllerRunState) -> Result<String> {
@@ -347,16 +593,25 @@ mod linux {
         }
     }
 
+    /// Shared immutable transport, recipe and geometry context for the
+    /// controller run actions; groups the stable read-only execution
+    /// inputs so the physical sweep and per-block erase entry points stay
+    /// callable without a long argument list. The mutable per-call inputs
+    /// (artifacts, events) stay explicit arguments.
+    struct RecipeRunContext<'a> {
+        file: &'a dyn CommandTransport,
+        controller_recipe: &'a ControllerRecipe,
+        geometry: &'a nclr::profile::NandGeometryPolicy,
+    }
+
     fn sweep_physical(
-        file: &std::fs::File,
-        controller_recipe: &ControllerRecipe,
-        artifacts: &mut [(String, std::fs::File)],
+        run: &RecipeRunContext<'_>,
         state: &ControllerRunState,
-        geometry: &nclr::profile::NandGeometryPolicy,
         image: Option<&mut std::fs::File>,
         map: Option<&mut std::fs::File>,
-        events: &mut BackendEvents,
         action: &str,
+        artifacts: &mut [(String, std::fs::File)],
+        events: &mut BackendEvents,
     ) -> Result<nclr::physical::SweepSummary> {
         let dispositions = state
             .blocks
@@ -364,42 +619,50 @@ mod linux {
             .map(|block| physical_disposition(block.disposition))
             .collect::<Vec<_>>();
         let sweep_geometry = nclr::physical::SweepGeometry {
-            blocks: recipe::total_blocks(geometry)?,
-            channels: geometry.channels,
-            chips_per_channel: geometry.chips_per_channel,
-            luns_per_chip: geometry.luns_per_chip,
-            planes_per_lun: geometry.planes_per_lun,
-            blocks_per_lun: geometry.blocks_per_lun,
-            pages_per_block: geometry.pages_per_block,
-            page_bytes: geometry.page_bytes,
-            oob_bytes: geometry.oob_bytes,
+            blocks: recipe::total_blocks(run.geometry)?,
+            channels: run.geometry.channels,
+            chips_per_channel: run.geometry.chips_per_channel,
+            luns_per_chip: run.geometry.luns_per_chip,
+            planes_per_lun: run.geometry.planes_per_lun,
+            blocks_per_lun: run.geometry.blocks_per_lun,
+            pages_per_block: run.geometry.pages_per_block,
+            page_bytes: run.geometry.page_bytes,
+            oob_bytes: run.geometry.oob_bytes,
         };
         nclr::physical::sweep_physical_pages(
             sweep_geometry,
             &dispositions,
-            controller_recipe.policy.erased_byte,
+            run.controller_recipe.policy.erased_byte,
             image.map(|writer| writer as &mut dyn nclr::physical::WriteSeek),
             map.map(|writer| writer as &mut dyn std::io::Write),
             |flat, page| {
                 let context = CommandContext {
                     page: u64::from(page),
-                    ..recipe::coordinate(flat, geometry)?
+                    ..recipe::coordinate(flat, run.geometry)?
                 };
                 let (raw, fields) = execute_named(
-                    file,
-                    controller_recipe,
+                    run.file,
+                    run.controller_recipe,
                     artifacts,
                     "read-page",
                     context,
                     None,
                 )?;
+                let ecc_known = response_value(&fields, "ecc_known")? != 0;
+                let uncorrectable = response_value(&fields, "uncorrectable")? != 0;
                 Ok(nclr::physical::PageRead {
                     raw,
                     metrics: nclr::physical::PageMetrics {
                         corrected_bits: response_value(&fields, "corrected_bits")?,
                         read_retries: response_value(&fields, "read_retries")?,
                         read_latency_ms: response_value(&fields, "read_latency_ms")?,
-                        uncorrectable: response_value(&fields, "uncorrectable")? != 0,
+                        ecc_status: if !ecc_known {
+                            nclr::physical::PageEccStatus::Unknown
+                        } else if uncorrectable {
+                            nclr::physical::PageEccStatus::Uncorrectable
+                        } else {
+                            nclr::physical::PageEccStatus::Correctable
+                        },
                     },
                 })
             },
@@ -438,7 +701,7 @@ mod linux {
     }
 
     fn wait_controller_idle(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         context: CommandContext,
@@ -488,6 +751,20 @@ mod linux {
         })
     }
 
+    fn validate_inquiry_continuation(
+        inquiry_available: bool,
+        service_state_bound: bool,
+        diagnostic: Option<&str>,
+    ) -> Result<()> {
+        if inquiry_available || service_state_bound {
+            return Ok(());
+        }
+        Err(Error::Permission(format!(
+            "standard SCSI INQUIRY failed and no recipe-bound non-normal controller state permits continuation: {}",
+            diagnostic.unwrap_or("the transport returned no diagnostic")
+        )))
+    }
+
     fn bounded_failure(error: &Error) -> String {
         const MAX_CHARS: usize = 64;
         let message = error.to_string();
@@ -513,7 +790,7 @@ mod linux {
     }
 
     fn verify_erased_page(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         mut context: CommandContext,
@@ -544,7 +821,7 @@ mod linux {
     }
 
     fn verify_factory_markers(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         state: &ControllerRunState,
@@ -592,24 +869,29 @@ mod linux {
     }
 
     fn erase_one(
-        file: &std::fs::File,
-        controller_recipe: &ControllerRecipe,
-        artifacts: &mut [(String, std::fs::File)],
+        run: &RecipeRunContext<'_>,
         state_file: &mut std::fs::File,
         state: &mut ControllerRunState,
-        geometry: &nclr::profile::NandGeometryPolicy,
         flat: u64,
         phase: &str,
+        artifacts: &mut [(String, std::fs::File)],
         events: &mut BackendEvents,
     ) -> Result<bool> {
-        let context = recipe::coordinate(flat, geometry)?;
+        let context = recipe::coordinate(flat, run.geometry)?;
         if state
             .in_flight
             .as_ref()
             .is_some_and(|flight| flight.flat_block == flat && flight.operation == "erase-block")
         {
             if let Err(error) = ambiguous_transport(
-                wait_controller_idle(file, controller_recipe, artifacts, context, events, phase),
+                wait_controller_idle(
+                    run.file,
+                    run.controller_recipe,
+                    artifacts,
+                    context,
+                    events,
+                    phase,
+                ),
                 &format!("erase-block status for block {flat}"),
             ) {
                 if matches!(&error, Error::Backend(_)) {
@@ -618,18 +900,24 @@ mod linux {
                 }
                 return Err(error);
             }
-            if verify_erased_page(file, controller_recipe, artifacts, context, geometry)? {
+            if verify_erased_page(
+                run.file,
+                run.controller_recipe,
+                artifacts,
+                context,
+                run.geometry,
+            )? {
                 state.in_flight = None;
                 save_state(state_file, state)?;
                 return Ok(true);
             }
         }
-        for attempt in 0..=controller_recipe.policy.erase_retries {
+        for attempt in 0..=run.controller_recipe.policy.erase_retries {
             set_in_flight(state_file, state, "erase-block", flat, phase)?;
             ambiguous_transport(
                 execute_named(
-                    file,
-                    controller_recipe,
+                    run.file,
+                    run.controller_recipe,
                     artifacts,
                     "erase-block",
                     context,
@@ -638,7 +926,14 @@ mod linux {
                 &format!("erase-block command for block {flat}"),
             )?;
             if let Err(error) = ambiguous_transport(
-                wait_controller_idle(file, controller_recipe, artifacts, context, events, phase),
+                wait_controller_idle(
+                    run.file,
+                    run.controller_recipe,
+                    artifacts,
+                    context,
+                    events,
+                    phase,
+                ),
                 &format!("erase-block status for block {flat}"),
             ) {
                 if matches!(&error, Error::Backend(_)) {
@@ -648,7 +943,13 @@ mod linux {
                 return Err(error);
             }
             state.blocks[flat as usize].erase_attempts = attempt.saturating_add(1);
-            if verify_erased_page(file, controller_recipe, artifacts, context, geometry)? {
+            if verify_erased_page(
+                run.file,
+                run.controller_recipe,
+                artifacts,
+                context,
+                run.geometry,
+            )? {
                 state.in_flight = None;
                 return Ok(true);
             }
@@ -705,22 +1006,39 @@ mod linux {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn execute_action(
-        action: &str,
-        plan_hash: &str,
-        reenumeration_nonce: Option<&str>,
-        file: &std::fs::File,
-        block_file: &std::fs::File,
-        profile: &Profile,
-        controller_recipe: &ControllerRecipe,
-        recipe_sha256: &str,
-        artifacts: &mut [(String, std::fs::File)],
-        state_file: &mut std::fs::File,
-        mut physical_image: Option<&mut std::fs::File>,
-        mut physical_map: Option<&mut std::fs::File>,
-        events: &mut BackendEvents,
-    ) -> Result<Value> {
+    /// Bound inputs of one controller action invocation.
+    struct ActionInvocation<'a> {
+        action: &'a str,
+        plan_hash: &'a str,
+        reenumeration_nonce: Option<&'a str>,
+        file: &'a dyn CommandTransport,
+        block_file: &'a std::fs::File,
+        profile: &'a Profile,
+        controller_recipe: &'a ControllerRecipe,
+        recipe_sha256: &'a str,
+        artifacts: &'a mut [(String, std::fs::File)],
+        state_file: &'a mut std::fs::File,
+        physical_image: Option<&'a mut std::fs::File>,
+        physical_map: Option<&'a mut std::fs::File>,
+        events: &'a mut BackendEvents,
+    }
+
+    fn execute_action(invocation: ActionInvocation) -> Result<Value> {
+        let ActionInvocation {
+            action,
+            plan_hash,
+            reenumeration_nonce,
+            file,
+            block_file,
+            profile,
+            controller_recipe,
+            recipe_sha256,
+            artifacts,
+            state_file,
+            mut physical_image,
+            mut physical_map,
+            events,
+        } = invocation;
         let geometry = required_geometry(profile)?;
         let metadata = required_metadata(profile)?;
         let mut state = load_bound_state(state_file, plan_hash, profile, recipe_sha256)?;
@@ -964,46 +1282,42 @@ mod linux {
                         save_state(state_file, &mut state)?;
                     }
                 }
-                if matches!(
-                    state.service_mode.as_str(),
-                    "normal" | "entry-command-pending"
-                ) {
-                    if state.service_mode == "entry-command-pending" {
-                        let already_entered = if controller_recipe.family == "phison-ufd"
-                            && controller_recipe
-                                .policy
-                                .service_loader_artifact_id
-                                .is_some()
-                        {
-                            let page = scsi_command(
-                                file,
-                                &vendor::phison_version_cdb(),
-                                scsi::SG_DXFER_FROM_DEV,
-                                vendor::PHISON_VERSION_PAGE_LEN,
-                            )?;
-                            vendor::parse_phison_version_page(&page)?.mode == "bootrom"
-                        } else {
-                            let (_, status) = execute_named(
-                                file,
-                                controller_recipe,
-                                artifacts,
-                                "read-status",
-                                CommandContext::default(),
-                                None,
-                            )?;
-                            command_idle(&status)?;
-                            response_value(&status, "service_mode")? == 1
-                        };
-                        if already_entered {
-                            state.service_mode = "entry-reenumerating".into();
-                            save_state(state_file, &mut state)?;
-                        }
+                if state.service_mode == "entry-command-pending" {
+                    let already_entered = if controller_recipe.family == "phison-ufd"
+                        && controller_recipe
+                            .policy
+                            .service_loader_artifact_id
+                            .is_some()
+                    {
+                        let page = scsi_command(
+                            file,
+                            &vendor::phison_version_cdb(),
+                            TransferDirection::FromDevice,
+                            vendor::PHISON_VERSION_PAGE_LEN,
+                        )?;
+                        vendor::parse_phison_version_page(&page)?.mode == "bootrom"
+                    } else {
+                        let (_, status) = execute_named(
+                            file,
+                            controller_recipe,
+                            artifacts,
+                            "read-status",
+                            CommandContext::default(),
+                            None,
+                        )?;
+                        command_idle(&status)?;
+                        response_value(&status, "service_mode")? == 1
+                    };
+                    if already_entered {
+                        state.service_mode = "entry-reenumerating".into();
+                        save_state(state_file, &mut state)?;
                     }
                 }
                 if state.service_mode == "normal" || state.service_mode == "entry-command-pending" {
                     let spec = command(controller_recipe, "enter-service-mode")?;
-                    let payload = command_payload(spec, artifacts, None)?;
-                    if let Err(error) = ambiguous_transport(
+                    let payload =
+                        command_payload(spec, artifacts, CommandContext::default(), None)?;
+                    ambiguous_transport(
                         execute_recipe_command(
                             file,
                             controller_recipe,
@@ -1012,9 +1326,7 @@ mod linux {
                             payload.as_deref(),
                         ),
                         "service-entry command",
-                    ) {
-                        return Err(error);
-                    }
+                    )?;
                     if controller_recipe.policy.enter_reenumerates {
                         state.service_mode = "entry-reenumerating".into();
                         state.phase = "service-entry-command-sent".into();
@@ -1035,7 +1347,7 @@ mod linux {
                         let version = scsi_command(
                             file,
                             &vendor::phison_version_cdb(),
-                            scsi::SG_DXFER_FROM_DEV,
+                            TransferDirection::FromDevice,
                             vendor::PHISON_VERSION_PAGE_LEN,
                         )?;
                         let mode = vendor::parse_phison_version_page(&version)?.mode;
@@ -1054,10 +1366,9 @@ mod linux {
                                 })?,
                                 |cdb, len| {
                                     let mut data = vec![0u8; len];
-                                    let actual = scsi::sg::exec_len(
-                                        file,
+                                    let actual = file.execute(
                                         cdb,
-                                        scsi::SG_DXFER_FROM_DEV,
+                                        TransferDirection::FromDevice,
                                         &mut data,
                                         60_000,
                                     )?;
@@ -1066,10 +1377,9 @@ mod linux {
                                 },
                                 |cdb, payload| {
                                     let mut data = payload.to_vec();
-                                    let actual = scsi::sg::exec_len(
-                                        file,
+                                    let actual = file.execute(
                                         cdb,
-                                        scsi::SG_DXFER_TO_DEV,
+                                        TransferDirection::ToDevice,
                                         &mut data,
                                         60_000,
                                     )?;
@@ -1160,20 +1470,17 @@ mod linux {
                 let mut historical_erased = 0u64;
                 let mut historical_failed = 0u64;
                 let mut per_block = Vec::with_capacity(targets.len());
+                let run = RecipeRunContext {
+                    file,
+                    controller_recipe,
+                    geometry,
+                };
                 for (index, flat) in targets.iter().copied().enumerate() {
                     let was_historical = state.blocks[flat as usize].historical_rbb;
                     let previous_disposition = state.blocks[flat as usize].disposition;
                     let is_system = previous_disposition == BlockDisposition::SystemRebuild;
                     match erase_one(
-                        file,
-                        controller_recipe,
-                        artifacts,
-                        state_file,
-                        &mut state,
-                        geometry,
-                        flat,
-                        action,
-                        events,
+                        &run, state_file, &mut state, flat, action, artifacts, events,
                     ) {
                         Ok(true) => {
                             succeeded += 1;
@@ -1229,7 +1536,7 @@ mod linux {
                         Err(error) => return Err(error),
                     }
                     let block = &state.blocks[flat as usize];
-                    let coordinate = recipe::coordinate(flat, geometry)?;
+                    let coordinate = recipe::coordinate(flat, run.geometry)?;
                     per_block.push(json!([
                         flat,
                         coordinate.channel,
@@ -1241,14 +1548,14 @@ mod linux {
                         block.erase_attempts,
                         block.failure.clone()
                     ]));
-                    if (index + 1) % controller_recipe.policy.block_batch_size as usize == 0 {
+                    if (index + 1) % run.controller_recipe.policy.block_batch_size as usize == 0 {
                         state.phase = format!(
                             "{action}-batch-{}-complete",
-                            index / controller_recipe.policy.block_batch_size as usize
+                            index / run.controller_recipe.policy.block_batch_size as usize
                         );
                         save_state(state_file, &mut state)?;
                     }
-                    if (index + 1) % controller_recipe.policy.block_batch_size as usize == 0
+                    if (index + 1) % run.controller_recipe.policy.block_batch_size as usize == 0
                         || index + 1 == targets.len()
                     {
                         events.progress(
@@ -1365,19 +1672,22 @@ mod linux {
                     .collect::<Vec<_>>();
                 let program_len =
                     command(controller_recipe, "program-page")?.transfer_bytes as usize;
+                let run = RecipeRunContext {
+                    file,
+                    controller_recipe,
+                    geometry,
+                };
                 for (index, flat) in targets.iter().copied().enumerate() {
                     let mut block_ok = true;
                     let mut block_weak = false;
                     for pattern in &controller_recipe.policy.qualification_patterns {
                         match erase_one(
-                            file,
-                            controller_recipe,
-                            artifacts,
+                            &run,
                             state_file,
                             &mut state,
-                            geometry,
                             flat,
                             "qualification-pattern-erase",
+                            artifacts,
                             events,
                         ) {
                             Ok(true) => {}
@@ -1466,6 +1776,7 @@ mod linux {
                                 });
                             if read[..data_bytes] != payload[..data_bytes]
                                 || marker_changed
+                                || response_value(&metrics, "ecc_known")? == 0
                                 || response_value(&metrics, "uncorrectable")? != 0
                             {
                                 block_ok = false;
@@ -1623,16 +1934,19 @@ mod linux {
                         "physical output fds are only valid for salvage-physical".into(),
                     ));
                 }
-                let summary = sweep_physical(
+                let run = RecipeRunContext {
                     file,
                     controller_recipe,
-                    artifacts,
-                    &state,
                     geometry,
+                };
+                let summary = sweep_physical(
+                    &run,
+                    &state,
                     physical_image.as_deref_mut(),
                     physical_map.as_deref_mut(),
-                    events,
                     action,
+                    artifacts,
+                    events,
                 )?;
                 if let Some(output) = physical_image.as_mut() {
                     output
@@ -1659,6 +1973,7 @@ mod linux {
                     .iter()
                     .filter(|block| {
                         block.unreadable_pages > 0
+                            || block.ecc_unknown_pages > 0
                             || block.uncorrectable_pages > 0
                             || (!salvage
                                 && block.disposition.expected_erased()
@@ -1671,6 +1986,7 @@ mod linux {
                     .iter()
                     .filter(|block| {
                         block.unreadable_pages > 0
+                            || block.ecc_unknown_pages > 0
                             || block.uncorrectable_pages > 0
                             || (!salvage
                                 && block.disposition.expected_erased()
@@ -1681,6 +1997,7 @@ mod linux {
                 fields.insert("total_pages".into(), json!(summary.total_pages));
                 fields.insert("readable_pages".into(), json!(summary.readable_pages));
                 fields.insert("unreadable_pages".into(), json!(summary.unreadable_pages));
+                fields.insert("ecc_unknown_pages".into(), json!(summary.ecc_unknown_pages));
                 fields.insert(
                     "uncorrectable_pages".into(),
                     json!(summary.uncorrectable_pages),
@@ -1693,6 +2010,10 @@ mod linux {
                 fields.insert(
                     "target_unreadable_pages".into(),
                     json!(summary.target_unreadable_pages),
+                );
+                fields.insert(
+                    "target_ecc_unknown_pages".into(),
+                    json!(summary.target_ecc_unknown_pages),
                 );
                 fields.insert(
                     "target_uncorrectable_pages".into(),
@@ -1717,6 +2038,10 @@ mod linux {
                 fields.insert(
                     "all_addresses_readable".into(),
                     json!(summary.all_addresses_readable),
+                );
+                fields.insert(
+                    "all_pages_ecc_known".into(),
+                    json!(summary.all_pages_ecc_known),
                 );
                 fields.insert(
                     "all_pages_correctable".into(),
@@ -1760,15 +2085,18 @@ mod linux {
                     } else if salvage {
                         summary
                             .unreadable_pages
+                            .saturating_add(summary.ecc_unknown_pages)
                             .saturating_add(summary.uncorrectable_pages)
                     } else {
                         summary
                             .target_unreadable_pages
+                            .saturating_add(summary.target_ecc_unknown_pages)
                             .saturating_add(summary.target_uncorrectable_pages)
                             .saturating_add(summary.target_non_erased_pages)
                             .max(
                                 summary
                                     .unreadable_pages
+                                    .saturating_add(summary.ecc_unknown_pages)
                                     .saturating_add(summary.uncorrectable_pages),
                             )
                     }),
@@ -1811,8 +2139,12 @@ mod linux {
                     let capacity = user_blocks
                         .checked_mul(block_bytes)
                         .ok_or_else(|| Error::Invalid("logical capacity overflow".into()))?;
-                    let rounded =
-                        capacity / profile.capacity.bin_bytes * profile.capacity.bin_bytes;
+                    let rounded = capacity
+                        .checked_div(profile.capacity.bin_bytes)
+                        .and_then(|quotient| quotient.checked_mul(profile.capacity.bin_bytes))
+                        .ok_or_else(|| {
+                            Error::Invalid("logical capacity rounding overflow".into())
+                        })?;
                     user_blocks = rounded / block_bytes;
                 }
                 if user_blocks == 0 {
@@ -2183,6 +2515,10 @@ mod linux {
                     None,
                 )?;
                 command_idle(&status)?;
+                // macOS quiesces the in-kernel logical-unit driver while
+                // SCSITask exclusivity is held. Release it before the LBA
+                // postcheck; Linux transport close is a no-op.
+                file.close()?;
                 let block_clone = block_file
                     .try_clone()
                     .map_err(|error| Error::io("clone controller block fd", Some(error)))?;
@@ -2222,7 +2558,7 @@ mod linux {
     }
 
     fn controller_status(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         profile: &Profile,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
@@ -2254,7 +2590,7 @@ mod linux {
     }
 
     fn recover_controller(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         profile: &Profile,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
@@ -2355,7 +2691,7 @@ mod linux {
     /// returns an identity. The identification profile supplies the probe
     /// parameters (vendor id hints, INQUIRY marker).
     fn vendor_identity(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         hint: Option<Family>,
         standard_inquiry: &[u8],
         attempted: &mut Vec<Value>,
@@ -2398,7 +2734,7 @@ mod linux {
                     "transfer_bytes": len,
                     "source": "compiled-read-only-probe",
                 }));
-                scsi_command(file, cdb, scsi::SG_DXFER_FROM_DEV, len)
+                scsi_command(file, cdb, TransferDirection::FromDevice, len)
             }),
             // No vendor-owned VID hint: inspect the controller signature in
             // the standard INQUIRY response already obtained above. No
@@ -2446,7 +2782,7 @@ mod linux {
                     )
                 })?;
                 let path = e.path();
-                if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+                if !profile::is_runtime_profile_path(&path) {
                     continue;
                 }
                 let p = profile::load(&path)?;
@@ -2506,6 +2842,42 @@ mod linux {
             .ok_or_else(|| Error::Invalid(format!("USB {field} is absent")))
     }
 
+    #[cfg(target_os = "macos")]
+    fn macos_expected_usb(
+        request: &Value,
+    ) -> Result<Option<nclr::macos_usb_bot::ExpectedUsbDevice>> {
+        if request
+            .get("device")
+            .and_then(|device| device.get("usb"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let physical_path = request
+            .get("device")
+            .and_then(|device| device.get("physical_path"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Invalid("macOS USB physical_path is absent".into()))?;
+        let location = physical_path.strip_prefix("macos-usb:").ok_or_else(|| {
+            Error::Permission(format!(
+                "macOS USB physical path does not carry an IOKit location id: {physical_path}"
+            ))
+        })?;
+        if location.len() != 8 || !location.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Invalid(format!(
+                "macOS USB IOKit location id is invalid: {location}"
+            )));
+        }
+        Ok(Some(nclr::macos_usb_bot::ExpectedUsbDevice {
+            vendor_id: usb_hex_value(request, "vid", false)?,
+            product_id: usb_hex_value(request, "pid", false)?,
+            release_number: usb_hex_value(request, "bcd_device", true)?,
+            location_id: Some(u32::from_str_radix(location, 16).map_err(|_| {
+                Error::Invalid("macOS USB IOKit location id is out of range".into())
+            })?),
+        }))
+    }
+
     /// Select only the artifact set needed for a recipe-owned identity
     /// command. USB and INQUIRY data are not authorization; destructive use
     /// remains disabled until the recipe response is verified.
@@ -2539,7 +2911,7 @@ mod linux {
                         Some(error),
                     )
                 })?;
-                if entry.path().extension().and_then(|value| value.to_str()) != Some("toml") {
+                if !profile::is_runtime_profile_path(&entry.path()) {
                     continue;
                 }
                 let candidate = profile::load(&entry.path())?;
@@ -2613,7 +2985,7 @@ mod linux {
                         Some(error),
                     )
                 })?;
-                if entry.path().extension().and_then(|value| value.to_str()) != Some("toml") {
+                if !profile::is_runtime_profile_path(&entry.path()) {
                     continue;
                 }
                 let candidate = profile::load(&entry.path())?;
@@ -2668,7 +3040,7 @@ mod linux {
     }
 
     fn verify_recipe_hardware_identity(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         profile: &Profile,
@@ -2709,7 +3081,7 @@ mod linux {
     }
 
     fn verify_recipe_bootstrap_identity(
-        file: &std::fs::File,
+        file: &dyn CommandTransport,
         controller_recipe: &ControllerRecipe,
         artifacts: &mut [(String, std::fs::File)],
         profile: &Profile,
@@ -2769,6 +3141,7 @@ mod linux {
     /// Validate an inherited sg fd against the SCSI device object reached by
     /// the block fd. Block and sg nodes have different inodes and device
     /// numbers, so their canonical sysfs `device` targets must match.
+    #[cfg(target_os = "linux")]
     fn validate_sg_fd(block_fd: &std::fs::File, sg_fd: &std::fs::File) -> Result<()> {
         use std::os::fd::AsRawFd;
         let bdev = scsi_device_of_fd(block_fd.as_raw_fd(), libc::S_IFBLK)?;
@@ -2784,6 +3157,7 @@ mod linux {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn scsi_device_of_fd(fd: i32, expected_kind: libc::mode_t) -> Result<std::path::PathBuf> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -2815,7 +3189,38 @@ mod linux {
         })
     }
 
-    pub fn linux_main() {
+    #[cfg(target_os = "macos")]
+    fn macos_disk_path(file: &std::fs::File) -> Result<String> {
+        use std::ffi::CStr;
+        use std::os::fd::AsRawFd;
+        let mut path = [0i8; libc::PATH_MAX as usize];
+        let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) };
+        if result != 0 {
+            return Err(Error::io(
+                "resolve inherited macOS disk descriptor",
+                Some(std::io::Error::last_os_error()),
+            ));
+        }
+        let path = unsafe { CStr::from_ptr(path.as_ptr()) }
+            .to_str()
+            .map_err(|_| Error::Invalid("inherited macOS disk path is not UTF-8".into()))?;
+        let normalized = path
+            .strip_prefix("/dev/rdisk")
+            .or_else(|| path.strip_prefix("/dev/disk"))
+            .ok_or_else(|| {
+                Error::Permission(format!(
+                    "inherited descriptor does not name a whole macOS disk: {path}"
+                ))
+            })?;
+        if normalized.is_empty() || !normalized.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::Permission(format!(
+                "inherited descriptor does not name a whole macOS disk: {path}"
+            )));
+        }
+        Ok(format!("/dev/disk{normalized}"))
+    }
+
+    pub fn platform_main() {
         let invocation = match nclr::backend::parse_backend_args() {
             Ok(i) => i,
             Err(e) => {
@@ -2834,10 +3239,9 @@ mod linux {
         let mut events = BackendEvents::open(invocation.events_fd);
 
         let block_fd = unsafe { std::fs::File::from_raw_fd(FD_DEVICE) };
-        // An sg fd (protocol fd 6) is only present when the core handed one
-        // over and declared it in the request (`extra_fds` role "sg").
-        // Claiming a stray fd that was never handed over would corrupt the
-        // child's descriptor table, so fd 6 is only touched when declared.
+        // Linux receives an associated sg descriptor first. macOS resolves
+        // the inherited whole-disk descriptor to its SCSITask service and
+        // therefore starts auxiliary artifact descriptors directly at fd 6.
         let declarations: Vec<(i32, String)> = request
             .get("extra_fds")
             .and_then(|v| v.as_array())
@@ -2852,11 +3256,16 @@ mod linux {
                     .collect()
             })
             .unwrap_or_default();
-        if declarations.is_empty()
-            || declarations[0] != (nclr::backend::FD_EXTRA_BASE, "sg".into())
+        let transport_prefix = usize::from(cfg!(target_os = "linux"));
+        let transport_layout_valid = if cfg!(target_os = "linux") {
+            declarations.first() == Some(&(nclr::backend::FD_EXTRA_BASE, "sg".to_string()))
+        } else {
+            declarations.iter().all(|(_, role)| role != "sg")
+        };
+        if !transport_layout_valid
             || declarations.iter().enumerate().any(|(index, (fd, role))| {
                 *fd != nclr::backend::FD_EXTRA_BASE + index as i32
-                    || (index > 0
+                    || (index >= transport_prefix
                         && !role.starts_with("artifact:")
                         && !matches!(
                             role.as_str(),
@@ -2886,18 +3295,37 @@ mod linux {
             backend_common::respond_err(
                 "controller",
                 &Error::Invalid(
-                    "sg must be protocol fd 6 followed by contiguous artifact, controller-state or paired physical-output fds"
+                    "platform transport descriptors must be followed by contiguous artifact, controller-state or paired physical-output fds"
                         .into(),
                 ),
             );
         }
-        let sg_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(6) };
-        let sg_file = std::fs::File::from(sg_fd);
+        #[cfg(target_os = "linux")]
+        let command_transport: Box<dyn CommandTransport> = {
+            let sg_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(nclr::backend::FD_EXTRA_BASE) };
+            let sg_file = std::fs::File::from(sg_fd);
+            if let Err(error) = validate_sg_fd(&block_fd, &sg_file) {
+                backend_common::respond_err("controller", &error);
+            }
+            Box::new(sg_file)
+        };
+        #[cfg(target_os = "macos")]
+        let command_transport: Box<dyn CommandTransport> = {
+            let disk_path = match macos_disk_path(&block_fd) {
+                Ok(path) => path,
+                Err(error) => backend_common::respond_err("controller", &error),
+            };
+            let expected_usb = match macos_expected_usb(&request) {
+                Ok(expected) => expected,
+                Err(error) => backend_common::respond_err("controller", &error),
+            };
+            Box::new(MacCommandTransport::new(disk_path, expected_usb))
+        };
         let mut artifact_files = Vec::new();
         let mut state_file = None;
         let mut physical_image = None;
         let mut physical_map = None;
-        for (fd, role) in declarations.iter().skip(1) {
+        for (fd, role) in declarations.iter().skip(transport_prefix) {
             let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(*fd) };
             let file = std::fs::File::from(owned);
             if role == "controller-state" {
@@ -2910,20 +3338,22 @@ mod linux {
                 artifact_files.push((role.clone(), file));
             }
         }
-        if let Err(e) = validate_sg_fd(&block_fd, &sg_file) {
-            backend_common::respond_err("controller", &e);
-        }
-        let command_file = &sg_file;
+        let command_file = command_transport.as_ref();
 
-        // Base identity via SCSI INQUIRY.
-        let (scsi_inquiry, standard_inquiry) = match scsi_identity(command_file) {
-            Ok(v) => v,
-            Err(e) => {
-                backend_common::respond_err("controller", &e);
-            }
+        // Normal mode requires standard INQUIRY. A controller can stop
+        // answering it after an authenticated service-mode transition, so
+        // preserve the failure until the durable recipe state is checked.
+        let (scsi_inquiry, standard_inquiry, scsi_inquiry_error) = match scsi_identity(command_file)
+        {
+            Ok((inquiry, bytes)) => (Some(inquiry), bytes, None),
+            Err(error) => (None, Vec::new(), Some(error.to_string())),
         };
 
         let family_hint = usb_family_hint(&request);
+        // Both destructive profiles and read-only probe profiles are loaded
+        // only from package-managed locations. User-controlled directories
+        // cannot cause a vendor CDB to be sent.
+        let dirs = profile::trusted_search_dirs();
         let mut media_commands_sent = vec![json!({
             "transport": "scsi",
             "cdb_hex": hex::encode(scsi::cdb_inquiry(false, 0, 96)),
@@ -2931,14 +3361,74 @@ mod linux {
             "transfer_bytes": 96,
             "source": "standard-inquiry",
         })];
-        let (detected, probe_error) = match vendor_identity(
-            command_file,
-            family_hint,
-            &standard_inquiry,
-            &mut media_commands_sent,
-        ) {
-            Ok(v) => (v, None),
-            Err(e) => (None, Some(e.to_string())),
+        let observed_probe = if request.get("device").is_some() {
+            scsi_inquiry
+                .as_ref()
+                .map(|scsi_inquiry| {
+                    (|| -> Result<ObservedBootstrap<'_>> {
+                        Ok(ObservedBootstrap {
+                            usb_vid: usb_hex_value(&request, "vid", false)?,
+                            usb_pid: usb_hex_value(&request, "pid", false)?,
+                            usb_bcd_device: usb_hex_value(&request, "bcd_device", true)?,
+                            usb_manufacturer: usb_string_value(&request, "manufacturer")?,
+                            usb_product: usb_string_value(&request, "product")?,
+                            usb_serial: usb_string_value(&request, "serial")?,
+                            scsi_vendor: &scsi_inquiry.vendor_id,
+                            scsi_product: &scsi_inquiry.product_id,
+                            scsi_revision: &scsi_inquiry.product_rev,
+                        })
+                    })()
+                })
+                .transpose()
+                .unwrap_or_else(|error| backend_common::respond_err("controller", &error))
+        } else {
+            None
+        };
+        let read_only_probe = match observed_probe.as_ref() {
+            Some(observed) => match controller_probe::matching(&dirs, observed, family_hint) {
+                Ok(profile) => profile,
+                Err(error) => backend_common::respond_err("controller", &error),
+            },
+            None => None,
+        };
+        let probe_profile_id = read_only_probe.as_ref().map(|profile| profile.id.clone());
+        let probe_profile_sha256 = read_only_probe
+            .as_ref()
+            .map(|profile| profile.source_sha256.clone());
+        let (detected, probe_error) = if let Some(probe) = read_only_probe.as_ref() {
+            match controller_probe::execute_with(probe, |name, cdb, len, timeout_ms| {
+                media_commands_sent.push(json!({
+                    "transport": "scsi",
+                    "cdb_hex": hex::encode(cdb),
+                    "direction": "from-device",
+                    "transfer_bytes": len,
+                    "source": "package-read-only-probe-profile",
+                    "probe_profile": probe.id,
+                    "command": name,
+                }));
+                scsi_command_timeout(
+                    command_file,
+                    cdb,
+                    TransferDirection::FromDevice,
+                    len,
+                    timeout_ms,
+                )
+            }) {
+                Ok(identity) => (Some(identity), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else if scsi_inquiry.is_some() {
+            match vendor_identity(
+                command_file,
+                family_hint,
+                &standard_inquiry,
+                &mut media_commands_sent,
+            ) {
+                Ok(identity) => (identity, None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, scsi_inquiry_error.clone())
         };
         let mut controller_id = detected
             .as_ref()
@@ -2953,10 +3443,6 @@ mod linux {
             .and_then(|i| i.nand_id.clone())
             .unwrap_or_else(|| "unidentified".into());
 
-        // Real destructive controller profiles are loaded only from package-
-        // managed locations. User-controlled NCLR_PROFILE_DIR content cannot
-        // self-assert production trust.
-        let dirs = profile::trusted_search_dirs();
         let matched_by_identity = match detected.as_ref() {
             Some(identity) => match matching_production_profile(
                 &dirs,
@@ -2969,10 +3455,17 @@ mod linux {
             },
             None => None,
         };
-        let matched_by_bootstrap = match matching_bootstrap_profile(&dirs, &request, &scsi_inquiry)
-        {
-            Ok(profile) => profile,
-            Err(e) => backend_common::respond_err("controller", &e),
+        let matched_by_bootstrap = if request.get("device").is_some() {
+            if let Some(scsi_inquiry) = scsi_inquiry.as_ref() {
+                match matching_bootstrap_profile(&dirs, &request, scsi_inquiry) {
+                    Ok(profile) => profile,
+                    Err(e) => backend_common::respond_err("controller", &e),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
         };
         if matched_by_identity
             .as_ref()
@@ -3099,12 +3592,11 @@ mod linux {
             }
         }
 
-        let recipe_spec = matched.as_ref().and_then(|profile| {
+        let recipe_spec = matched.as_ref().zip(
             runtime_artifacts
                 .iter()
-                .find(|artifact| artifact.kind == nclr::artifact::ArtifactKind::ProtocolRecipe)
-                .map(|artifact| (profile, artifact))
-        });
+                .find(|artifact| artifact.kind == nclr::artifact::ArtifactKind::ProtocolRecipe),
+        );
         // Profile validation already requires exactly one runtime recipe for
         // every real production tuple. Keep the execution boundary explicit
         // here as well: a future profile-format regression must not turn a
@@ -3173,9 +3665,21 @@ mod linux {
             }
             _ => None,
         };
-        let service_state_bound = recipe_state
+        let service_state_bound = match recipe_state
             .as_ref()
-            .is_some_and(|state| state.service_mode != "normal");
+            .map(ControllerRunState::service_mode_transition_active)
+            .transpose()
+        {
+            Ok(value) => value.unwrap_or(false),
+            Err(error) => backend_common::respond_err("controller", &error),
+        };
+        if let Err(error) = validate_inquiry_continuation(
+            scsi_inquiry.is_some(),
+            service_state_bound,
+            scsi_inquiry_error.as_deref(),
+        ) {
+            backend_common::respond_err("controller", &error);
+        }
         let mut runtime_identity_verified = service_state_bound;
         if let (Some(profile), Some(controller_recipe)) = (matched.as_ref(), loaded_recipe.as_ref())
         {
@@ -3260,9 +3764,16 @@ mod linux {
                     );
                 }
             } else {
+                controller_id = controller_recipe.controller_id.clone();
+                firmware = controller_recipe.firmware.clone();
                 nand_id = controller_recipe.nand_id.clone();
             }
         }
+        let reported_service_mode = recipe_state
+            .as_ref()
+            .map(|state| state.service_mode.as_str())
+            .or_else(|| detected.as_ref().map(|identity| identity.mode.as_str()))
+            .unwrap_or(ServiceModeState::Normal.as_str());
         // The engine is executable only when the profile, recipe, parsed
         // controller-owned identity and durable state descriptor all exist.
         let executable_profile = matched.is_some()
@@ -3296,6 +3807,15 @@ mod linux {
             vec![
                 "authenticated runtime artifacts",
                 "recipe-owned identity response",
+            ]
+        } else if detected.is_some() {
+            vec![
+                "exact NAND geometry and ECC/randomizer layout",
+                "service transition and runtime loader artifacts",
+                "physical erase/status and page/OOB command contracts",
+                "BBT, FTL, spare and atomic commit metadata layouts",
+                "complete pre-HIL runtime recipe and profile",
+                "independent HIL qualification and power-cut evidence",
             ]
         } else {
             vec![
@@ -3368,15 +3888,18 @@ mod linux {
                         "family_hint": family_hint.map(Family::as_str),
                         "family_support": support,
                         "probe_error": probe_error,
+                        "read_only_probe_profile": probe_profile_id,
+                        "read_only_probe_profile_sha256": probe_profile_sha256,
                         "recipe_artifact_error": recipe_artifact_error,
                         "scsi": {
-                            "vendor": scsi_inquiry.vendor_id,
-                            "product": scsi_inquiry.product_id,
-                            "revision": scsi_inquiry.product_rev,
+                            "vendor": scsi_inquiry.as_ref().map(|inquiry| inquiry.vendor_id.as_str()),
+                            "product": scsi_inquiry.as_ref().map(|inquiry| inquiry.product_id.as_str()),
+                            "revision": scsi_inquiry.as_ref().map(|inquiry| inquiry.product_rev.as_str()),
+                            "inquiry_error": scsi_inquiry_error,
                         },
                         "controller_research": {
                             "schema": 1,
-                            "selection": if bootstrap_selected { "exact-bootstrap" } else if detected.is_some() { "signed-built-in-identity" } else if family_hint.is_some() { "vendor-id-candidate-only" } else { "undetermined" },
+                            "selection": if read_only_probe.is_some() && detected.is_some() { "package-read-only-probe" } else if bootstrap_selected { "exact-bootstrap" } else if detected.is_some() { "signed-built-in-identity" } else if family_hint.is_some() { "vendor-id-candidate-only" } else { "undetermined" },
                             "recipe_family_candidates": recipe_family_candidates,
                             "exact_bootstrap_observed": {
                                 "family": family_hint.map(Family::recipe_str),
@@ -3386,11 +3909,11 @@ mod linux {
                                 "usb_manufacturer": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("manufacturer")).cloned().unwrap_or(Value::Null),
                                 "usb_product": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("product")).cloned().unwrap_or(Value::Null),
                                 "usb_serial": request.get("device").and_then(|device| device.get("usb")).and_then(|usb| usb.get("serial")).cloned().unwrap_or(Value::Null),
-                                "scsi_vendor": scsi_inquiry.vendor_id,
-                                "scsi_product": scsi_inquiry.product_id,
-                                "scsi_revision": scsi_inquiry.product_rev,
+                                "scsi_vendor": scsi_inquiry.as_ref().map(|inquiry| inquiry.vendor_id.as_str()),
+                                "scsi_product": scsi_inquiry.as_ref().map(|inquiry| inquiry.product_id.as_str()),
+                                "scsi_revision": scsi_inquiry.as_ref().map(|inquiry| inquiry.product_rev.as_str()),
                             },
-                            "identity_source": "scsi-sg-io",
+                            "identity_source": if read_only_probe.is_some() { "package-read-only-probe+scsi-sg-io" } else { "scsi-sg-io" },
                             "media_commands_sent": media_commands_sent,
                             "unknown_vendor_commands_sent": false,
                             "missing_for_production": missing_for_production,
@@ -3399,7 +3922,7 @@ mod linux {
                             "controller_id": controller_id,
                             "firmware": firmware,
                             "nand_id": nand_id,
-                            "service_mode": detected.as_ref().map(|i| i.mode.as_str()).unwrap_or(ServiceModeState::Normal.as_str()),
+                            "service_mode": reported_service_mode,
                         }
                     });
                     if advertised_profile {
@@ -3495,24 +4018,24 @@ mod linux {
                     let controller_state = state_file.as_mut().ok_or_else(|| {
                         Error::Invalid("executable controller state fd disappeared".into())
                     })?;
-                    execute_action(
+                    execute_action(ActionInvocation {
                         action,
                         plan_hash,
-                        request
+                        reenumeration_nonce: request
                             .get("params")
                             .and_then(|value| value.get("nonce"))
                             .and_then(|value| value.as_str()),
-                        command_file,
-                        &block_fd,
+                        file: command_file,
+                        block_file: &block_fd,
                         profile,
                         controller_recipe,
-                        recipe_digest,
-                        &mut artifact_files,
-                        controller_state,
-                        physical_image.as_mut(),
-                        physical_map.as_mut(),
-                        &mut events,
-                    )
+                        recipe_sha256: recipe_digest,
+                        artifacts: &mut artifact_files,
+                        state_file: controller_state,
+                        physical_image: physical_image.as_mut(),
+                        physical_map: physical_map.as_mut(),
+                        events: &mut events,
+                    })
                 }
                 "status" if executable_profile => {
                     let profile = matched.as_ref().ok_or_else(|| {
@@ -3538,7 +4061,7 @@ mod linux {
                     "backend": "controller",
                     "version": VERSION,
                     "state": "ready",
-                    "service_mode": detected.as_ref().map(|i| i.mode.as_str()).unwrap_or(ServiceModeState::Normal.as_str()),
+                    "service_mode": reported_service_mode,
                 })),
                 "recover" => {
                     if !executable_profile {
@@ -3567,6 +4090,15 @@ mod linux {
             }
         })();
 
+        let result = match (result, command_transport.close()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(operation), Err(cleanup)) => Err(Error::Backend(format!(
+                "controller operation failed: {operation}; transport cleanup also failed: {cleanup}"
+            ))),
+        };
+
         match result {
             Ok(v) => {
                 if let Err(e) = nclr::backend::write_response(&v) {
@@ -3580,6 +4112,20 @@ mod linux {
                 }
                 backend_common::respond_err("controller", &e);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::validate_inquiry_continuation;
+
+        #[test]
+        fn inquiry_failure_requires_recipe_bound_service_state() {
+            assert!(validate_inquiry_continuation(true, false, None).is_ok());
+            assert!(validate_inquiry_continuation(false, true, Some("not ready")).is_ok());
+            let error = validate_inquiry_continuation(false, false, Some("not ready"))
+                .expect_err("normal mode must retain the standard INQUIRY requirement");
+            assert!(error.to_string().contains("not ready"));
         }
     }
 }

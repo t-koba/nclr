@@ -54,12 +54,15 @@ install -m 0755 target/release/nclr-sim  "$DEST/nclr/libexec/nclr/nclr-sim"
 install -m 0644 man/nclr.1               "$DEST/nclr/share/man/man1/nclr.1"
 install -m 0644 man/nclr-backend.7       "$DEST/nclr/share/man/man7/nclr-backend.7"
 
-# Linux-only raw SCSI/MMC/controller backends. Cargo also builds small
-# unsupported-platform stubs on macOS; those are not package payloads.
-if [ "$(uname -s)" = "Linux" ]; then
+# USB controller execution uses SG_IO on Linux and SCSITask on macOS.
+if [ "$(uname -s)" = "Linux" ] || [ "$(uname -s)" = "Darwin" ]; then
     mkdir -p "$DEST/nclr-backends-usb/libexec/nclr"
-    install -m 0755 target/release/nclr-scsi       "$DEST/nclr-backends-usb/libexec/nclr/nclr-scsi"
     install -m 0755 target/release/nclr-controller "$DEST/nclr-backends-usb/libexec/nclr/nclr-controller"
+fi
+
+# Raw standards-based SCSI/MMC backends remain Linux-only.
+if [ "$(uname -s)" = "Linux" ]; then
+    install -m 0755 target/release/nclr-scsi       "$DEST/nclr-backends-usb/libexec/nclr/nclr-scsi"
 
     mkdir -p "$DEST/nclr-backends-sd/libexec/nclr"
     install -m 0755 target/release/nclr-sd-native "$DEST/nclr-backends-sd/libexec/nclr/nclr-sd-native"

@@ -418,12 +418,14 @@ pub struct PhysicalScopeEvidence {
     pub physical_pages: u64,
     pub physical_readable_pages: u64,
     pub physical_unreadable_pages: u64,
+    pub physical_ecc_unknown_pages: u64,
     pub physical_uncorrectable_pages: u64,
     pub ordered_sweep_sha256: Option<String>,
     /// Pages in the declared erased scope and their read/blank verdicts.
     pub target_pages: u64,
     pub target_readable_pages: u64,
     pub target_unreadable_pages: u64,
+    pub target_ecc_unknown_pages: u64,
     pub target_uncorrectable_pages: u64,
     pub target_non_erased_pages: u64,
     /// Pages outside the erased scope (FBB/preserved/unknown) that could not
@@ -526,7 +528,10 @@ pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
         && e.target_unreadable_pages
             .checked_add(e.excluded_unreadable_pages)
             == Some(e.physical_unreadable_pages)
+        && e.physical_ecc_unknown_pages <= e.physical_readable_pages
         && e.physical_uncorrectable_pages <= e.physical_readable_pages
+        && e.target_ecc_unknown_pages <= e.target_readable_pages
+        && e.target_ecc_unknown_pages <= e.physical_ecc_unknown_pages
         && e.target_uncorrectable_pages <= e.target_readable_pages
         && e.target_uncorrectable_pages <= e.physical_uncorrectable_pages
         && e.target_non_erased_pages <= e.target_readable_pages;
@@ -567,6 +572,7 @@ pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
         .is_some_and(|blocks| blocks == e.blocks_enumerated);
     let all_target_pages_verified = e.target_pages == e.target_readable_pages
         && e.target_unreadable_pages == 0
+        && e.target_ecc_unknown_pages == 0
         && e.target_uncorrectable_pages == 0
         && e.target_non_erased_pages == 0;
     let no_erase_failures = e.old_rbb_erase_failed == 0 && e.blocks_erase_failed == 0;
@@ -584,6 +590,7 @@ pub fn compute_physical_c4(e: &PhysicalScopeEvidence) -> GradeResult {
     } else if e.old_rbb_erase_failed > 0
         || e.blocks_erase_failed > 0
         || e.target_unreadable_pages > 0
+        || e.target_ecc_unknown_pages > 0
         || e.target_uncorrectable_pages > 0
         || e.target_non_erased_pages > 0
     {
@@ -920,11 +927,13 @@ mod tests {
             physical_pages: 15_616,
             physical_readable_pages: 15_616,
             physical_unreadable_pages: 0,
+            physical_ecc_unknown_pages: 0,
             physical_uncorrectable_pages: 0,
             ordered_sweep_sha256: Some("0".repeat(64)),
             target_pages: 15_104,
             target_readable_pages: 15_104,
             target_unreadable_pages: 0,
+            target_ecc_unknown_pages: 0,
             target_uncorrectable_pages: 0,
             target_non_erased_pages: 0,
             excluded_unreadable_pages: 0,
@@ -1072,6 +1081,17 @@ mod tests {
         let g = compute_physical_c4(&inconsistent);
         assert_eq!(g.grade, CGrade::C0);
         assert!(!g.qualified);
+    }
+
+    #[test]
+    fn c4_rejects_raw_pages_without_an_ecc_verdict() {
+        let mut e = c4_ok_evidence();
+        e.physical_ecc_unknown_pages = 1;
+        e.target_ecc_unknown_pages = 1;
+        let g = compute_physical_c4(&e);
+        assert_eq!(g.grade, CGrade::C4);
+        assert!(!g.qualified);
+        assert_eq!(g.residual, Residual::EraseFailed);
     }
 
     #[test]

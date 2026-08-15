@@ -8,19 +8,41 @@ nclr-lab \- research tooling for nclr vendor protocols and profiles
 .br
 .B nclr-lab artifact verify MANIFEST (\-\-file FILE|\-\-store DIR)
 .br
+.B nclr-lab controller [\-\-family NAME]
+.br
 .B nclr-lab decode CDB [\-\-response HEX]
 .br
 .B nclr-lab diff TRACE_A TRACE_B [\-\-summary]
 .br
 .B nclr-lab infer HEX [\-\-command]
 .br
+.B nclr-lab phison-ps2303 loader-check FILE
+.br
+.B nclr-lab phison-ps2303 geometry \-\-nand\-id HEX \-\-page\-bytes N \-\-oob\-bytes N \-\-pages\-per\-block N \-\-blocks\-per\-lun N \-\-luns N \-\-column\-address\-cycles N \-\-row\-address\-cycles N \-\-bits\-per\-cell N
+.br
+.B nclr-lab phison-ps2303 inspect DEVICE \-\-confirm\-research\-device
+.br
+.B nclr-lab phison-ps2303 enter-bootrom DEVICE \-\-firmware VERSION \-\-confirm\-research\-device
+.br
+.B nclr-lab phison-ps2303 load DEVICE FILE \-\-firmware VERSION \-\-confirm\-research\-device
+.br
+.B nclr-lab phison-ps2303 probe-loader DEVICE [\-\-channel N \-\-chip N \-\-read\-onfi] \-\-confirm\-research\-device
+.br
+.B nclr-lab probe check FILE
+.br
+.B nclr-lab probe new INFO_JSON \-\-family NAME \-\-controller ID \-\-firmware VERSION \-\-nand\-id HEX [\-o FILE]
+.br
+.B nclr-lab probe run PROBE DEVICE [\-\-execute \-\-confirm\-research\-device]
+.br
 .B nclr-lab profile \-\-new [\-\-family NAME] [\-\-controller ID] [\-o FILE]
 .br
-.B nclr-lab profile \-\-check FILE
+.B nclr-lab profile \-\-check [\-\-pre\-hil \-\-artifact\-dir DIR ...] FILE
 .br
 .B nclr-lab recipe \-\-profile PROFILE \-\-file RECIPE
 .br
 .B nclr-lab replay TRACE [\-\-execute] [\-\-confirm-sacrificial]
+.br
+.B nclr-lab tool PATH [\-\-family NAME] [\-\-include\-unmatched]
 .br
 .B nclr-lab cap \-\-bus N [\-o FILE]
 .br
@@ -43,6 +65,11 @@ source and terms. Non-redistributable downloads require
 \-\-accept-source-terms. Objects are stored as DIR/id/sha256 and are never
 executed by this command.
 .TP
+.B controller [\-\-family NAME]
+Show all registered controller families, fixed read-only probe coverage,
+recipe-engine coverage and whether a production tuple is bundled. Catalog
+coverage is not a C3/C4 capability claim.
+.TP
 .B decode [\-\-lenient] CDB [RESPONSE_HEX]
 Decode a hex SCSI CDB (e.g. "48 03 00 00 00 02") into a structured
 description; optionally attach a hex response. \-\-lenient tolerates
@@ -55,11 +82,74 @@ Compare two NDJSON traces (opcode/status/response differences).
 Heuristics over a byte sequence: role, length, endianness candidates,
 checksum candidates (sum/xor/crc16), tail sequence.
 .TP
+.B phison-ps2303 loader-check FILE
+Authenticate the exact locally reproduced PS2303 volatile loader by reviewed
+size, SHA-256 and strict BtPramCd structure. No hardware command is sent.
+.TP
+.B phison-ps2303 geometry [OPTIONS]
+Encode and validate a 40-byte non-ONFI geometry payload. The geometry is bound
+to an exact six-byte NAND id, includes an ONFI-polynomial CRC, and is rejected
+when its raw page or address space exceeds the reviewed loader bounds. The
+command prints the exact CDB and payload without accessing hardware.
+.TP
+.B phison-ps2303 inspect DEVICE \-\-confirm\-research\-device
+On macOS, obtain exclusive SCSITask access and read the signed PS2251 version
+page. Only the reviewed PS2303 controller id is accepted. The target must be
+an unmounted, removable, non-system USB whole disk.
+.TP
+.B phison-ps2303 enter-bootrom DEVICE [OPTIONS]
+After exact PS2303 controller and firmware validation, send the reviewed
+volatile BootROM transition command. Re-enumeration is expected. This changes
+controller state but does not write NAND or authorize purge.
+.TP
+.B phison-ps2303 load DEVICE FILE [OPTIONS]
+In exact PS2303 BootROM mode, transfer and run only the loader accepted by
+.BR "phison-ps2303 loader-check" .
+The live controller id and exact firmware must match before transfer. The
+loader is volatile, re-enumeration is expected, and no NAND erase/program
+command is exposed by this research command.
+.TP
+.B phison-ps2303 probe-loader DEVICE [OPTIONS]
+Authenticate the running loader signature/schema, verify its operation
+sequence, read the selected channel/chip six-byte NAND id and, when
+.B \-\-read\-onfi
+is supplied, require a CRC-valid ONFI parameter copy. Raw reads from this
+loader deliberately have no trusted ECC verdict, so this command cannot
+qualify C4 or authorize purge.
+.TP
+.B probe check FILE
+Validate one exact read-only probe profile. It must bind a complete USB
+descriptor plus SCSI INQUIRY tuple to exactly two fixed device-to-host
+commands, signed response envelopes, exact controller identity and exact
+NAND identity. It has no trust or destructive capability.
+.TP
+.B probe new INFO_JSON [OPTIONS]
+Generate an incomplete probe profile from the exact bootstrap collected by
+.BR "nclr info -j" .
+The command, response, trace digest and source placeholders must be replaced
+from a captured vendor-tool read before
+.B probe check
+will accept it.
+.TP
+.B probe run FILE DEVICE [\-\-execute \-\-confirm\-research\-device]
+Match the profile against the currently attached whole disk and print the
+two exact reads without sending them. On macOS, explicit execution requires
+both flags, a removable non-system target with no holders, an unmounted
+complete disk and exclusive SCSITask access. Only 6, 10, 12 and 16-byte CDBs
+are supported by Apple's interface. Both full responses and identity payloads
+must match; the command never enables purge.
+.TP
 .B profile \-\-new
 Generate a controller profile template (research trust by default).
 .TP
-.B profile \-\-check FILE
-Validate a profile against the schema.
+.B profile \-\-check [\-\-pre\-hil \-\-artifact\-dir DIR ...] FILE
+Validate a profile against the schema. With
+.B \-\-pre\-hil
+the profile must satisfy every production requirement except independent HIL
+qualification. Every non-qualification artifact is then opened from the
+content-addressed stores, checked by size/SHA-256/format, and the exact runtime
+recipe is parsed and semantically validated. Passing this check does not
+change profile trust or authorize execution.
 .TP
 .B recipe \-\-profile PROFILE \-\-file RECIPE
 Authenticate the recipe using the profile-pinned size, SHA-256 and format,
@@ -83,6 +173,20 @@ Bulk-Only Transport CBW/data/CSW sequences. Output is normalized NDJSON.
 Payload bytes are represented by SHA-256 only unless both
 \-\-include-payload and \-\-confirm-sensitive-payload are supplied. The
 offline conversion is supported on macOS.
+.TP
+.B tool PATH [\-\-family NAME] [\-\-include\-unmatched]
+Recursively hash and statically inspect a downloaded vendor executable,
+extracted archive tree, loader or source file without executing it. Public
+protocol constants, dynamic SanDisk U3 x86 constructor patterns, family
+inventory strings and cross-family NAND/BBT/ECC/loader research markers are
+reported with offsets and provenance. Schema 2 also parses active SMI FFW
+assignments into exact controller/six-byte-NAND bindings, resolves referenced
+artifacts by hash without choosing ambiguous duplicates, distinguishes
+duplicate paths with byte-identical content, extracts Alcor
+six-byte FIDs, and preserves CTL-generation module parameters without
+inventing their semantics. Conflicting SMI keys and missing or ambiguous
+artifacts remain explicit. Every result is a candidate only and is never
+production-eligible.
 .SH SAFETY
 Write-command brute forcing is prohibited. Read-only and state-changing
 commands are classified separately in the output. Research profiles are

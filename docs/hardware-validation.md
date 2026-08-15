@@ -1,7 +1,6 @@
 # nclr 実機検証ガイド (Linux)
 
-このガイドは、macOS では検証できない **Linux 実機パス** の確認手順です。
-Linux 実機パスの確認手順として使います。
+このガイドは、macOS では検証できない Linux 実機パスの確認手順である。
 すべての実機操作は対象デバイスを慎重に確認して行ってください。
 
 ## 前提
@@ -97,19 +96,17 @@ NCLR_BACKEND_DIR=target/release ./target/release/nclr plan -l controller /dev/sd
 ```
 公開一次資料と実装済み範囲は
 [`controller-vendor-support.md`](controller-vendor-support.md) を参照してください。
-実ベンダーの C3 / C4 認定には:
-1. 対象コントローラー (Phison/SMI/Alcor 等) のサービスモード資料
-2. 正規 tool の pcapng を `nclr-lab trace` で USB BOT NDJSON へ変換し、
-   成功 / 失敗 / 設定差を比較
-3. service loader / tool / trace / report を `nclr-lab artifact` で
-   exact SHA-256 と hardware tuple に固定
-4. `nclr-lab profile --new` の雛形へ geometry、FBB、ECC、metadata commit
-   layout と clean-room/runtime provenance を記録し、`nclr-lab recipe` で
-   exact runtime recipe の digest、command、response、layout を検査
-5. HIL fixture (犠牲媒体) での電源断・USB reset 復旧試験
-6. `tests/e2e.rs` の sim 認定 fixture に相当する独立物理確認
-7. レビュー済み profile を package-managed profile directory へ配置し、
-   package 側で `trust = production` と digest を固定
+実ベンダーの C3 / C4 認定は、HIL 前の完成工程と HIL 認定を分ける。
+
+1. `nclr info -j` の exact USB / SCSI bootstrap を保存し、正規 tool を `nclr-lab tool` で実行せず静的解析する。
+2. 正規 tool の pcapng を `nclr-lab trace` で USB BOT NDJSON へ変換し、成功 / 失敗 / 設定差を比較する。
+3. exact `read-controller-id` / `read-nand-id` を `nclr-lab probe check` で固定する。macOS では `probe run` の dry-run と、unmount 済み犠牲媒体への明示的な read-only 実行ができる。
+4. service loader / tool / trace を `nclr-lab artifact` で exact SHA-256 と hardware tuple に固定する。
+5. geometry、FBB、ECC、metadata commit layout、clean-room / runtime provenance、全 D1–D4 role を runtime recipe と profile に記録する。`nclr-lab profile --check --pre-hil --artifact-dir STORE PROFILE` が qualification report 以外の全 byte 列と意味契約を検査する。
+6. ここから HIL fixture の工程とする。犠牲媒体で正常、failure、電源断、USB reset 復旧、独立全物理読み出しを確認する。
+7. qualification artifact を追加し、レビュー済み profile を package-managed profile directory へ配置して `trust = "production"` と digest を固定する。
+
+手順 1–5 は HIL を待たずに完了させる。HIL は未知 command や geometry を推測する工程として使わない。
 
 `NCLR_PROFILE_DIR` 内の user profile が `trust = production` を自己申告しても、
 実媒体の破壊的 controller operation には使用されません。

@@ -291,23 +291,40 @@ pub fn support(family: Family) -> FamilySupport {
             recipe_identify: true,
             nand_identify: true,
             recipe_nand_identify: true,
-            service_entry_documented: false,
-            volatile_loader_documented: false,
+            service_entry_documented: true,
+            volatile_loader_documented: true,
             recipe_engine: true,
             physical_erase_recipe_role: true,
             bbt_rebuild_recipe_role: true,
             ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
-            reason: "configuration/flash-ID identification and the bounded physical/BBT/FTL recipe engine are implemented; no exact destructive AU698x tuple recipe is bundled",
+            reason: "configuration/flash-ID identification, exact AU698x factory-module upload, raw page/erase/status constructors and the bounded physical/BBT/FTL recipe engine are implemented; no exact destructive controller/NAND tuple recipe is bundled",
         },
         Family::SiliconMotionUfd => FamilySupport {
             family,
             controller_lines: &[
                 "SM32X/SM3255/SM3257",
-                "SM3265/SM3267/SM3271/SM3281",
+                "SM3259/SM3265/SM3267/SM3271/SM3280/SM3281",
                 "SM2320/SM2321/SM2322 native USB 3.2",
             ],
             fixed_probe_lines: &["SM32X 0xf0/0x04 identity-page-compatible controllers"],
+            identify: true,
+            recipe_identify: true,
+            nand_identify: false,
+            recipe_nand_identify: true,
+            service_entry_documented: true,
+            volatile_loader_documented: true,
+            recipe_engine: true,
+            physical_erase_recipe_role: true,
+            bbt_rebuild_recipe_role: true,
+            ftl_rebuild_recipe_role: true,
+            production_tuple_bundled: false,
+            reason: "the bounded SMI32X identity page, reviewed UFDIF raw/metadata constructors, seven exact 32-bit internal-IC mappings, service-artifact upload path and physical/BBT/FTL recipe engine are implemented; a destructive controller/firmware/NAND tuple and metadata format remain separately required",
+        },
+        Family::SandiskCruzer => FamilySupport {
+            family,
+            controller_lines: &["Cruzer proprietary", "82-00263-1"],
+            fixed_probe_lines: &["SanDisk U3 0xff/0x03/0x01 chip-info-compatible controllers"],
             identify: true,
             recipe_identify: true,
             nand_identify: false,
@@ -319,24 +336,7 @@ pub fn support(family: Family) -> FamilySupport {
             bbt_rebuild_recipe_role: true,
             ftl_rebuild_recipe_role: true,
             production_tuple_bundled: false,
-            reason: "the bounded SMI32X identity-page read and physical/BBT/FTL recipe engine are implemented; NAND identity and destructive commands require an exact trace-derived recipe and HIL qualification",
-        },
-        Family::SandiskCruzer => FamilySupport {
-            family,
-            controller_lines: &["Cruzer proprietary", "82-00263-1"],
-            fixed_probe_lines: &[],
-            identify: false,
-            recipe_identify: true,
-            nand_identify: false,
-            recipe_nand_identify: true,
-            service_entry_documented: false,
-            volatile_loader_documented: false,
-            recipe_engine: true,
-            physical_erase_recipe_role: true,
-            bbt_rebuild_recipe_role: true,
-            ftl_rebuild_recipe_role: true,
-            production_tuple_bundled: false,
-            reason: "SanDisk Cruzer proprietary controllers use exact USB/SCSI bootstrap selection followed by recipe-owned controller and NAND identity commands; destructive commands require an exact trace-derived recipe and HIL qualification",
+            reason: "U3-compatible Cruzer controllers have a bounded read-only chip-manufacturer/revision probe; 82-00263-1 and non-U3 controllers still require exact USB/SCSI bootstrap selection followed by recipe-owned controller and NAND identity commands, and destructive commands require an exact trace-derived recipe and HIL qualification",
         },
         Family::UsbestUfd => FamilySupport {
             family,
@@ -594,11 +594,11 @@ pub fn identify_with(
             let page = read(&smi_identity_cdb(), SMI_IDENTITY_LEN)?;
             Ok(Some(parse_smi_identity_page(&page)?))
         }
-        // No public fixed vendor CDB is known for the proprietary SanDisk
-        // Cruzer family. Identification is supplied by an authenticated
-        // exact-tuple recipe after a read-only USB/SCSI bootstrap match.
-        Family::SandiskCruzer
-        | Family::ChipsbankUfd
+        Family::SandiskCruzer => {
+            let info = read(&sandisk_u3_chip_info_cdb(), SANDISK_U3_CHIP_INFO_LEN)?;
+            Ok(Some(parse_sandisk_u3_chip_info(&info)?))
+        }
+        Family::ChipsbankUfd
         | Family::InnostorUfd
         | Family::FirstchipUfd
         | Family::SolidStateSystemUfd
@@ -633,6 +633,101 @@ pub fn identify_with(
             Ok(Some(parse_inquiry_marker(&inquiry, marker)?))
         }
     }
+}
+
+// SanDisk U3 ---------------------------------------------------------------
+
+pub const SANDISK_U3_CHIP_INFO_LEN: usize = 24;
+
+/// Read-only chip-information command from the original u3-tool source.
+/// The response is an eight-byte revision followed by a sixteen-byte chip
+/// manufacturer. It identifies only the U3 protocol implementation; it does
+/// not reveal a PCB marking, NAND geometry or destructive capability.
+pub fn sandisk_u3_chip_info_cdb() -> [u8; 12] {
+    [0xFF, 0x03, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn parse_sandisk_u3_text(field: &[u8], name: &str) -> Result<String> {
+    let terminator = field.iter().position(|byte| *byte == 0);
+    if let Some(index) = terminator {
+        if field[index + 1..]
+            .iter()
+            .any(|byte| !matches!(*byte, 0 | b' '))
+        {
+            return Err(Error::Invalid(format!(
+                "SanDisk U3 {name} has non-padding bytes after its terminator"
+            )));
+        }
+    }
+    let text = &field[..terminator.unwrap_or(field.len())];
+    if text
+        .iter()
+        .any(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+    {
+        return Err(Error::Invalid(format!(
+            "SanDisk U3 {name} contains non-printable bytes"
+        )));
+    }
+    let value = std::str::from_utf8(text)
+        .expect("ASCII validation guarantees UTF-8")
+        .trim_matches(' ');
+    if value.is_empty() {
+        return Err(Error::Invalid(format!("SanDisk U3 {name} is empty")));
+    }
+    Ok(value.to_owned())
+}
+
+fn sandisk_u3_revision_id(revision: &str) -> Result<String> {
+    let mut normalized = String::with_capacity(revision.len());
+    let mut separator = false;
+    for byte in revision.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            normalized.push((byte as char).to_ascii_lowercase());
+            separator = false;
+        } else if matches!(byte, b'.' | b'-' | b'_' | b' ') {
+            if !normalized.is_empty() && !separator {
+                normalized.push('-');
+                separator = true;
+            }
+        } else {
+            return Err(Error::Invalid(
+                "SanDisk U3 revision contains an unsupported identifier character".into(),
+            ));
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        return Err(Error::Invalid(
+            "SanDisk U3 revision has no identifier characters".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+pub fn parse_sandisk_u3_chip_info(data: &[u8]) -> Result<ControllerIdentity> {
+    if data.len() != SANDISK_U3_CHIP_INFO_LEN {
+        return Err(Error::Invalid(format!(
+            "SanDisk U3 chip-info response must be {SANDISK_U3_CHIP_INFO_LEN} bytes, got {}",
+            data.len()
+        )));
+    }
+    let revision = parse_sandisk_u3_text(&data[..8], "revision")?;
+    let manufacturer = parse_sandisk_u3_text(&data[8..], "manufacturer")?;
+    if !manufacturer.eq_ignore_ascii_case("SanDisk") {
+        return Err(Error::Invalid(format!(
+            "SanDisk U3 chip-info manufacturer signature is absent: {manufacturer}"
+        )));
+    }
+    let revision_id = sandisk_u3_revision_id(&revision)?;
+    Ok(ControllerIdentity {
+        family: Family::SandiskCruzer,
+        controller_id: format!("sandisk-u3-{revision_id}"),
+        firmware: revision,
+        nand_id: None,
+        mode: "firmware".into(),
+    })
 }
 
 // Silicon Motion SM32X ----------------------------------------------------
@@ -821,11 +916,13 @@ pub struct PhisonTransferChunk {
 }
 
 const PHISON_PRAM_HEADER: usize = 0x200;
+const PHISON_PRAM_MP_TAIL: usize = 0x200;
+const PHISON_PRAM_MP_MARK: &[u8; 16] = b"this is mp mark\0";
 const PHISON_PRAM_MAX_IMAGE: usize = 1024 * 1024;
 
 fn phison_pram_chunks(image: &[u8], body_len: usize) -> Result<Vec<PhisonTransferChunk>> {
     const MAX_BODY: usize = 0x8000;
-    debug_assert_eq!(image.len(), PHISON_PRAM_HEADER + body_len);
+    debug_assert!(image.len() >= PHISON_PRAM_HEADER + body_len);
 
     let mut header = [0u8; 16];
     header[0] = 0x06;
@@ -882,6 +979,30 @@ fn validate_phison_pram_marker(image: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_phison_legacy_mp_tail(tail: &[u8]) -> Result<()> {
+    if tail.len() != PHISON_PRAM_MP_TAIL || &tail[..16] != PHISON_PRAM_MP_MARK {
+        return Err(Error::Invalid(
+            "Phison legacy MP tail marker or length is invalid".into(),
+        ));
+    }
+    // Observed MPALL legacy burners encode the controller byte, a fixed
+    // format tuple, the burner version bytes and a terminal 'B'. The exact
+    // artifact digest remains authoritative; this parser only prevents an
+    // arbitrary trailer from being silently omitted by the BootROM transfer.
+    if tail[16] == 0
+        || tail[16] == 0xff
+        || tail[17..21] != [0x01, 0x00, 0x10, 0x01]
+        || (tail[21] == 0 && tail[22] == 0)
+        || tail[23] != b'B'
+        || tail[24..].iter().any(|byte| *byte != 0)
+    {
+        return Err(Error::Invalid(
+            "Phison legacy MP tail metadata is malformed".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the legacy PS2303 `BtPramCd` header whose little-endian field at
 /// 0x10 is a 1 KiB page count, then build its bounded transfer sequence.
 pub fn phison_pram_transfer_legacy(image: &[u8]) -> Result<Vec<PhisonTransferChunk>> {
@@ -899,9 +1020,11 @@ pub fn phison_pram_transfer_legacy(image: &[u8]) -> Result<Vec<PhisonTransferChu
     let expected_len = PHISON_PRAM_HEADER
         .checked_add(body_len)
         .ok_or_else(|| Error::Invalid("Phison PRAM image length overflow".into()))?;
-    if image.len() != expected_len {
+    if image.len() == expected_len + PHISON_PRAM_MP_TAIL {
+        validate_phison_legacy_mp_tail(&image[expected_len..])?;
+    } else if image.len() != expected_len {
         return Err(Error::Invalid(format!(
-            "Phison PRAM image length {} does not match header {}",
+            "Phison PRAM image length {} does not match header {} or its strict MP-tail form",
             image.len(),
             expected_len
         )));
@@ -944,6 +1067,12 @@ pub fn phison_pram_transfer_extended(image: &[u8]) -> Result<Vec<PhisonTransferC
 /// Artifact verification selects one layout explicitly before this function is
 /// reached; automatic detection here only keeps the runtime transport shared.
 pub fn phison_pram_transfer(image: &[u8]) -> Result<Vec<PhisonTransferChunk>> {
+    if image.len() >= PHISON_PRAM_HEADER {
+        let legacy_pages = u32::from_le_bytes([image[0x10], image[0x11], image[0x12], image[0x13]]);
+        if (1..=32).contains(&legacy_pages) {
+            return phison_pram_transfer_legacy(image);
+        }
+    }
     phison_pram_transfer_legacy(image).or_else(|legacy_error| {
         phison_pram_transfer_extended(image).map_err(|extended_error| {
             Error::Invalid(format!(
@@ -1085,14 +1214,17 @@ pub fn parse_six_byte_nand_id(data: &[u8], context: &str) -> Result<String> {
 // Alcor AU698x -------------------------------------------------------------
 
 pub const ALCOR_CONFIG_LEN: usize = 512;
-pub const ALCOR_FLASH_ID_LEN: usize = 10;
+pub const ALCOR_FLASH_ID_LEN: usize = 512;
 
 pub fn alcor_config_read_cdb() -> [u8; 10] {
     [0x82, 0x51, 0x01, 0, 0, 0, 0, 0, 0, 0]
 }
 
-pub fn alcor_flash_id_cdb() -> [u8; 8] {
-    [0xFA, 0, 0, 0, 0, 0, 0, 0]
+/// The 2013 Alcor UfdComLib factory transport submits FA 00 through its
+/// 16-byte data-in wrapper and requests one 512-byte transfer unit. This is
+/// intentionally explicit; callers must not transport-pad an 8-byte CDB.
+pub fn alcor_flash_id_cdb() -> [u8; 16] {
+    [0xFA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
 /// Parse the bounded prefix and USB descriptors from the public AU698x
@@ -1316,6 +1448,42 @@ mod tests {
     }
 
     #[test]
+    fn accepts_strict_legacy_mpall_metadata_tail_without_transferring_it() {
+        let body_len = 0x8000usize;
+        let transfer_len = PHISON_PRAM_HEADER + body_len;
+        let mut image = vec![0u8; transfer_len + PHISON_PRAM_MP_TAIL];
+        image[..8].copy_from_slice(b"BtPramCd");
+        image[0x10..0x14].copy_from_slice(&32u32.to_le_bytes());
+        image[transfer_len..transfer_len + 16].copy_from_slice(PHISON_PRAM_MP_MARK);
+        image[transfer_len + 16..transfer_len + 24]
+            .copy_from_slice(&[0x03, 0x01, 0x00, 0x10, 0x01, 0x14, 0x10, b'B']);
+        let chunks = phison_pram_transfer(&image).unwrap();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.length).sum::<usize>(),
+            transfer_len
+        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.offset + chunk.length <= transfer_len));
+    }
+
+    #[test]
+    fn rejects_arbitrary_or_malformed_legacy_trailers() {
+        let body_len = 0x8000usize;
+        let transfer_len = PHISON_PRAM_HEADER + body_len;
+        let mut image = vec![0u8; transfer_len + PHISON_PRAM_MP_TAIL];
+        image[..8].copy_from_slice(b"BtPramCd");
+        image[0x10..0x14].copy_from_slice(&32u32.to_le_bytes());
+        assert!(phison_pram_transfer(&image).is_err());
+
+        image[transfer_len..transfer_len + 16].copy_from_slice(PHISON_PRAM_MP_MARK);
+        image[transfer_len + 16..transfer_len + 24]
+            .copy_from_slice(&[0x03, 0x01, 0x00, 0x10, 0x01, 0x14, 0x10, b'B']);
+        image[transfer_len + 24] = 1;
+        assert!(phison_pram_transfer(&image).is_err());
+    }
+
+    #[test]
     fn rejects_malformed_phison_pram_images() {
         assert!(phison_pram_transfer(&[0; 0x200]).is_err());
         let mut bad = vec![0u8; 0x200 + 0x400];
@@ -1388,19 +1556,59 @@ mod tests {
             assert!(s.ftl_rebuild_recipe_role);
             assert!(!s.production_tuple_bundled);
         }
-        assert_eq!(fixed_probe_families, 4);
+        assert_eq!(fixed_probe_families, 5);
     }
 
     #[test]
-    fn sandisk_probe_never_guesses_a_vendor_command() {
-        let mut called = false;
-        let identity = identify_with(Family::SandiskCruzer, None, |_, _| {
-            called = true;
-            Err(Error::Invalid("unexpected transport call".into()))
+    fn sandisk_u3_probe_is_bounded_and_signed() {
+        let mut calls = Vec::<(Vec<u8>, usize)>::new();
+        let identity = identify_with(Family::SandiskCruzer, None, |cdb, len| {
+            calls.push((cdb.to_vec(), len));
+            let mut info = vec![0u8; SANDISK_U3_CHIP_INFO_LEN];
+            info[..4].copy_from_slice(b"4.04");
+            info[8..15].copy_from_slice(b"SanDisk");
+            Ok(info)
         })
         .unwrap();
-        assert!(identity.is_none());
-        assert!(!called);
+        let identity = identity.unwrap();
+        assert_eq!(
+            calls,
+            vec![(
+                sandisk_u3_chip_info_cdb().to_vec(),
+                SANDISK_U3_CHIP_INFO_LEN
+            )]
+        );
+        assert_eq!(identity.controller_id, "sandisk-u3-4-04");
+        assert_eq!(identity.firmware, "4.04");
+        assert!(identity.nand_id.is_none());
+    }
+
+    #[test]
+    fn sandisk_u3_probe_accepts_full_width_revision() {
+        let mut info = [0u8; SANDISK_U3_CHIP_INFO_LEN];
+        info[..8].copy_from_slice(b"80140002");
+        info[8..15].copy_from_slice(b"SanDisk");
+        let identity = parse_sandisk_u3_chip_info(&info).unwrap();
+        assert_eq!(identity.controller_id, "sandisk-u3-80140002");
+        assert_eq!(identity.firmware, "80140002");
+    }
+
+    #[test]
+    fn sandisk_u3_probe_rejects_unsigned_or_malformed_responses() {
+        let mut info = [0u8; SANDISK_U3_CHIP_INFO_LEN];
+        info[..4].copy_from_slice(b"4.04");
+        info[8..15].copy_from_slice(b"Generic");
+        assert!(parse_sandisk_u3_chip_info(&info).is_err());
+
+        info[8..15].copy_from_slice(b"SanDisk");
+        info[4] = 0;
+        info[5] = b'X';
+        assert!(parse_sandisk_u3_chip_info(&info).is_err());
+
+        info[5] = 0;
+        info[0] = 0x80;
+        assert!(parse_sandisk_u3_chip_info(&info).is_err());
+        assert!(parse_sandisk_u3_chip_info(&info[..23]).is_err());
     }
 
     #[test]
@@ -1445,6 +1653,34 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], (phison_version_cdb().to_vec(), 528));
         assert_eq!(calls[1], (phison_nand_id_cdb().to_vec(), 512));
+    }
+
+    #[test]
+    fn alcor_probe_uses_factory_transport_cdb_and_transfer_size() {
+        let mut calls = Vec::<(Vec<u8>, usize)>::new();
+        let identity = identify_with(Family::AlcorUfd, None, |cdb, len| {
+            calls.push((cdb.to_vec(), len));
+            if cdb == alcor_config_read_cdb() {
+                let mut config = vec![0u8; ALCOR_CONFIG_LEN];
+                config[..2].copy_from_slice(&[0x99, 0x07]);
+                config[12..14].copy_from_slice(&0x058fu16.to_le_bytes());
+                config[14..16].copy_from_slice(&0x6387u16.to_le_bytes());
+                config[16..18].copy_from_slice(&0x0102u16.to_le_bytes());
+                config[22..26].copy_from_slice(&[4, 3, b'A', 0]);
+                config[26..30].copy_from_slice(&[4, 3, b'B', 0]);
+                Ok(config)
+            } else {
+                let mut nand = vec![0u8; ALCOR_FLASH_ID_LEN];
+                nand[..6].copy_from_slice(&[0x89, 0xd3, 0x90, 0x2e, 0x64, 0x52]);
+                Ok(nand)
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.nand_id.as_deref(), Some("89d3902e6452"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (alcor_config_read_cdb().to_vec(), 512));
+        assert_eq!(calls[1], (alcor_flash_id_cdb().to_vec(), 512));
     }
 
     #[test]

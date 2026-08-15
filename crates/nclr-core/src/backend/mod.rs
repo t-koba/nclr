@@ -4,7 +4,9 @@
 //! sealed anonymous temp FD, then spawns
 //! `nclr-<id> <op> --request-fd 4 --device-fd 3 [--events-fd 5]`.
 //! The protocol convention fixes fd 3 = device, 4 = request, 5 = events.
-//! Backends must not open any device path themselves.
+//! Backends must not open a device node themselves. The macOS controller
+//! backend may resolve the inherited whole-disk descriptor to its IOKit
+//! SCSITask service, while all block descriptors remain core-owned.
 
 use crate::errors::{Error, Result};
 use serde::Deserialize;
