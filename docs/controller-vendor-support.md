@@ -208,7 +208,7 @@ KVM 上の Windows 10 で MP2232 v1.11.0 の `MP2233_F1_B4_V111_00.exe` を実�
 - [作者の調査記録](https://linuxehacking.ovh/2014/07/20/alcor-ufd-controller-hacking-update-2/) は `82 51 01` による 512-byte config read と `81 00 ff` による config upload を説明するが、実験段階である。
 - [main.cpp](https://github.com/tizbac/alcorhack/blob/master/main.cpp) は `FA 00` flash-ID read と物理 sector read の研究経路も含む。ただし、準備 blob の意味、geometry、ECC、消去、BBT/FTL commit は確定していない。
 
-実測 (PQI Traveling Disk U273、VID `3538`、OEM VID): `82 51 01` config read は GOOD だが 0 バイト (config page 非実装)、`FA 00` flash-ID read は 512 バイトの NAND ID `89 68 04 46 A9 00` を返す。nclr は config page が無い世代でも `FA 00` の有効な 6-byte NAND ID から `alcor-ufd-<nand_id>` と識別する。このフォールバックは VID ヒントなしのデバイスに対しても安全に試行され、非 Alcor デバイスは CHECK CONDITION または無効 NAND ID で単に一致しない。識別は読み取り専用の情報提供であり、config page が無い世代の destructive capability は公開しない。
+実測 (PQI Traveling Disk U273、VID `3538`、OEM VID): `82 51 01` config read は GOOD だが 0 バイト (config page 非実装)、`FA 00` flash-ID read は 512 バイトの NAND ID `89 68 04 46 A9 00` を返す。nclr は config page が無い世代でも `FA 00` の有効な 6-byte NAND ID から `alcor-ufd-<nand_id>` と識別する。このフォールバックは VID ヒントなしのデバイスに対しても試行される。ただし、UT163 (Imation Flash Drive Mini) では `FA 00` が CHECK CONDITION を返さず 60 秒の DID_TIME_OUT で USB reset に至ることを URescue trace 検証の際に確認した (後述)。nclr は USBest の marker パスを vendor CDB より先に試行するため、profile が配備された環境では `FA 00` を送らない。識別は読み取り専用の情報提供であり、config page が無い世代の destructive capability は公開しない。
 
 ### PQI U273 の USB trace 検証 (AlcorMP)
 
@@ -352,6 +352,47 @@ nclr はこの境界を code でも固定した。`nclr-lab decode` は既知 U3
 - usb.ids は `4146` を "USBest Technology" に、`1307` を "Transcend Information, Inc." に登録するが、USB-IF の registry 議論は `1307` を USBest Technology Inc. の割り当てとする。いずれも識別のヒントに過ぎない。
 
 実測 (Imation Flash Drive Mini、VID `0718`、UT163 搭載): 標準 INQUIRY を 96 バイト要求すると、36 バイトの標準データを超える vendor-specific 領域に `UtffU163A1BM` のマーカーが返る。`profiles/identify-usbest-ufd.toml` が vendor-owned VID ヒント (`4146`、`1307`) と INQUIRY マーカー (`U163`) を宣言し、nclr はこの領域のパターンを検証して controller ID `usbest-ut163` を返す。この識別は標準 INQUIRY だけを使い、未知の vendor CDB を送信しない。UT165 以降はこの marker probe の対象ではない。全 USBest line は common recipe adapter を利用できるが、exact service CDB、NAND identity、metadata format と HIL がない状態では destructive capability を公開しない。
+
+### URescue v1.3.0.71 の USB trace 検証 (UT163)
+
+KVM 上の Windows 10 で URescue v1.3.0.71 (USBest UT161/UT163/UT165/IT1167 専用の recovery / update tool、SHA-256 `9b390185...`) を実行し、sdc (0718:0084) を USB パススルーして Update を実行した。ホスト側 usbmon でキャプチャした pcapng (`urescue-trace.pcapng`、EPB 76552 件、dev 6 = Imation Flash Drive) から CBW/CDB を抽出した。
+
+**識別 (read-only) フェーズ** — Update の前に URescue が送信した読み取り専用コマンド:
+
+| CDB | dtl | 応答 | 意味 |
+|---|---|---|---|
+| `fd 10 00...` (12B) | 5 | `2c d3 94 a5 e5` | NAND ID (5 byte) |
+| `f2 00...` (12B) | 35 | 35 byte status | 状態取得 |
+| `f8 00 00 00 00 00 00 00 01 00` | 2048 | firmware 領域 | addr 0x0000 の 2048B read |
+| `f8 00 00 02 00 00 00 00 01 00` | 2048 | 同上 | addr 0x0200 |
+| `f8 00 00 04 00 00 00 00 01 00` | 2048 | 同上 | addr 0x0400 |
+| `f8 00 00 06 00 00 00 00 01 00` | 2048 | 同上 | addr 0x0600 |
+| `fd 00 00 41 13 00 00 02 00` | 512 | config 領域 (0x4113) | 512B read |
+| `fd 00 00 00 03 00 00 00 01 00` | 512 | config 領域 (0x0003) | 512B read |
+| `fd 00 00 00 4a 00 00 00 01 00` | 512 | config 領域 (0x004a) | 512B read |
+| `fd 00 00 46 da 00 00 00 01 00` | 512 | 乱数様 (0x46da) | 512B read |
+| `fd 0e 00...` (10B) | 512 / 1536 | ゼロ | サブコマンド 0x0e read |
+| `f3 00...` / `f6 00...` (6B) | 1 | 1 byte | status probe |
+
+`fd 10` の 5 byte NAND ID 応答、`fd` の 512 byte config read 応答を pcapng から復元し、reference binary として保存した (`usbest-fd10.bin` ほか)。`fd 00 00 41 13` 応答には `ffff 5555` のマーカーと物理 block 対応表らしき増加列、`fd 00 00 00 03` 応答には NAND 容量・ページ構成らしき値が含まれ、`f8` の 2048B read は 8051 命令列 (`90 00 07 e0` = MOV DPTR/MOVX) を含む firmware コード領域である。
+
+**Update フェーズ** — `fd 13 01` (OUT, dtl=0) で update mode に入り、`fd 00 01 00 4c 88` (OUT) を送った後:
+
+| CDB | dtl | 意味 |
+|---|---|---|
+| `fd 00 00 f0 00 00 00 02 00` / `fd 00 01 f0 00 00 03 02 00` | 512 | 0xf000〜0xfe00 の 8 block を read-modify-write (byte2 の 0x00=read / 0x01=write) |
+| `fd 11 00...` (OUT) | 0 | commit / execute |
+| `fe 00 00 <addr> 00...` | 1 | status / progress poll。address フィールドが 0x0000 から順に増える (3940 回) |
+| `fa 00 00 <addr> 00 00 00 02 00` (OUT) | 4096 / 65536 | page write (address は 0x0200 刻みで増加) |
+| `f8 00 00 <addr> 00 00 00 02 00` | 4096 | page verify read |
+| `f2 00...` | 35 | status |
+| `fd 0f 00...` (OUT) | 512 | 最終化 |
+
+各 page write の後には TEST UNIT READY (`00`) + REQUEST SENSE (`03`, 18/24 byte) の連打が挟まり、`fa`/`f8` のペアで書込→読戻し検証をしながら address を進める。最後に標準 SCSI の `28` (READ) / `2a` (WRITE) で論理領域を検証し、`1e` (PREVENT ALLOW MEDIUM REMOVAL) で終了する。update 後の論理容量・識別子は変化していない。
+
+これにより UT163 の vendor protocol は `fd` (read/write/config, サブコマンド 0x10=ID, 0x0e=read, 0x0f=finalize, 0x11=commit, 0x13=update mode)、`f8`/`fa` (page read/write)、`f2` (35B status)、`f3`/`f6`/`fe` (1B status) で構成されることが確定した。ただし `fa` の page write が raw NAND page か FTL 経由か、BBT / reserve 領域の commit 規則は trace だけでは確定できず、nclr はこの trace で観測された read-only コマンド (`fd 10`、`f2`、`f8`、`fd` read) を識別にのみ利用し、write 系 (`fd 13 01`、`fa`、`fd 11`、`fd 0f`) を hard-code しない。
+
+Update 適用後 (sdb として再接続) に `nclr info` で再検証した。INQUIRY の `UtffU163A1BM` marker、Vendor/Product `Imation` / `Flash Drive`、論理容量、fingerprint は変化していない。識別は profile 配備時 (`NCLR_PROFILE_DIR` または `/usr/share/nclr/profiles`) に marker 経由で `usbest-ut163` を返す。ただし profile 未配備の環境では VID ヒントが無いため Alcor `FA 00` フォールバックが試行され、URescue 適用後の本機は `FA 00` に DID_TIME_OUT (60 s) で応答し USB reset に至ることを確認した。適用前の同一コマンド応答は記録が無いため、この挙動が firmware update 由来か否かは未確定。profile を配備して marker 経由で識別すれば vendor CDB を送らず、この問題を回避できる。
 
 ## C3 / C4 へ昇格する認定条件
 
