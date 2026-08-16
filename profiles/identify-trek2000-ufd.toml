@@ -1,0 +1,7 @@
+# Candidate-only identification profile: Trek 2000 TD2SMG9/TD2SM9, legacy
+# ThumbDrive. The vendor-owned VID selects no command: exact controller and
+# NAND identities must come from an authenticated bootstrap recipe.
+schema = 1
+id = "trek2000-ufd"
+family = "trek2000-ufd"
+usb_vid_hints = [0x0A16]

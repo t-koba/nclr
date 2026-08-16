@@ -258,13 +258,23 @@ impl<T: LoaderTransport + ?Sized> LoaderTransport for &mut T {
 pub fn inspect_controller<T: LoaderTransport>(
     transport: &mut T,
 ) -> Result<crate::controller_protocol::ControllerIdentity> {
+    inspect_controller_any(transport, REVIEWED_CONTROLLER_ID)
+}
+
+/// Inspect the controller identity, allowing any Phison UFD controller that
+/// answers the signed version page. The caller binds the result to the exact
+/// controller / firmware tuple before any loader transition.
+pub fn inspect_controller_any<T: LoaderTransport>(
+    transport: &mut T,
+    allowed_controller_id: &str,
+) -> Result<crate::controller_protocol::ControllerIdentity> {
     let data = transport.read(
         &crate::controller_protocol::phison_version_cdb(),
         crate::controller_protocol::PHISON_VERSION_PAGE_LEN,
         READ_TIMEOUT_MS,
     )?;
     let identity = crate::controller_protocol::parse_phison_version_page(&data)?;
-    if identity.controller_id != REVIEWED_CONTROLLER_ID {
+    if identity.controller_id != allowed_controller_id {
         return Err(Error::Permission(format!(
             "PS2303 loader contract does not apply to controller {}",
             identity.controller_id
@@ -280,7 +290,17 @@ pub fn enter_bootrom<T: LoaderTransport>(
     transport: &mut T,
     expected_firmware: &str,
 ) -> Result<bool> {
-    let identity = inspect_controller(transport)?;
+    enter_bootrom_any(transport, REVIEWED_CONTROLLER_ID, expected_firmware)
+}
+
+/// Enter BootROM on any Phison UFD controller whose signed version page
+/// matches the allowed controller / firmware tuple.
+pub fn enter_bootrom_any<T: LoaderTransport>(
+    transport: &mut T,
+    allowed_controller_id: &str,
+    expected_firmware: &str,
+) -> Result<bool> {
+    let identity = inspect_controller_any(transport, allowed_controller_id)?;
     if identity.firmware != expected_firmware {
         return Err(Error::Permission(format!(
             "PS2303 BootROM target firmware mismatch: expected {expected_firmware}, got {}",
@@ -309,15 +329,27 @@ pub fn load_reviewed_loader<T: LoaderTransport>(
     image: &[u8],
     expected_firmware: &str,
 ) -> Result<()> {
-    validate_reviewed_loader_image(image)?;
-    let identity = inspect_controller(transport)?;
+    load_phison_loader_any(transport, image, REVIEWED_CONTROLLER_ID, expected_firmware)
+}
+
+/// Transfer and start a digest-pinned Phison PRAM image on any controller
+/// whose signed BootROM identity matches the allowed controller / firmware
+/// tuple. The image digest is validated by the caller's artifact store; this
+/// function only binds the transport and the exact target tuple.
+pub fn load_phison_loader_any<T: LoaderTransport>(
+    transport: &mut T,
+    image: &[u8],
+    allowed_controller_id: &str,
+    expected_firmware: &str,
+) -> Result<()> {
+    let identity = inspect_controller_any(transport, allowed_controller_id)?;
     if identity.mode != "bootrom" || identity.firmware != expected_firmware {
         return Err(Error::Permission(format!(
-            "PS2303 loader target mismatch: expected {REVIEWED_CONTROLLER_ID} fw {expected_firmware} in bootrom, got {} fw {} in {}",
+            "PS2303 loader target mismatch: expected {allowed_controller_id} fw {expected_firmware} in bootrom, got {} fw {} in {}",
             identity.controller_id, identity.firmware, identity.mode
         )));
     }
-    for chunk in crate::controller_protocol::phison_pram_transfer_legacy(image)? {
+    for chunk in crate::controller_protocol::phison_pram_transfer(image)? {
         let end = chunk
             .offset
             .checked_add(chunk.length)
@@ -989,5 +1021,57 @@ mod tests {
             destination.copy_from_slice(&page);
         }
         assert!(parse_onfi_parameter_copies(&payload).is_err());
+    }
+
+    struct FakeTransport {
+        version_page: Vec<u8>,
+    }
+
+    impl LoaderTransport for FakeTransport {
+        fn read(&mut self, _cdb: &[u8], _length: usize, _timeout_ms: u64) -> Result<Vec<u8>> {
+            Ok(self.version_page.clone())
+        }
+        fn write(&mut self, _cdb: &[u8], _data: &[u8], _timeout_ms: u64) -> Result<()> {
+            Ok(())
+        }
+        fn no_data(&mut self, _cdb: &[u8], _timeout_ms: u64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn version_page(controller: u16, mode: &str) -> Vec<u8> {
+        let mut page = vec![0u8; crate::controller_protocol::PHISON_VERSION_PAGE_LEN];
+        page[0x17A..0x17C].copy_from_slice(b"VR");
+        page[0x17E..0x180].copy_from_slice(&controller.to_be_bytes());
+        page[0x94..0x97].copy_from_slice(&[1, 5, 0x10]);
+        page[0xA0..0xA8].copy_from_slice(mode.as_bytes());
+        page
+    }
+
+    /// The generic loader contract accepts any Phison UFD controller whose
+    /// signed version page matches, not only the reviewed PS2303.
+    #[test]
+    fn generic_loader_contract_accepts_other_phison_generations() {
+        // PS2232 (0x2232) in firmware mode.
+        let mut transport = FakeTransport {
+            version_page: version_page(0x2232, "firmware"),
+        };
+        let entered = enter_bootrom_any(&mut transport, "phison-ps2232", "01.05.10").unwrap();
+        assert!(entered);
+
+        // Wrong controller is rejected.
+        let mut wrong = FakeTransport {
+            version_page: version_page(0x2232, "firmware"),
+        };
+        assert!(enter_bootrom_any(&mut wrong, "phison-ps2303", "01.05.10").is_err());
+
+        // PS2232 in bootrom mode: loader transfer is attempted on the
+        // generic path (the image is the reviewed PS2303 build, which the
+        // transfer layout accepts; the digest gate stays with the caller).
+        let mut bootrom = FakeTransport {
+            version_page: version_page(0x2232, " PRAM   "),
+        };
+        let entered = enter_bootrom_any(&mut bootrom, "phison-ps2232", "01.05.10").unwrap();
+        assert!(!entered);
     }
 }

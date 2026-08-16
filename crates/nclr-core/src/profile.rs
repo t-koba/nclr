@@ -2059,8 +2059,8 @@ mod tests {
             }
         }
         assert!(
-            loaded >= 18,
-            "expected at least 18 identify profiles, got {loaded}"
+            loaded >= 28,
+            "expected at least 28 identify profiles, got {loaded}"
         );
 
         // VID hints resolve to a single family.
@@ -2088,6 +2088,20 @@ mod tests {
         assert_eq!(
             family_hint_from_vid(0x23A9, &profiles),
             Some(crate::controller_protocol::Family::YeestorUfd)
+        );
+        // Vendor-owned VIDs confirmed via usb.ids for the recipe-only
+        // legacy families.
+        assert_eq!(
+            family_hint_from_vid(0x0A16, &profiles),
+            Some(crate::controller_protocol::Family::Trek2000Ufd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x102A, &profiles),
+            Some(crate::controller_protocol::Family::RamosUfd)
+        );
+        assert_eq!(
+            family_hint_from_vid(0x0424, &profiles),
+            Some(crate::controller_protocol::Family::SmscUfd)
         );
         // An unknown / unlisted VID hints nothing.
         assert_eq!(family_hint_from_vid(0x1234, &profiles), None);

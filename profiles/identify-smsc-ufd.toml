@@ -1,0 +1,8 @@
+# Candidate-only identification profile: SMSC USB97C242 (legacy direct-NAND
+# USB flash-drive controller). The vendor-owned VID selects no command:
+# exact controller and NAND identities must come from an authenticated
+# bootstrap recipe.
+schema = 1
+id = "smsc-ufd"
+family = "smsc-ufd"
+usb_vid_hints = [0x0424]

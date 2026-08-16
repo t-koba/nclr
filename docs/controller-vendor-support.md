@@ -114,6 +114,10 @@ SanDisk U3 tool だけは後述する SanDisk 正規 URL の保存 response と 
 
 AppoTech、SiliconGo、iCreate、OTi、Prolific、Ameco、Netac、eFortune、ITE、Ramos、Moai、RealWay、HuaYi、KTC などの legacy line は、二次 catalog と実 package inventory を controller namespace の根拠にした recipe-only adapter である。vendor-owned VID を一次資料で一意に確定できた family だけ candidate profile を同梱し、それ以外は接続媒体の exact OS identity と trace から production bootstrap を作る。二次 catalog の型番だけで固定 probe、service loader、NAND geometry を共有しない。
 
+usb.ids で vendor-owned VID が一意に確定した family には `profiles/identify-*.toml` を同梱する。Trek 2000 (`0a16` Trek Technology)、Ramos (`102a` Ramos Technology)、SMSC (`0424` Microchip/SMSC) はこの条件を満たし、candidate プロファイルを追加した。FirstChip、SiliconGo、Ameco、HuaYi、KTC、Moai、RealWay は usb.ids で一意な vendor-owned VID を確認できず (例: FirstChip の `1d45` は usb.ids では "Touch" と登録)、VID ヒントなしの candidate プロファイルのみを同梱する。これらは接続媒体の exact OS identity と trace から production bootstrap を作る。
+
+全 28 family に `profiles/identify-*.toml` を同梱した。recipe_engine と recipe_identify は全 family で true であり、bootstrap + recipe の read-controller-id / read-nand-id で識別できる。組み込みの固定識別 (`identify: true`) は一次資料で読み取り専用コマンドが確定した 5 family (Phison / Alcor / SMI / SanDisk / USBest) に限られ、残りは recipe 経由の識別となる。C3/C4 実行は recipe エンジンで全 family が同じレベルで対応し、各 family の exact production profile + runtime recipe を確定すれば有効化される。
+
 ## Phison PS2251 family
 
 一次資料:
@@ -147,6 +151,41 @@ MPALL v5.13.0C はこの構造が後期 PS2251 にも継続していることを
 
 v5.13 は PS2251-67／-68／-69／-70／-07／-09 の NAND 別 firmware、`b2267_bank.bin`／`b2269_bank.bin`／`b2307_bank.bin`／`b2309_bank.bin`、更新版 `IDBLK_TIMING.dll` v1.4.44.0 を別 object として持つ。main tool 内には PS2251-01／-02／-03／-06／-07／-08／-12／-13／-30／-33／-37／-38／-39／-50／-60／-61／-62／-63／-67／-68／-80／-85 の分岐文字列がある。ただし package に分岐が存在することは、その全 controller で共通 BootROM command と response が同一である証拠ではない。実 profile は controller chip type ごとに分ける。
 
+### PS2232 (MP2232 v1.11.0) の実ファイル解析
+
+sdd (13fe:1f23、phison-ps2232、FW 01.05.10、NAND 2cd5943e7400) を対象に、PS2232 世代の正規 tool を追加取得した。
+
+| 取得物 | 出典 | archive size | archive SHA-256 |
+|---|---|---:|---|
+| [Phison MPTool MP2232 v1.11.0](https://flashboot.ru/files/file/148/) | flashboot.ru、PS2231/PS2232/PS2233/PS2237/AE2263 対応 | 3,258,005 | 取得物を隔離した一時 directory に保存 |
+
+archive (`Phison_PS2233-PS2237_v1.11.rar`) 内の主要 object と `nclr-lab tool --family phison-ufd` の解析結果は次のとおりである。
+
+| object | size | SHA-256 | 解析結果 |
+|---|---:|---|---|
+| `MP2233_F1_B4_V111_00.exe` | 1,904,640 | `82b99c9379bf73d878cb5c7d41519ff047163bf43466fa3b95ada1a7945e73d9` | 32-bit PE (2009-04-13)。`CreateFileA/W`、`DeviceIoControl`、`setupapi.dll`、`USBSTOR` registry、`NT_GetFlashExtendID_All ScsiStatus`、`NT_GetStatus ScsiStatus`、`Read/Write ScsiStatus` を参照し、USB mass storage を SCSI pass-through で操作する。`BtPramCd`、`Burner`、`ISP`、`Preformat`、`Flash ID`、`Bad Block` の marker を検出 |
+| `BBN103.BIN` | 18,944 | `d63e7c66882b829886f226dd8ce3fc7de254e124d552b461040a19ccc427d484` | `phison-bt-pram`。`BtPramCd` header、little-endian page count `18`、512-byte header + body。内部文字列は "2233 FW BURNER" — PS2233 用 burner であり、PS2232 用ではない |
+| `BFF01702.BIN` | 147,968 | `332fc6bcb18968290cae0b73db8ea99dae76f379de6df50a0e72f864e539ab48` | `phison-bt-pram`。`BtPramCd` header と multi-field header (`10 10 08 00`) を持つ後期形式。burner ではなく firmware と区別される |
+| `IDBLK_TIMING.dll` | 221,184 | `bcddbed92a357cc736ea03ed337d53e94fb99b749c9518b9aee88095400359d5` | 32-bit PE (2009-03-31)。`Preformat`、`Firmware` marker |
+| `ParamEdt-F1-v2.1.0.2.exe` | 675,840 | `3b18ef8193203bac5c1a08adaf1f3541a44e51a3b8afdeca3cc4eb40bc239cbb` | 32-bit PE。`ISP`、`Burner`、`Preformat`、`Flash ID` marker。パラメータ編集 |
+| `ParamEdt-F2-v2.1.0.2.exe` | 675,840 | `6a9872ce5a7859e569698d0705ead1fc76da40349fdca66fcd25bb7aa88fc8ab` | 同上 (F2 系統) |
+
+追加取得: [Phison UP13 UP14 UP12 V1.96](https://flashboot.ru/files/file/10/) (2008-10-09)。PS2232 (UP13/UP14) 世代の正規 tool として解析した。
+
+| object | size | SHA-256 | 解析結果 |
+|---|---:|---|---|
+| `BN206.BIN` | 25,088 | 取得物を隔離した一時 directory に保存 | `phison-bt-pram`。`BtPramCd` header、little-endian page count `96` だが実 body は 24,576 byte (expected 98,304)。内部文字列は "2231 FW BURNER" — PS2231 用 burner |
+| `FF0110D.BIN` | 111,104 | 同上 | `BtPramCd` header。page count フィールドは異常値 (3,145,776) で legacy 形式ではない。後期 segmented 形式の可能性 |
+| `F1_90_v196_00.exe` | 1,273,856 | 同上 | 32-bit PE (2008-03-18)。量産ツール本体 |
+| `IDBLK_TIMING.dll` | 229,376 | 同上 | 32-bit PE。NAND ID / timing table |
+| `ParamEdt-F1-v2.1.0.2.exe` | 643,072 | 同上 | パラメータ編集 |
+
+UP13/UP14 ツールの burner も "2231 FW BURNER" であり、PS2232 固有の burner は確認できなかった。PS2232 (sdd) の C3 を正規 burner 経由で実現するには、PS2232 固有の burner / firmware を別途入手するか、nclr の clean-room loader を PS2232 へ適用する必要がある。
+
+静的解析はここまでで確定する。`nclr-lab decode` が表示する `06 05` version page、`06 56` NAND ID、`06 BF` BootROM、`06 B1`/`06 B0` transfer、`06 B3` PRAM run は PS2251 系の公開実装 (Psychson / flowswitch) と一致するが、PS2232 世代で同一 CDB が使われることを確定するには、MP2232 を実媒体に対して実行した USB BOT capture と成功／失敗 trace の差分が必要である。PC110.TXT の内容も recipe 作成時に追記する。
+
+PS2232 の C3 を有効にするには、この archive の burner / firmware / timing と、同一 tool / device tuple の USB trace から確定した loader 遷移、raw page/erase/status、BBT/FTL/capacity commit を 1 個の runtime recipe に固定し、pre-HIL check を通す必要がある。現在は静的解析のみ完了で、HIL 前の trace / recipe は未完了である。
+
 ## Alcor AU698x
 
 一次資料:
@@ -154,6 +193,8 @@ v5.13 は PS2251-67／-68／-69／-70／-07／-09 の NAND 別 firmware、`b2267
 - [alcorhack](https://github.com/tizbac/alcorhack) は作者の AU698x リバースエンジニアリング実装である。
 - [作者の調査記録](https://linuxehacking.ovh/2014/07/20/alcor-ufd-controller-hacking-update-2/) は `82 51 01` による 512-byte config read と `81 00 ff` による config upload を説明するが、実験段階である。
 - [main.cpp](https://github.com/tizbac/alcorhack/blob/master/main.cpp) は `FA 00` flash-ID read と物理 sector read の研究経路も含む。ただし、準備 blob の意味、geometry、ECC、消去、BBT/FTL commit は確定していない。
+
+実測 (PQI Traveling Disk U273、VID `3538`、OEM VID): `82 51 01` config read は GOOD だが 0 バイト (config page 非実装)、`FA 00` flash-ID read は 512 バイトの NAND ID `89 68 04 46 A9 00` を返す。nclr は config page が無い世代でも `FA 00` の有効な 6-byte NAND ID から `alcor-ufd-<nand_id>` と識別する。このフォールバックは VID ヒントなしのデバイスに対しても安全に試行され、非 Alcor デバイスは CHECK CONDITION または無効 NAND ID で単に一致しない。識別は読み取り専用の情報提供であり、config page が無い世代の destructive capability は公開しない。
 
 `0x81` はソース中で rebuild と呼ばれる箇所があるが、確認できる効果は USB 設定の upload / regenerate であり、D1–D4 の完全消去を意味しない。nclr はこの write CDB を hard-code しない。正規 tool trace で物理 erase、raw page、status、BBT/FTL commit の個別 semantics が確定した exact tuple だけを Alcor recipe として実行できる。
 

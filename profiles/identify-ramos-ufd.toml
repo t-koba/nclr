@@ -1,0 +1,7 @@
+# Candidate-only identification profile: Ramos UR22/24/25/26, UR28/30/31.
+# The vendor-owned VID selects no command: exact controller and NAND
+# identities must come from an authenticated bootstrap recipe.
+schema = 1
+id = "ramos-ufd"
+family = "ramos-ufd"
+usb_vid_hints = [0x102A]

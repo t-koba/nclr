@@ -2740,13 +2740,26 @@ mod platform {
             // the standard INQUIRY response already obtained above. No
             // additional command is sent.
             None => {
-                let Some(marker) = marker else {
-                    return Ok(None);
-                };
-                match vendor::parse_inquiry_marker(standard_inquiry, &marker) {
-                    Ok(identity) => Ok(Some(identity)),
-                    Err(_) => Ok(None),
+                let inquiry_marker = marker.as_ref();
+                if let Some(marker) = inquiry_marker {
+                    if let Ok(identity) = vendor::parse_inquiry_marker(standard_inquiry, marker) {
+                        return Ok(Some(identity));
+                    }
                 }
+                // A VID-less device (OEM rebrand) can still answer the
+                // public Alcor flash-ID read (FA 00). Only a valid 6-byte
+                // NAND id identifies the family; anything else (including a
+                // CHECK CONDITION) simply does not match and is harmless.
+                vendor::identify_with(Family::AlcorUfd, None, |cdb, len| {
+                    attempted.push(json!({
+                        "transport": "scsi",
+                        "cdb_hex": hex::encode(cdb),
+                        "direction": "from-device",
+                        "transfer_bytes": len,
+                        "source": "compiled-read-only-probe",
+                    }));
+                    scsi_command(file, cdb, TransferDirection::FromDevice, len)
+                })
             }
         }
     }

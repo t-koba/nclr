@@ -584,11 +584,38 @@ pub fn identify_with(
             Ok(Some(identity))
         }
         Family::AlcorUfd => {
-            let config = read(&alcor_config_read_cdb(), ALCOR_CONFIG_LEN)?;
-            let mut identity = parse_alcor_config(&config)?;
-            let nand = read(&alcor_flash_id_cdb(), ALCOR_FLASH_ID_LEN)?;
-            identity.nand_id = Some(parse_six_byte_nand_id(&nand, "Alcor")?);
-            Ok(Some(identity))
+            // AU698x-compatible controllers answer the config read with the
+            // 99 07 signature. Earlier generations answer the flash-ID read
+            // (FA 00) without implementing the config page (the config read
+            // returns GOOD with zero bytes or CHECK CONDITION); a valid
+            // 6-byte NAND id from the public factory transport is still a
+            // controller-owned signature, so the family is identified from
+            // the flash id alone in that case.
+            let config = match read(&alcor_config_read_cdb(), ALCOR_CONFIG_LEN) {
+                Ok(bytes) if bytes.len() == ALCOR_CONFIG_LEN => Some(bytes),
+                _ => None,
+            };
+            match config {
+                Some(config) => {
+                    let mut identity = parse_alcor_config(&config)?;
+                    let nand = read(&alcor_flash_id_cdb(), ALCOR_FLASH_ID_LEN)?;
+                    identity.nand_id = Some(parse_six_byte_nand_id(&nand, "Alcor")?);
+                    Ok(Some(identity))
+                }
+                None => {
+                    // No config page: the exact USB VID/PID cannot be read
+                    // back, so the identity is bounded to the NAND id.
+                    let nand = read(&alcor_flash_id_cdb(), ALCOR_FLASH_ID_LEN)?;
+                    let nand_id = parse_six_byte_nand_id(&nand, "Alcor")?;
+                    Ok(Some(ControllerIdentity {
+                        family: Family::AlcorUfd,
+                        controller_id: format!("alcor-ufd-{nand_id}"),
+                        firmware: "unidentified".into(),
+                        nand_id: Some(nand_id),
+                        mode: "firmware".into(),
+                    }))
+                }
+            }
         }
         Family::SiliconMotionUfd => {
             let page = read(&smi_identity_cdb(), SMI_IDENTITY_LEN)?;
@@ -1681,6 +1708,40 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], (alcor_config_read_cdb().to_vec(), 512));
         assert_eq!(calls[1], (alcor_flash_id_cdb().to_vec(), 512));
+    }
+
+    /// Earlier Alcor generations answer the flash-ID read (FA 00) without
+    /// implementing the 99 07 config page. The family is still identified
+    /// from the controller-owned NAND id in that case.
+    #[test]
+    fn alcor_identifies_from_flash_id_when_config_page_is_absent() {
+        let mut calls = Vec::<(Vec<u8>, usize)>::new();
+        let identity = identify_with(Family::AlcorUfd, None, |cdb, len| {
+            calls.push((cdb.to_vec(), len));
+            if cdb == alcor_config_read_cdb() {
+                Err(Error::Invalid("config page absent".into()))
+            } else {
+                let mut nand = vec![0u8; ALCOR_FLASH_ID_LEN];
+                nand[..6].copy_from_slice(&[0x89, 0x68, 0x04, 0x46, 0xa9, 0x00]);
+                Ok(nand)
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.family, Family::AlcorUfd);
+        assert_eq!(identity.controller_id, "alcor-ufd-89680446a900");
+        assert_eq!(identity.nand_id.as_deref(), Some("89680446a900"));
+        assert_eq!(identity.firmware, "unidentified");
+        // Config was attempted once, then the flash id was read.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], (alcor_config_read_cdb().to_vec(), 512));
+        assert_eq!(calls[1], (alcor_flash_id_cdb().to_vec(), 512));
+
+        // A device that answers neither command is not identified.
+        let none = identify_with(Family::AlcorUfd, None, |_, _| {
+            Err(Error::Invalid("no response".into()))
+        });
+        assert!(none.is_err());
     }
 
     #[test]

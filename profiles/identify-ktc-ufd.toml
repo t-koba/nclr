@@ -1,0 +1,8 @@
+# Candidate-only identification profile: ktc (FC1325N).
+# The vendor-owned VID is not confirmed from primary sources (usb.ids has no
+# unique registration), so no VID hint selects a command. Exact controller
+# and NAND identities must come from an authenticated bootstrap recipe after
+# the device's exact OS identity is captured with nclr info.
+schema = 1
+id = "ktc-ufd"
+family = "ktc-ufd"
