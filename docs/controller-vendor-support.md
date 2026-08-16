@@ -186,6 +186,20 @@ UP13/UP14 ツールの burner も "2231 FW BURNER" であり、PS2232 固有の 
 
 PS2232 の C3 を有効にするには、この archive の burner / firmware / timing と、同一 tool / device tuple の USB trace から確定した loader 遷移、raw page/erase/status、BBT/FTL/capacity commit を 1 個の runtime recipe に固定し、pre-HIL check を通す必要がある。現在は静的解析のみ完了で、HIL 前の trace / recipe は未完了である。
 
+### PS2232 の USB trace 検証 (MP2232 GetInfo)
+
+KVM 上の Windows 10 で MP2232 v1.11.0 の `MP2233_F1_B4_V111_00.exe` を実行し、sdd (13fe:1f23) を USB パススルーして GetInfo を実行した。ホスト側 usbmon でキャプチャした pcapng から CBW/CDB を抽出した結果、GetInfo は次の読み取り専用コマンドを送信していた。
+
+| CDB | 意味 | nclr 実装との一致 |
+|---|---|---|
+| `06 05 00 00 00 00 00 00 80 00 00 00` (dtl=528) | Phison version page | `phison_version_cdb()` と一致 |
+| `06 05 49 4E 46 4F 00 00 80 00 00 00` (dtl=528) | version page ("INFO") | 同上 |
+| `23 00 00 00 00 00 00 00 fc 00` | READ FORMAT CAPACITIES | GetInfo の容量取得 |
+| `12 01 80 00 ff 00` | INQUIRY VPD 0x80 | 標準 |
+| `25 00 ...` / `28 00 ...` | READ CAPACITY(10) / READ(10) | 標準 |
+
+`06 05` の 528 バイト応答を pcapng から復元し、`VR` シグネチャ (0x17A)、chip type `2232` (0x17E)、firmware `01.05.10` (0x94)、mode `firmware` を確認した。これは nclr が実機から直接取得した version page とバイト単位で一致し、`nclr-lab decode` も同じ CDB を PHISON VERSION PAGE として認識する。したがって、MP2232 ツールの読み取り専用識別経路は nclr の `06 05` 実装と同一プロトコルであることを実機 trace で確定した。
+
 ## Alcor AU698x
 
 一次資料:
@@ -195,6 +209,20 @@ PS2232 の C3 を有効にするには、この archive の burner / firmware / 
 - [main.cpp](https://github.com/tizbac/alcorhack/blob/master/main.cpp) は `FA 00` flash-ID read と物理 sector read の研究経路も含む。ただし、準備 blob の意味、geometry、ECC、消去、BBT/FTL commit は確定していない。
 
 実測 (PQI Traveling Disk U273、VID `3538`、OEM VID): `82 51 01` config read は GOOD だが 0 バイト (config page 非実装)、`FA 00` flash-ID read は 512 バイトの NAND ID `89 68 04 46 A9 00` を返す。nclr は config page が無い世代でも `FA 00` の有効な 6-byte NAND ID から `alcor-ufd-<nand_id>` と識別する。このフォールバックは VID ヒントなしのデバイスに対しても安全に試行され、非 Alcor デバイスは CHECK CONDITION または無効 NAND ID で単に一致しない。識別は読み取り専用の情報提供であり、config page が無い世代の destructive capability は公開しない。
+
+### PQI U273 の USB trace 検証 (AlcorMP)
+
+KVM 上の Windows 10 で AlcorMP v13.10.28.01.C を実行し、sdb (3538:0901) を USB パススルーして Refresh を実行した。ホスト側 usbmon でキャプチャした pcapng から CBW/CDB を抽出した結果、AlcorMP は次の読み取り専用コマンドを送信していた。
+
+| CDB | 意味 | nclr 実装との一致 |
+|---|---|---|
+| `82 51 01` (dtl=512) | Alcor config read | `alcor_config_read_cdb()` と一致 |
+| `fa 00` (dtl=512) | Alcor flash ID | `alcor_flash_id_cdb()` と一致 |
+| `12 01 80` (dtl=252) | INQUIRY VPD 0x80 | 標準 |
+
+`82 51 01` の 512 バイト応答を pcapng から復元し、`99 07` シグネチャ、VID `3538` (offset 12)、PID `0901` (offset 14)、bcdDevice `0100` (offset 16)、USB 文字列 "PQI" / "PQI USB Flash Drive" / "Generic USB Flash Disk 8.01"、シリアル "02AA0000000000000000000284" を確認した。nclr の `parse_alcor_config` はこの実機応答を `alcor-au698x-3538:0901` (firmware 0100) として正しく解析する (ユニットテスト追加済み)。
+
+AlcorMP 自体は Refresh で一覧にデバイスを表示しなかった。これは AlcorMP が config 応答の controller type (offset 2-3 の `08 28`) を内部の既知リストと照合するためで、nclr 側の識別コマンド送信・応答解析は実機 trace で正常であることを確定した。
 
 `0x81` はソース中で rebuild と呼ばれる箇所があるが、確認できる効果は USB 設定の upload / regenerate であり、D1–D4 の完全消去を意味しない。nclr はこの write CDB を hard-code しない。正規 tool trace で物理 erase、raw page、status、BBT/FTL commit の個別 semantics が確定した exact tuple だけを Alcor recipe として実行できる。
 

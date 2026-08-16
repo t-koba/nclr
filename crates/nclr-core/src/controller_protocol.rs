@@ -1710,6 +1710,31 @@ mod tests {
         assert_eq!(calls[1], (alcor_flash_id_cdb().to_vec(), 512));
     }
 
+    /// The config response captured from the PQI U273 (VID 3538:0901) via
+    /// AlcorMP on Windows (KVM usbmon trace). The 99 07 signature and
+    /// little-endian VID/PID/bcdDevice at offset 12-17 are the same layout
+    /// nclr parses, confirming the parser against a real device.
+    #[test]
+    fn alcor_config_parses_the_pqi_u273_capture() {
+        let mut config = vec![0u8; ALCOR_CONFIG_LEN];
+        config[..2].copy_from_slice(&[0x99, 0x07]);
+        config[2..4].copy_from_slice(&[0x08, 0x28]);
+        config[12..14].copy_from_slice(&0x3538u16.to_le_bytes());
+        config[14..16].copy_from_slice(&0x0901u16.to_le_bytes());
+        config[16..18].copy_from_slice(&0x0100u16.to_le_bytes());
+        // USB string descriptors from the capture: "PQI" at offset 22,
+        // then "PQI USB Flash Drive" at offset 30.
+        config[22..30].copy_from_slice(&[8, 3, b'P', 0, b'Q', 0, b'I', 0]);
+        config[30..40].copy_from_slice(&[
+            0x28, 3, b'P', 0, b'Q', 0, b'I', 0, b' ', 0,
+        ]);
+        config[40..44].copy_from_slice(&[b'U', 0, b'S', 0]);
+        let identity = parse_alcor_config(&config).unwrap();
+        assert_eq!(identity.family, Family::AlcorUfd);
+        assert_eq!(identity.controller_id, "alcor-au698x-3538:0901");
+        assert_eq!(identity.firmware, "0100");
+    }
+
     /// Earlier Alcor generations answer the flash-ID read (FA 00) without
     /// implementing the 99 07 config page. The family is still identified
     /// from the controller-owned NAND id in that case.
